@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, RelWithDebInfo]
+        crypto: [ON, OFF]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Cache wolfSSL FetchContent build
+        if: matrix.crypto == 'ON'
+        uses: actions/cache@v4
+        with:
+          path: build/_deps/wolfssl-*
+          key: wolfssl-${{ runner.os }}-v5.7.6-stable
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DFUSE_WITH_CRYPTO=${{ matrix.crypto }}
+          -DFUSE_BUILD_TESTS=ON
+          -DFUSE_BUILD_EXAMPLES=ON
+          -DFUSE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Install (smoke test)
+        run: |
+          cmake --install build --prefix "${{ runner.temp }}/fuse-install"
+          find "${{ runner.temp }}/fuse-install" -maxdepth 3

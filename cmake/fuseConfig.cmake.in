@@ -1,0 +1,11 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+if(@FUSE_WITH_CRYPTO@)
+    find_dependency(wolfssl CONFIG)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/fuse-targets.cmake")
+
+check_required_components(fuse)
