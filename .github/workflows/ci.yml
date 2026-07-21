@@ -27,7 +27,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/_deps/wolfssl-*
-          key: wolfssl-${{ runner.os }}-v5.7.6-stable
+          key: wolfssl-${{ runner.os }}-v5.9.2-stable
 
       - name: Configure
         run: >
@@ -48,3 +48,43 @@ jobs:
         run: |
           cmake --install build --prefix "${{ runner.temp }}/fuse-install"
           find "${{ runner.temp }}/fuse-install" -maxdepth 3
+
+  package:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build/packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build rpm
+
+      - name: Cache wolfSSL FetchContent build
+        uses: actions/cache@v4
+        with:
+          path: build/_deps/wolfssl-*
+          key: wolfssl-${{ runner.os }}-v5.9.2-stable
+
+      - name: Configure (release, library only)
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_INSTALL_PREFIX=/usr
+          -DFUSE_BUILD_TESTS=OFF
+          -DFUSE_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Build DEB/RPM/TGZ packages
+        run: cd build && cpack
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuse-packages
+          path: |
+            build/*.deb
+            build/*.rpm
+            build/*.tar.gz

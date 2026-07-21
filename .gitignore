@@ -20,3 +20,6 @@ _deps/
 .cache/
 .vscode/
 .idea/
+
+# Rust benchmark baseline build artifacts
+bench/quic/target/

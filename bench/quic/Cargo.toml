@@ -1,0 +1,19 @@
+[package]
+name = "quic_filebench"
+version = "0.1.0"
+edition = "2021"
+
+# Reference QUIC baseline for the Fuse file-transfer benchmark. Built
+# separately from the CMake tree (cargo build --release); see bench/README.md.
+
+[dependencies]
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1"
+rcgen = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = true

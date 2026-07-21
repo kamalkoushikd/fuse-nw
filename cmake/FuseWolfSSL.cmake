@@ -25,9 +25,16 @@ elseif(FUSE_FETCH_WOLFSSL)
     set(WOLFSSL_EXAMPLES no CACHE STRING "" FORCE)
     set(WOLFSSL_CRYPT_TESTS no CACHE STRING "" FORCE)
 
+    # Stage 7 optional encryption rides on DTLS (the datagram-appropriate
+    # counterpart to TLS) with pre-shared keys. WOLFSSL_PSK is not a declared
+    # wolfSSL option but is read by its CMakeLists: leaving it unset makes
+    # wolfSSL compile in -DNO_PSK, which would strip the PSK cipher suites.
+    set(WOLFSSL_DTLS yes CACHE STRING "" FORCE)
+    set(WOLFSSL_PSK yes CACHE STRING "" FORCE)
+
     FetchContent_Declare(wolfssl
         GIT_REPOSITORY https://github.com/wolfSSL/wolfssl.git
-        GIT_TAG v5.7.6-stable
+        GIT_TAG v5.9.2-stable
         GIT_SHALLOW TRUE
     )
     FetchContent_MakeAvailable(wolfssl)
