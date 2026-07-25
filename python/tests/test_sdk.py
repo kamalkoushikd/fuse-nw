@@ -1,7 +1,8 @@
 """Behavioural tests for the Python bindings.
 
-Run with:  FUSE_LIBRARY=build/default/libfuse_proto.so python3 -m pytest python/tests
-or plainly: python3 python/tests/test_sdk.py   (no pytest needed)
+Run against an installed package:  python3 -m unittest discover -s python/tests
+or against a build tree:           FUSE_LIBRARY=build/default/libfuse_proto.so \
+                                       python3 python/tests/test_sdk.py
 """
 import os
 import sys
@@ -9,8 +10,36 @@ import threading
 import time
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import fuse  # noqa: E402
+
+def _import_fuse():
+    """Prefer an installed package; fall back to the source tree beside us.
+
+    Order matters. A wheel carries the shared library inside the package, so
+    when one is installed it is the thing under test. Unconditionally putting
+    ../ on sys.path would shadow it with the source tree, which has no .so —
+    the tests would then fail against a perfectly good wheel.
+
+    The source-tree fallback is for running in a checkout with no install,
+    where FUSE_LIBRARY points at a build tree.
+    """
+    try:
+        import fuse
+
+        # 'fuse' is also the import name of the unrelated FUSE-filesystem
+        # bindings. If we got one of those, ignore it and use the source tree.
+        if hasattr(fuse, "listen") and hasattr(fuse, "connect"):
+            return fuse
+        del sys.modules["fuse"]
+    except ImportError:
+        pass
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    import fuse
+
+    return fuse
+
+
+fuse = _import_fuse()
 
 
 def _serve(listener, out, count=1):
