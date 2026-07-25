@@ -20,27 +20,67 @@ topology, or application domain.
   required, and is never negotiated in-band.
 - **No allocation on the data path** and no locks in the worker hot path.
 
-**Implemented and tested** (see `docs/ROADMAP.md` for detail and for the
-honest list of gaps): the datagram block layer with registry-backed
-retransmission, O(1) bitmask loss detection, the SETUP handshake, worker
-threads with static routing, per-stream flags, per-stream AIMD congestion
-control, optional CPU pinning, and optional DTLS/PSK encryption.
+**Implemented and tested** (120 tests; see `docs/ROADMAP.md` for detail and
+the honest list of gaps): a one-call `fuse/transfer.hpp` send/receive API
+over a sharded, GSO-batched data plane with registry-backed retransmission,
+O(1) bitmask loss detection, RTT-adaptive timeouts, per-stream AIMD
+congestion control, adaptive block sizing, optional AES-256-GCM encryption,
+and a userspace network-emulator test harness.
 
-> **Measured against QUIC, Fuse currently loses.** On a checksum-verified
-> loopback file transfer, a reference QUIC implementation (quinn) is
-> **2.5–2.9× faster** — while doing more work, since QUIC always encrypts
-> and Fuse in that test does not.
+> **Measured against QUIC on a 1 GiB checksum-verified file transfer, Fuse
+> is 1.3–2.2× faster** than a reference QUIC implementation (quinn) at
+> matched shard counts — and **1.3–1.8× faster with encryption enabled on
+> both sides** (1093 vs 710 MB/s single-lane, 3560 vs 1947 at four).
 >
-> The cause is diagnosed and fixable: Fuse issues one `sendto()` syscall
-> per datagram and is pinned at ~213k packets/sec regardless of payload
-> size, where QUIC batches packets with UDP GSO / `sendmmsg`. That is an
-> implementation gap, not a wire-format one.
+> **Under load, Fuse's latency does not move.** With 6.3 GB/s of bulk
+> traffic in flight, small-message p99 latency goes 39.6 → 38.2 µs — no
+> measurable inflation. Multiplexing the same two workloads onto a single
+> QUIC connection inflates p99 by 82× (153 → 12,585 µs). QUIC recovers with
+> a *second* connection (p99 82 µs); Fuse gets that isolation inside one
+> session, which is precisely the per-stream-congestion-control claim.
 >
-> Note also that a lossless, microsecond-RTT loopback transfer exercises
-> none of Fuse's actual differentiators (per-stream congestion control,
-> loss-tolerant streams, head-of-line-blocking avoidance). Testing on a
-> lossy/high-BDP path is what could still support the design premise.
-> See `bench/README.md`.
+> **Tested under emulated network conditions** (loss, delay, jitter,
+> reordering, duplication via a userspace `tc netem` substitute), every
+> transfer arrived byte-identical — for both Fuse and QUIC. Fuse tolerates
+> reordering/jitter far better (~40 vs ~1 MB/s); under heavy 5% loss it is
+> faster on average but higher-variance than QUIC. This testing also found
+> and fixed a real bug: a fixed 5 ms retransmit timeout that collapsed
+> throughput on any real-RTT path (4.8 → 39.6 MB/s at 50 ms RTT). Details:
+> **[bench/RESULTS.md](bench/RESULTS.md)** §4a.
+>
+> Read that with its caveats, which are load-bearing. Fuse's encryption uses
+> a **pre-shared key, which gives no forward secrecy**, where QUIC's TLS 1.3
+> handshake does — QUIC is buying a stronger security property with some of
+> its throughput. A lossless microsecond-RTT loopback also exercises none of
+> Fuse's actual differentiators, and the 16 KiB block the sender adapts into
+> is a loopback artefact a 1500-MTU path would not allow. Full numbers,
+> loss-injection results, and what they do *not* say:
+> **[bench/RESULTS.md](bench/RESULTS.md)**.
+
+## Quickstart
+
+```sh
+sudo cmake --install build          # or install the .deb/.rpm from cpack
+```
+
+```cmake
+find_package(fuse CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE fuse::proto)
+```
+
+```cpp
+#include <fuse/transfer.hpp>
+
+fuse::TransferConfig cfg;
+cfg.host = "192.0.2.10";
+cfg.base_port = 4433;
+cfg.pre_shared_key = "shared-secret";   // optional
+
+fuse::send_file(cfg, "/path/to/file");  // receiver calls receive_file()
+```
+
+Full guide — install, ports, encryption, error handling, lower-level
+APIs: **[docs/USAGE.md](docs/USAGE.md)**.
 
 Two libraries are built: `fuse::proto` (the protocol above, C++17) and
 `fuse::fuse`, an earlier C scaffold with a varint codec, packet framing,

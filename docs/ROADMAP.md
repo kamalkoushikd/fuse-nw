@@ -24,7 +24,7 @@ what is actually built and verified by the test suite, not what is planned.
 | 8 | Benchmark harness + head-to-head vs reference QUIC | Done |
 
 Every stage's acceptance criteria are covered by tests in `tests/proto/`
-(93 tests with the crypto backend, 89 without).
+(120 tests with the crypto backend, 104 without).
 
 ### Key design points
 
@@ -71,46 +71,93 @@ useful as an opt-in hook; it is not a default win.
 
 ## Head-to-head vs QUIC (file transfer)
 
-`bench/fuse_filebench` performs a genuinely reliable file transfer
-(checksum-verified) and `bench/quic/` is a reference QUIC implementation
-(quinn). Median of 3 runs, loopback, single-stream bulk transfer:
+*Consolidated numbers for every benchmark: [`bench/RESULTS.md`](../bench/RESULTS.md).*
 
-| Size | Fuse (unencrypted) | QUIC (TLS 1.3) |
-|---|---|---|
-| 1 MiB | 216.7 MB/s | **555.4 MB/s** |
-| 8 MiB | 227.5 MB/s | **665.8 MB/s** |
-| 64 MiB | 237.2 MB/s | **596.6 MB/s** |
+`bench/fuse_filebench` performs a reliable, sharded, checksum-verified file
+transfer; `bench/quic/` is a reference QUIC implementation (quinn) doing the
+same work with the same shard count. 1 GiB file, loopback, median of 3:
 
-**QUIC is 2.5–2.9× faster, while doing more work** (it always encrypts;
-Fuse here does not). Turning on Fuse's DTLS costs a further 44–56%, so the
-gap widens rather than closes. On this benchmark the project's premise
-does not hold.
+| lanes | Fuse (unencrypted) | QUIC (TLS 1.3) | Fuse advantage |
+|---|---|---|---|
+| 1 | **1327.7 MB/s** | 678.6 MB/s | 1.96x |
+| 4 | **3980.8 MB/s** | 1847.4 MB/s | 2.16x |
+| 8 | **4225.6 MB/s** | 3238.4 MB/s | 1.30x |
 
-**Diagnosis: Fuse is packet-rate bound.** Holding the transfer fixed and
-varying only block size gives 61.5 / 123.8 / 242.9 MB/s for 300 / 600 /
-1200 B blocks — dead-linear, with a flat ~213k datagrams/sec ceiling
-independent of payload size. Fuse issues one `sendto()` per block and is
-sitting on a syscall ceiling; quinn batches packets with UDP GSO /
-`sendmmsg`. This is an implementation gap, not a design flaw, and it is
-fixable with no wire-format change. Details in `bench/README.md`.
+An earlier version of this benchmark **lost** to QUIC by 2.5-2.9x. What
+closed the gap, in order of impact: batched syscalls (UDP GSO on send,
+`recvmmsg` on receive) removing a ~213k packets/sec ceiling; sharding the
+file across independent lanes; and adaptive block size. Details and full
+caveats in `bench/README.md`.
 
-Importantly, this benchmark does **not** exercise what Fuse is actually
-designed for: loopback has no loss and microsecond RTT, so per-stream
-congestion control, loss-tolerant streams, and head-of-line-blocking
-avoidance never come into play. A lossy/high-BDP path (`tc netem`) with
-the mixed workload is the test that could still vindicate the design.
+With encryption on both sides Fuse still leads (1093 vs 710 MB/s at one
+lane, 3560 vs 1947 at four), because keys are derived once per session and
+each lane runs its own AEAD — which keeps crypto parallel and, critically,
+keeps GSO batching intact. A per-lane DTLS session would have serialised on
+its record layer and given up batching entirely.
+
+Two caveats carry real weight. Fuse's encryption uses a pre-shared key and
+therefore provides **no forward secrecy**, where QUIC's TLS 1.3 handshake
+does; QUIC is buying a stronger property with part of its throughput. And
+the 16 KiB block size the sender adapts to is a loopback artefact a 1500-MTU
+path would not permit. Loopback also exercises none of Fuse's actual
+differentiators.
+
+One build-configuration finding is worth repeating: wolfSSL's CMake build
+has no AES-NI option, so it silently used software AES at 151 MB/s. Wiring
+in `aes_asm.S` + `aes_gcm_asm.S` took the primitive to 4852 MB/s — a 32x
+swing that decided the entire encrypted comparison.
+
+## Latency under load — the design premise, finally tested
+
+Every earlier benchmark measured bulk throughput on an idle link, which
+exercises none of what Fuse is designed for. `bench/fuse_latbench` measures
+what a saturating bulk transfer does to a concurrent small-message stream.
+Probe latency, microseconds:
+
+| configuration | p50 | p99 | p99.9 |
+|---|---|---|---|
+| Fuse — idle | 14.1 | 39.6 | 101.9 |
+| **Fuse — under 6.3 GB/s bulk** | **15.8** | **38.2** | **131.5** |
+| QUIC — under bulk, one connection | 326.9 | 12584.8 | 21455.6 |
+| QUIC — under bulk, separate connections | 42.5 | 82.4 | 99.1 |
+
+Fuse shows **no measurable latency inflation under load** (p99 39.6 -> 38.2)
+with zero probe loss. Multiplexing bulk and latency-sensitive traffic on one
+QUIC connection inflates p99 by 82x — the shared-congestion-controller
+coupling that per-stream congestion control exists to avoid.
+
+The honest qualification: QUIC recovers most of that with a second
+connection (p99 82 us). So the claim is not "QUIC is broken" but the
+narrower, accurate one Fuse actually makes — it delivers stream isolation
+*within one session*, where QUIC must spend an extra connection, handshake
+and congestion controller for the same property. Fuse remains ~2.2x better
+at p99 than separate-connection QUIC.
+
+Goodput efficiency is 97.48% of wire bytes at 1200-byte blocks, matching the
+31-byte header exactly.
 
 ## Gaps / not yet done
 
-1. **Send path is unbatched.** One syscall per datagram, ~213k pkt/s
-   ceiling. Implementing `sendmmsg`/GSO is the highest-value fix and is
-   where the QUIC gap lives.
-2. **The in-flight window is capped at 64 blocks (~77 KB)** because the
-   ACK bitmask is one `uint64`. Harmless on loopback, but it will throttle
-   any high bandwidth-delay-product path. Needs a wider or run-length
-   ACK range format.
-3. **No benchmark under loss or delay.** The differentiating features are
-   untested where they would matter.
+*(Resolved earlier and no longer gaps: the send path is now batched via UDP
+GSO + `recvmmsg`; the retransmission timeout and NACK timers are now
+RTT-adaptive; a public `fuse/transfer.hpp` API ships. See `bench/RESULTS.md`.)*
+
+1. **The in-flight window is capped at 64 blocks** because the ACK bitmask is
+   one `uint64`. Harmless on loopback; on a high bandwidth-delay-product path
+   it caps throughput at window_bytes/RTT (measured: 50 ms RTT → ~40 MB/s).
+   A wider or run-length-encoded ACK range format is the single
+   highest-value protocol change left.
+2. **Real-network behaviour is now emulated, not yet real-NIC.** Loss,
+   delay, jitter, reordering and duplication are tested via a userspace
+   relay (`bench/fuse_netem`, `bench/run_network_matrix.sh`) — see
+   `bench/RESULTS.md` §4a. Integrity holds under every condition. Still
+   missing: an actual two-host test over a physical or virtualised NIC.
+3. **Straggler lanes under heavy loss.** With static sharding, one lane that
+   hits an unlucky loss pattern stalls the whole transfer (which finishes
+   only when the slowest lane does). At 5% loss this makes Fuse's throughput
+   swing from 27 to 226 MB/s where QUIC holds steady at ~83. Dynamic
+   re-sharding / work-stealing across lanes (the orchestrator's remit) is
+   the fix.
 4. **NUMA placement is unverified.** The hook exists and compiles against
    libnuma when its headers are present, but this host has no
    libnuma-devel and is single-node, so the `numastat` locality check in
@@ -119,9 +166,9 @@ the mixed workload is the test that could still vindicate the design.
    Stage 3 workers own registries and service retransmit requests, but the
    full send loop over sockets lives in the demos and benchmark rather
    than in `Worker`. Unifying these is the natural next step.
-6. **Congestion control is wired into `fuse_filebench` only.** The
-   controller now gates the in-flight window there, but the worker pool
-   and `fuse_bench` still do not consult it.
+6. **Congestion control is wired into the transfer path only.** The
+   controller now gates the in-flight window in the shipping transfer API and
+   the file benchmark, but the Stage-3 worker pool does not yet consult it.
 7. **DTLS covers a link, not yet the full session lifecycle.** The
    session establishes and carries data; SETUP-inside-the-tunnel ordering
    is specified and implemented at the API level but not exercised by an

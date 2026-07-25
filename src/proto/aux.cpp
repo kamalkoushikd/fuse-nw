@@ -1,5 +1,7 @@
 #include "fuse/proto/aux.hpp"
 
+#include <cstring>
+
 namespace fuse::proto {
 
 namespace {
@@ -51,7 +53,7 @@ bool decode_heartbeat(const uint8_t *in, size_t in_len, Heartbeat *hb) {
 }
 
 size_t encode_stream_start(const StreamStart &ss, uint8_t *out, size_t out_cap) {
-    const size_t total = kOuterHeaderSize + 2 + 8 + 2 + 8;
+    const size_t total = kOuterHeaderSize + 2 + 8 + 2 + 8 + 16;
     if (out_cap < total) {
         return 0;
     }
@@ -60,18 +62,22 @@ size_t encode_stream_start(const StreamStart &ss, uint8_t *out, size_t out_cap) 
     off += put_u64(out + off, ss.total_blocks);
     off += put_u16(out + off, ss.block_size);
     off += put_u64(out + off, ss.total_bytes);
+    std::memcpy(out + off, ss.session_salt, sizeof(ss.session_salt));
+    off += sizeof(ss.session_salt);
     return off;
 }
 
 bool decode_stream_start(const uint8_t *in, size_t in_len, StreamStart *ss) {
     size_t off = check_outer(in, in_len, MsgType::StreamStart);
-    if (off == 0 || in_len != kOuterHeaderSize + 2 + 8 + 2 + 8) {
+    if (off == 0 || in_len != kOuterHeaderSize + 2 + 8 + 2 + 8 + 16) {
         return false;
     }
     off += get_u16(in + off, &ss->stream_id);
     off += get_u64(in + off, &ss->total_blocks);
     off += get_u16(in + off, &ss->block_size);
     off += get_u64(in + off, &ss->total_bytes);
+    std::memcpy(ss->session_salt, in + off, sizeof(ss->session_salt));
+    off += sizeof(ss->session_salt);
     return true;
 }
 

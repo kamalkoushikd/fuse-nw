@@ -10,3 +10,10 @@ target_link_libraries(fuse_stage1_receiver PRIVATE fuse::proto)
 
 add_executable(fuse_stage1_sender stage1_sender.cpp)
 target_link_libraries(fuse_stage1_sender PRIVATE fuse::proto)
+
+# Quickstart: the smallest complete send/receive pair using the public API.
+add_executable(fuse_quickstart_recv quickstart_recv.cpp)
+target_link_libraries(fuse_quickstart_recv PRIVATE fuse::proto)
+
+add_executable(fuse_quickstart_send quickstart_send.cpp)
+target_link_libraries(fuse_quickstart_send PRIVATE fuse::proto)

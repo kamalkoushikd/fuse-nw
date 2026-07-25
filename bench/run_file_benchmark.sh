@@ -17,7 +17,10 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FUSE_BIN="${FUSE_BIN:-$REPO/build/default/bench/fuse_filebench}"
 QUIC_BIN="${QUIC_BIN:-$REPO/bench/quic/target/release/quic_filebench}"
-WORK="$(mktemp -d)"
+# Default /tmp is often tmpfs, i.e. RAM-backed — a multi-gigabyte test file
+# there competes with the very memory the benchmark needs. Point
+# BENCH_WORKDIR at disk-backed storage for large runs.
+WORK="$(mktemp -d "${BENCH_WORKDIR:-/tmp}/fusebench.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 RUNS="${1:-3}"

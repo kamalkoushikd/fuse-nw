@@ -120,6 +120,8 @@ add_library(fuse_proto
     src/proto/topology.cpp
     src/proto/dtls.cpp
     src/proto/orchestrator.cpp
+    src/proto/session_crypto.cpp
+    src/proto/transfer.cpp
 )
 add_library(fuse::proto ALIAS fuse_proto)
 
@@ -168,6 +170,11 @@ target_link_libraries(fuse_proto PUBLIC Threads::Threads)
 set_target_properties(fuse_proto PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
+    # Without this the target exports as `fuse::fuse_proto`, since the
+    # `fuse::proto` ALIAS above exists only in the build tree. Downstream
+    # users would then have to link a different name than the one used
+    # in-tree and in the docs.
+    EXPORT_NAME proto
 )
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -178,6 +185,19 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 # --- Installation ---------------------------------------------------------
+
+# Let the installed libraries find their siblings (notably libwolfssl, which
+# is installed alongside them) from wherever the package ends up.
+#
+# This matters more than it looks: modern linkers emit RUNPATH rather than
+# RPATH, and the loader consults RUNPATH only for an object's *direct*
+# dependencies. So an executable's rpath does NOT help libfuse_proto.so find
+# libwolfssl.so — without $ORIGIN here, anything installed outside the system
+# library path fails at run time with a missing-library error, even though it
+# linked cleanly.
+set_target_properties(fuse fuse_proto PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+)
 
 install(TARGETS fuse fuse_proto
     EXPORT fuse-targets
@@ -225,6 +245,12 @@ install(FILES
 # the substitution is deferred into an install(CODE) script, where
 # CMAKE_INSTALL_PREFIX is re-evaluated as the real target of this
 # particular install.
+if(FUSE_WITH_CRYPTO)
+    set(FUSE_PC_REQUIRES_PRIVATE "wolfssl")
+else()
+    set(FUSE_PC_REQUIRES_PRIVATE "")
+endif()
+
 install(CODE "
     file(READ \"${CMAKE_CURRENT_SOURCE_DIR}/cmake/fuse.pc.in\" _fuse_pc_content)
     string(REPLACE \"@CMAKE_INSTALL_PREFIX@\" \"\${CMAKE_INSTALL_PREFIX}\" _fuse_pc_content \"\${_fuse_pc_content}\")
@@ -232,6 +258,8 @@ install(CODE "
     string(REPLACE \"@CMAKE_INSTALL_INCLUDEDIR@\" \"${CMAKE_INSTALL_INCLUDEDIR}\" _fuse_pc_content \"\${_fuse_pc_content}\")
     string(REPLACE \"@PROJECT_DESCRIPTION@\" \"${PROJECT_DESCRIPTION}\" _fuse_pc_content \"\${_fuse_pc_content}\")
     string(REPLACE \"@PROJECT_VERSION@\" \"${PROJECT_VERSION}\" _fuse_pc_content \"\${_fuse_pc_content}\")
+    string(REPLACE \"@PROJECT_HOMEPAGE_URL@\" \"${PROJECT_HOMEPAGE_URL}\" _fuse_pc_content \"\${_fuse_pc_content}\")
+    string(REPLACE \"@FUSE_PC_REQUIRES_PRIVATE@\" \"${FUSE_PC_REQUIRES_PRIVATE}\" _fuse_pc_content \"\${_fuse_pc_content}\")
     file(WRITE \"${CMAKE_CURRENT_BINARY_DIR}/fuse.pc\" \"\${_fuse_pc_content}\")
 ")
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/fuse.pc"

@@ -34,6 +34,10 @@ struct StreamStart {
     uint64_t total_blocks = 0;
     uint16_t block_size   = 0;
     uint64_t total_bytes  = 0;
+    // Per-session salt for key derivation. Sent identically on every lane:
+    // the whole session shares one key, and lanes are separated by nonce, not
+    // by key. All-zero means the session is unencrypted.
+    uint8_t  session_salt[16] = {};
 };
 
 struct Ack {

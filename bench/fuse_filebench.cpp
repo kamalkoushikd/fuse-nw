@@ -42,6 +42,7 @@
 #include "fuse/proto/hash.hpp"
 #include "fuse/proto/receiver.hpp"
 #include "fuse/proto/registry.hpp"
+#include "fuse/proto/session_crypto.hpp"
 #include "fuse/proto/udp.hpp"
 
 using namespace fuse::proto;
@@ -58,6 +59,31 @@ constexpr size_t kGsoBudget = 60000;    // bytes per GSO sendmsg (<64 KiB)
 constexpr uint16_t kBlockMin = kDefaultPayloadSize;
 constexpr uint16_t kBlockMax = kMaxPayloadSize;
 constexpr uint32_t kCleanBatchesToGrow = 8;
+
+// Deliberate send-side loss injection (percent), for exercising NACK
+// recovery and block-size back-off without needing a netem qdisc.
+int g_drop_pct = 0;
+
+// Session-wide encryption. Keys are derived ONCE for the whole transfer and
+// every lane encrypts with the same key under a nonce unique to
+// (lane, seq). That keeps crypto parallel across lanes and — crucially —
+// keeps each encrypted block a fixed-size datagram, so GSO batching still
+// applies. Routing through a per-lane DTLS session instead would serialise
+// on its record layer and give up batching entirely.
+bool g_encrypt = false;
+const std::string g_psk = "fuse-bench-preshared-key";
+uint8_t g_session_key[kSessionKeyLen] = {};
+uint8_t g_session_salt[kSessionSaltLen] = {};
+
+// Associated data binds a block to its identity: stream, sequence, offset.
+// Without it a valid block could be replayed at a different position.
+size_t build_aad(uint8_t *out, uint16_t lane, uint64_t seq, uint64_t offset) {
+    size_t n = 0;
+    n += put_u16(out + n, lane);
+    n += put_u64(out + n, seq);
+    n += put_u64(out + n, offset);
+    return n;
+}
 
 uint64_t now_ns() {
     timespec ts{};
@@ -114,8 +140,13 @@ void recv_lane(uint16_t port, uint16_t lane, std::vector<uint8_t> *shard, LaneSt
 
     PeerAddr peer{};
     bool have_peer = false;
-    uint64_t delivered = 0, last_ack_blocks = 0, last_ack_ns = 0;
+    uint64_t delivered = 0, last_ack_blocks = 0, last_ack_ns = 0, auth_failures = 0;
+    uint64_t rtt_est_ns = 0, nack_sent_ns = 0; // receiver-clock RTT estimate
     int idle = 0;
+
+    // Initialised once the sender's salt arrives in StreamStart.
+    LaneCipher cipher;
+    std::vector<uint8_t> opened(kMaxPayloadSize + kAeadTagLen);
 
     for (;;) {
         PeerAddr src;
@@ -151,6 +182,19 @@ void recv_lane(uint16_t port, uint16_t lane, std::vector<uint8_t> *shard, LaneSt
                     have_start = true;
                     shard_bytes = ss.total_bytes;
                     shard->assign(shard_bytes, 0);
+                    if (g_encrypt) {
+                        // The session key comes from the shared PSK plus the
+                        // salt the sender advertised, so both ends derive it
+                        // independently and it is fresh for this session.
+                        uint8_t key[kSessionKeyLen];
+                        if (!derive_session_key(
+                                reinterpret_cast<const uint8_t *>(g_psk.data()), g_psk.size(),
+                                ss.session_salt, key) ||
+                            !cipher.init(key)) {
+                            std::fprintf(stderr, "lane %u: key derivation failed\n", lane);
+                            return;
+                        }
+                    }
                 }
                 continue;
             }
@@ -165,13 +209,40 @@ void recv_lane(uint16_t port, uint16_t lane, std::vector<uint8_t> *shard, LaneSt
                 final_seq = hdr.seq_no; // the stream's extent, learned on arrival
             }
 
+            const uint8_t *body = payload;
+            uint16_t body_len = hdr.payload_len;
+
+            if (g_encrypt) {
+                // Authenticate BEFORE admitting the block to the window. If a
+                // forged block advanced `base`, the window would slide past
+                // data that was never written — silent corruption. A block
+                // that fails here is treated as never having arrived, so the
+                // ordinary NACK path recovers the real one.
+                uint8_t aad[18];
+                const size_t al = build_aad(aad, lane, hdr.seq_no, hdr.offset);
+                if (payload == nullptr || hdr.payload_len < kAeadTagLen ||
+                    !cipher.open(lane, hdr.seq_no, aad, al, payload, hdr.payload_len,
+                                 opened.data())) {
+                    ++auth_failures;
+                    continue;
+                }
+                body = opened.data();
+                body_len = static_cast<uint16_t>(hdr.payload_len - kAeadTagLen);
+            }
+
+            if ((hdr.flags & kFlagRetransmission) && nack_sent_ns != 0) {
+                const uint64_t sample = now_ns() - nack_sent_ns;
+                rtt_est_ns = (rtt_est_ns == 0) ? sample : (rtt_est_ns * 7 + sample) / 8;
+                nack_sent_ns = 0;
+            }
+
             if (rx.on_receive(hdr.seq_no, send_time, now_ns()) == ReceiveResult::Accepted &&
-                payload != nullptr) {
+                body != nullptr) {
                 // Explicit offset, so a mid-stream block-size change cannot
                 // misplace this payload.
-                if (hdr.offset + hdr.payload_len <= shard->size()) {
-                    std::memcpy(shard->data() + hdr.offset, payload, hdr.payload_len);
-                    bytes_written += hdr.payload_len;
+                if (hdr.offset + body_len <= shard->size()) {
+                    std::memcpy(shard->data() + hdr.offset, body, body_len);
+                    bytes_written += body_len;
                 }
                 ++delivered;
             }
@@ -188,10 +259,15 @@ void recv_lane(uint16_t port, uint16_t lane, std::vector<uint8_t> *shard, LaneSt
             if (n) sock.send_to(tx_buf.data(), n, peer);
         }
 
+        const uint64_t reorder_ns = (rtt_est_ns == 0) ? 3000000
+            : std::clamp<uint64_t>(rtt_est_ns / 2, 1000000, 100000000);
+        const uint64_t renack_ns = (rtt_est_ns == 0) ? 40000000
+            : std::clamp<uint64_t>(rtt_est_ns * 3 / 2, 20000000, 500000000);
         Nack nack;
-        if (rx.collect_nacks(t, /*reorder=*/300000, /*renack=*/2000000, &nack) > 0) {
+        if (rx.collect_nacks(t, reorder_ns, renack_ns, &nack) > 0) {
             size_t n = encode_nack(nack, tx_buf.data(), tx_buf.size());
             if (n) sock.send_to(tx_buf.data(), n, peer);
+            nack_sent_ns = t;
         }
 
         // Done once every block up to the announced last one has arrived.
@@ -208,6 +284,10 @@ void recv_lane(uint16_t port, uint16_t lane, std::vector<uint8_t> *shard, LaneSt
         if (n) sock.send_to(tx_buf.data(), n, peer);
     }
 
+    if (auth_failures > 0) {
+        std::fprintf(stderr, "lane %u: %llu blocks failed authentication\n", lane,
+                     (unsigned long long)auth_failures);
+    }
     stats->bytes.store(bytes_written);
     stats->ok.store(bytes_written == shard_bytes);
 }
@@ -231,7 +311,21 @@ void send_lane(const std::string &host, uint16_t port, uint16_t lane, const uint
     CongestionController cc(kWindow, true, /*clean_windows_to_grow=*/1, /*grow_step=*/16);
 
     std::vector<uint8_t> staging(kGsoBudget + kMaxDatagramSize);
+    // Control/feedback messages are small, but a RETRANSMIT re-encodes a full
+    // data block — which can be as large as kMaxDatagramSize once the block
+    // size has adapted upward. Encoding one into an aux-sized buffer just
+    // returns 0, so every retransmit would silently fail and the transfer
+    // would stall the moment a block was actually lost.
     std::vector<uint8_t> ctl(kMaxAuxDatagramSize + 64);
+    std::vector<uint8_t> rtx(kMaxDatagramSize + 64);
+    // One cipher per lane: same session key, distinct nonce space. Confining
+    // it to this thread is what keeps encryption parallel across lanes.
+    LaneCipher cipher;
+    std::vector<uint8_t> sealed(kMaxPayloadSize + kAeadTagLen);
+    if (g_encrypt && !cipher.init(g_session_key)) {
+        std::fprintf(stderr, "lane %u: cipher init failed\n", lane);
+        return;
+    }
 
     // Announce the shard. total_blocks is 0 = "not known up front", because
     // an adaptive block size means the block count is not fixed in advance;
@@ -241,6 +335,7 @@ void send_lane(const std::string &host, uint16_t port, uint16_t lane, const uint
     ss.total_blocks = 0;
     ss.block_size = start_block;
     ss.total_bytes = shard_bytes;
+    if (g_encrypt) std::memcpy(ss.session_salt, g_session_salt, kSessionSaltLen);
     bool started = false;
     for (int attempt = 0; attempt < 200 && !started; ++attempt) {
         size_t n = encode_stream_start(ss, ctl.data(), ctl.size());
@@ -258,7 +353,14 @@ void send_lane(const std::string &host, uint16_t port, uint16_t lane, const uint
 
     sock.set_nonblocking(true);
 
-    uint16_t block = start_block;
+    // The AEAD tag is carried inside payload_len, so the plaintext ceiling
+    // must leave room for it — otherwise the block size grows until
+    // payload_len exceeds kMaxPayloadSize and the receiver rejects
+    // every block.
+    const uint16_t block_ceiling =
+        g_encrypt ? static_cast<uint16_t>(kBlockMax - kAeadTagLen) : kBlockMax;
+
+    uint16_t block = std::min<uint16_t>(start_block, block_ceiling);
     uint32_t clean_batches = 0;
     uint64_t base = 0, next_seq = 0, next_offset = 0;
     uint64_t retransmits = 0, batches = 0;
@@ -280,7 +382,8 @@ void send_lane(const std::string &host, uint16_t port, uint16_t lane, const uint
         // Every segment in one sendmsg must be the same size, so a batch
         // uses a single block size; the size may change between batches.
         if (next_offset < shard_bytes && next_seq < base + window) {
-            const uint16_t seg = static_cast<uint16_t>(kDataPrefixSize + block);
+            const uint16_t seg = static_cast<uint16_t>(kDataPrefixSize + block +
+                                                       (g_encrypt ? kAeadTagLen : 0));
             size_t max_segs = std::min<size_t>(kGsoBudget / seg, window - (next_seq - base));
             size_t packed = 0, bytes_in_batch = 0;
 
@@ -302,7 +405,21 @@ void send_lane(const std::string &host, uint16_t port, uint16_t lane, const uint
                 if (sent_meta.size() <= next_seq) sent_meta.resize(next_seq + 1);
                 sent_meta[next_seq] = {next_offset, len};
 
-                size_t n = encode_data_datagram(hdr, now_ns(), data + next_offset,
+                const uint8_t *body = data + next_offset;
+                uint16_t body_len = len;
+                if (g_encrypt) {
+                    uint8_t aad[18];
+                    const size_t aad_len = build_aad(aad, lane, next_seq, next_offset);
+                    if (!cipher.seal(lane, next_seq, aad, aad_len, data + next_offset, len,
+                                     sealed.data())) {
+                        break; // fail closed rather than transmit plaintext
+                    }
+                    body = sealed.data();
+                    body_len = static_cast<uint16_t>(len + kAeadTagLen);
+                    hdr.payload_len = body_len;
+                }
+
+                size_t n = encode_data_datagram(hdr, now_ns(), body,
                                                 staging.data() + bytes_in_batch,
                                                 staging.size() - bytes_in_batch);
                 if (n == 0) break;
@@ -377,10 +494,25 @@ void send_lane(const std::string &host, uint16_t port, uint16_t lane, const uint
                     hdr.flags = kFlagRetransmission;
                     hdr.payload_len = slot->payload_len;
                     hdr.offset = sent_meta[seq].first;
-                    size_t n = encode_data_datagram(hdr, now_ns(), slot->payload, ctl.data(),
-                                                    ctl.size());
-                    if (n) sock.send_to(ctl.data(), n, dst);
-                    ++retransmits;
+                    const uint8_t *rbody = slot->payload;
+                    if (g_encrypt) {
+                        uint8_t aad[18];
+                        const size_t al = build_aad(aad, lane, seq, hdr.offset);
+                        if (!cipher.seal(lane, seq, aad, al, slot->payload, slot->payload_len,
+                                         sealed.data())) {
+                            continue;
+                        }
+                        rbody = sealed.data();
+                        hdr.payload_len = static_cast<uint16_t>(slot->payload_len + kAeadTagLen);
+                    }
+                    size_t n = encode_data_datagram(hdr, now_ns(), rbody, rtx.data(),
+                                                    rtx.size());
+                    // If the socket refuses this (buffer full) the block stays
+                    // NACK-able and the retransmit timer will come back to it;
+                    // only count retransmits that actually went out.
+                    if (n && sock.send_to(rtx.data(), n, dst)) {
+                        ++retransmits;
+                    }
                 }
             }
         }
@@ -392,17 +524,24 @@ void send_lane(const std::string &host, uint16_t port, uint16_t lane, const uint
         if (loss_seen) {
             block = kBlockMin;
             clean_batches = 0;
-        } else if (++clean_batches >= kCleanBatchesToGrow && block < kBlockMax) {
+        } else if (++clean_batches >= kCleanBatchesToGrow && block < block_ceiling) {
             clean_batches = 0;
-            block = static_cast<uint16_t>(std::min<uint32_t>(kBlockMax, block * 2u));
+            block = static_cast<uint16_t>(std::min<uint32_t>(block_ceiling, block * 2u));
         }
 
         // --- Retransmission timeout --------------------------------------
+        // Adaptive RTO (~2*RTT), 1 s until the first RTT sample. A fixed 5 ms
+        // is loopback-only: on a real-RTT path it spuriously retransmits every
+        // in-flight block many times before the ACK returns.
+        const uint64_t srtt = cc.rtt_ns();
+        const uint64_t rto_ns =
+            srtt ? std::clamp<uint64_t>(srtt * 2, 5000000ull, 1000000000ull) : 1000000000ull;
+
         const uint64_t t = now_ns();
         if (base != last_base) {
             last_base = base;
             last_progress = t;
-        } else if (t - last_progress > 5000000) {
+        } else if (t - last_progress > rto_ns) {
             cc.on_loss();
             const RegistrySlot *slot = reg.lookup(base);
             if (slot && base < sent_meta.size()) {
@@ -412,12 +551,34 @@ void send_lane(const std::string &host, uint16_t port, uint16_t lane, const uint
                 hdr.flags = kFlagRetransmission;
                 hdr.payload_len = slot->payload_len;
                 hdr.offset = sent_meta[base].first;
-                size_t n = encode_data_datagram(hdr, now_ns(), slot->payload, ctl.data(),
-                                                ctl.size());
-                if (n) sock.send_to(ctl.data(), n, dst);
-                ++retransmits;
+                const uint8_t *rbody = slot->payload;
+                if (g_encrypt) {
+                    uint8_t aad[18];
+                    const size_t al = build_aad(aad, lane, base, hdr.offset);
+                    if (cipher.seal(lane, base, aad, al, slot->payload, slot->payload_len,
+                                    sealed.data())) {
+                        rbody = sealed.data();
+                        hdr.payload_len = static_cast<uint16_t>(slot->payload_len + kAeadTagLen);
+                    }
+                }
+                size_t n = encode_data_datagram(hdr, now_ns(), rbody, rtx.data(),
+                                                rtx.size());
+                // A non-blocking socket refuses the send (EAGAIN/ENOBUFS)
+                // when its buffer is full. Treating that as "sent" is fatal:
+                // the block is never retransmitted again and the transfer
+                // stalls forever. Only charge the retransmit timer when the
+                // datagram actually left.
+                if (n && sock.send_to(rtx.data(), n, dst)) {
+                    ++retransmits;
+                    last_progress = t;
+                } else {
+                    // Buffer full: let it drain, then retry immediately.
+                    timespec nap{0, 200000}; // 200 us
+                    nanosleep(&nap, nullptr);
+                }
+            } else {
+                last_progress = t;
             }
-            last_progress = t;
         }
 
         if (t - t0 > 120ull * 1000000000ull) {
@@ -465,26 +626,33 @@ int run_receiver(uint16_t base_port, uint16_t lanes, const std::string &out_path
     const double secs =
         (first_start != UINT64_MAX && last_end > first_start) ? (last_end - first_start) / 1e9 : 0.0;
 
-    // Stitch the shards back together in lane order.
+    // Stitch the shards back together in lane order, streaming each straight
+    // to disk. Concatenating into one buffer first would double peak memory
+    // for no benefit — at multi-gigabyte transfers that is the difference
+    // between running and being OOM-killed.
     uint64_t total = 0;
-    for (auto &s : shards) total += s.size();
-    std::vector<uint8_t> file;
-    file.reserve(total);
-    for (auto &s : shards) file.insert(file.end(), s.begin(), s.end());
-
     std::ofstream out(out_path, std::ios::binary);
-    out.write(reinterpret_cast<const char *>(file.data()),
-              static_cast<std::streamsize>(file.size()));
+    for (auto &s : shards) {
+        out.write(reinterpret_cast<const char *>(s.data()),
+                  static_cast<std::streamsize>(s.size()));
+        total += s.size();
+    }
     out.close();
+
+    // Checksum per shard, then combine, so no full-file copy is needed.
+    uint64_t combined = 1469598103934665603ull;
+    for (auto &s : shards) {
+        combined ^= hash64(s.data(), s.size());
+        combined *= 1099511628211ull;
+    }
 
     bool all_ok = true;
     for (auto &s : stats) all_ok = all_ok && s.ok.load();
 
     std::printf("RECV bytes=%llu lanes=%u elapsed=%.4f throughput=%.1f MB/s ok=%d "
                 "checksum=%016llx\n",
-                (unsigned long long)file.size(), lanes, secs,
-                (file.size() / (1024.0 * 1024.0)) / secs, all_ok ? 1 : 0,
-                (unsigned long long)hash64(file.data(), file.size()));
+                (unsigned long long)total, lanes, secs, (total / (1024.0 * 1024.0)) / secs,
+                all_ok ? 1 : 0, (unsigned long long)combined);
     return all_ok ? 0 : 1;
 }
 
@@ -545,6 +713,14 @@ int main(int argc, char **argv) {
                      argv[0], argv[0]);
         return 2;
     }
+    if (const char *e = getenv("FUSE_ENCRYPT")) {
+        g_encrypt = (std::atoi(e) != 0);
+        if (g_encrypt && !session_crypto_available()) {
+            std::fprintf(stderr, "encryption requested but this build has no crypto backend\n");
+            return 2;
+        }
+    }
+
     if (std::strcmp(argv[1], "recv") == 0 && argc >= 5) {
         return run_receiver(static_cast<uint16_t>(std::atoi(argv[2])),
                             static_cast<uint16_t>(std::atoi(argv[3])), argv[4]);
@@ -552,6 +728,19 @@ int main(int argc, char **argv) {
     if (std::strcmp(argv[1], "send") == 0 && argc >= 6) {
         uint16_t block = (argc >= 7) ? static_cast<uint16_t>(std::atoi(argv[6])) : kBlockMin;
         block = std::clamp<uint16_t>(block, 64, kBlockMax);
+        if (const char *d = getenv("FUSE_DROP_PCT")) {
+            g_drop_pct = std::clamp(std::atoi(d), 0, 90);
+        }
+        if (g_encrypt) {
+            // One salt, one key, for the whole session — derived once and
+            // shared by every lane, rather than N independent handshakes.
+            if (!random_bytes(g_session_salt, kSessionSaltLen) ||
+                !derive_session_key(reinterpret_cast<const uint8_t *>(g_psk.data()),
+                                    g_psk.size(), g_session_salt, g_session_key)) {
+                std::fprintf(stderr, "failed to establish session key\n");
+                return 1;
+            }
+        }
         return run_sender(argv[2], static_cast<uint16_t>(std::atoi(argv[3])),
                           static_cast<uint16_t>(std::atoi(argv[4])), argv[5], block);
     }

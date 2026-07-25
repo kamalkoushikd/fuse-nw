@@ -6,5 +6,14 @@ includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
 Name: fuse
 Description: @PROJECT_DESCRIPTION@
 Version: @PROJECT_VERSION@
-Libs: -L${libdir} -lfuse
+URL: @PROJECT_HOMEPAGE_URL@
+Requires.private: @FUSE_PC_REQUIRES_PRIVATE@
+# -lfuse_proto is the transport itself (fuse/transfer.hpp and fuse/proto/*);
+# -lfuse is the older C scaffold. Both are listed so `pkg-config --libs fuse`
+# is enough to link either. -pthread is public: the worker threads are part
+# of how the library runs, not an implementation detail callers can avoid.
+# The -rpath makes a build against a non-system prefix run without the
+# caller having to set LD_LIBRARY_PATH. For a /usr or /usr/local install it
+# is a harmless no-op, since those are already on the loader's search path.
+Libs: -L${libdir} -Wl,-rpath,${libdir} -lfuse_proto -lfuse -pthread
 Cflags: -I${includedir}
