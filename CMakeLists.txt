@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.16)
 project(fuse
     VERSION 0.1.0
     DESCRIPTION "Fuse: an experimental low-latency transport protocol"
-    HOMEPAGE_URL "https://github.com/CHANGEME/fuse"
+    HOMEPAGE_URL "https://github.com/kamalkoushikd/fuse-nw"
     LANGUAGES C CXX
 )
 
@@ -122,6 +122,7 @@ add_library(fuse_proto
     src/proto/orchestrator.cpp
     src/proto/session_crypto.cpp
     src/proto/transfer.cpp
+    src/proto/sdk.cpp
 )
 add_library(fuse::proto ALIAS fuse_proto)
 
@@ -156,6 +157,8 @@ endif()
 target_include_directories(fuse_proto
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        # version.h is generated, so the build tree needs the binary dir too.
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 

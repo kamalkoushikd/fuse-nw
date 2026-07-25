@@ -38,6 +38,7 @@ add_executable(fuse_proto_tests
     proto/test_orchestrator.cpp
     proto/test_session_crypto.cpp
     proto/test_transfer.cpp
+    proto/test_sdk.cpp
 )
 
 target_link_libraries(fuse_proto_tests PRIVATE fuse::proto GTest::gtest_main)

@@ -48,6 +48,14 @@ enum class MsgType : uint8_t {
     SetupHashReply = 5,  // receiver's computed hash, receiver -> sender (Stage 2)
     SetupFinAck    = 6,  // sender's confirmed hash, sender -> receiver (Stage 2)
     StreamStart    = 7,  // per-stream length preamble for a bulk stream (Stage 4.2)
+    // Socket-style session control (fuse/sdk.h). A client HELLO lands on the
+    // listener's well-known port; the server answers HELLO-ACK from a fresh
+    // ephemeral socket, and the client adopts that reply's source address as
+    // its peer. That is how one listen port serves many connections without
+    // needing connection IDs — the same trick TFTP uses.
+    Hello          = 8,
+    HelloAck       = 9,
+    Close          = 10, // graceful teardown so the peer's recv() ends promptly
 };
 
 // Block header flag bits (Stage 1.1).

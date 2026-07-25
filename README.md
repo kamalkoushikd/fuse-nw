@@ -57,34 +57,69 @@ and a userspace network-emulator test harness.
 > loss-injection results, and what they do *not* say:
 > **[bench/RESULTS.md](bench/RESULTS.md)**.
 
-## Quickstart
+## Install
 
 ```sh
-sudo cmake --install build          # or install the .deb/.rpm from cpack
+curl -fsSL https://github.com/kamalkoushikd/fuse-nw/releases/latest/download/install.sh | sh
 ```
 
-```cmake
-find_package(fuse CONFIG REQUIRED)
-target_link_libraries(my_app PRIVATE fuse::proto)
+Installs to `/usr/local` as root, `~/.local` otherwise (`--prefix DIR` for
+anywhere else, `--uninstall` to remove). One download gives you the C/C++
+libraries and headers, CMake + pkg-config integration, and the Python
+package — wolfSSL is bundled, so there is nothing else to fetch.
+
+## Quickstart — write a networked program
+
+Fuse gives you a socket-style API: **listen, accept, connect, send, recv**.
+Messages keep their boundaries (one `send` = one `recv`), delivery is
+reliable, and `send` returns only once the peer has the data.
+
+**Python**
+
+```python
+import fuse
+
+# server
+with fuse.listen(port=4433) as server:
+    conn = server.accept()
+    print(conn.recv())
+    conn.send(b"pong")
+
+# client
+with fuse.connect("192.0.2.10", 4433) as conn:
+    conn.send(b"ping")
+    print(conn.recv())
 ```
 
-```cpp
-#include <fuse/transfer.hpp>
+**C**
 
-fuse::TransferConfig cfg;
+```c
+#include <fuse/sdk.h>
+
+fuse_config cfg;
+fuse_config_init(&cfg);
 cfg.host = "192.0.2.10";
-cfg.base_port = 4433;
-cfg.pre_shared_key = "shared-secret";   // optional
+cfg.port = 4433;
 
-fuse::send_file(cfg, "/path/to/file");  // receiver calls receive_file()
+fuse_conn *c = fuse_connect(&cfg, NULL);
+fuse_send(c, "ping", 4);
+
+char buf[4096]; size_t n;
+fuse_recv(c, buf, sizeof buf, &n, 5000);
+fuse_close(c);
 ```
 
-Full guide — install, ports, encryption, error handling, lower-level
-APIs: **[docs/USAGE.md](docs/USAGE.md)**.
+```sh
+cc app.c -o app $(pkg-config --cflags --libs fuse)   # or find_package(fuse CONFIG)
+```
 
-Two libraries are built: `fuse::proto` (the protocol above, C++17) and
-`fuse::fuse`, an earlier C scaffold with a varint codec, packet framing,
-and RFC 9001-verified HKDF primitives, kept for reference.
+Add `key="shared-secret"` (Python) or `cfg.pre_shared_key` (C) on both ends
+for AES-256-GCM encryption.
+
+**Full SDK guide — API reference, encryption, ports, threading,
+troubleshooting: [docs/SDK.md](docs/SDK.md).**
+Moving whole files or large buffers instead? That is a separate, faster
+API: [docs/USAGE.md](docs/USAGE.md).
 
 ## Building
 

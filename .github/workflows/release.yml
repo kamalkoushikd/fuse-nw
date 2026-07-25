@@ -1,0 +1,109 @@
+name: Release
+
+# Publishes the SDK when a version tag is pushed:
+#
+#     git tag v0.1.0 && git push origin v0.1.0
+#
+# Attaches a self-contained tarball plus install.sh to the GitHub release, so
+# users can install with:
+#
+#     curl -fsSL https://github.com/OWNER/REPO/releases/latest/download/install.sh | sh
+#
+# Can also be run manually from the Actions tab to test the packaging.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (without the leading v)"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the SDK tarball
+        run: ./scripts/make_release.sh "${{ steps.ver.outputs.version }}"
+
+      # Prove the artifact works before publishing it: install into a scratch
+      # prefix, then build and run a program against that install.
+      - name: Verify the tarball installs and works
+        run: |
+          set -e
+          V=${{ steps.ver.outputs.version }}
+          PFX="$RUNNER_TEMP/fuse-verify"
+          ./scripts/install.sh --tarball "dist/fuse-sdk-${V}-linux-x86_64.tar.gz" \
+                               --prefix "$PFX" --no-python
+          export PKG_CONFIG_PATH="$PFX/lib/pkgconfig"
+
+          cc examples/sdk/echo_server.c -o "$RUNNER_TEMP/srv" $(pkg-config --cflags --libs fuse)
+          cc examples/sdk/echo_client.c -o "$RUNNER_TEMP/cli" $(pkg-config --cflags --libs fuse)
+
+          "$RUNNER_TEMP/srv" 45999 & SRV=$!
+          sleep 1
+          OUT=$("$RUNNER_TEMP/cli" 127.0.0.1 45999 "ci-smoke-test")
+          kill $SRV || true
+          echo "$OUT"
+          echo "$OUT" | grep -q "ci-smoke-test" || { echo "smoke test failed"; exit 1; }
+
+          # And the Python bindings against the same install.
+          FUSE_LIBRARY="$PFX/lib/libfuse_proto.so" \
+            python3 python/tests/test_sdk.py
+
+      # A versionless copy so `releases/latest/download/...` has a stable name.
+      - name: Add a stable-name copy
+        run: |
+          V=${{ steps.ver.outputs.version }}
+          cp "dist/fuse-sdk-${V}-linux-x86_64.tar.gz" dist/fuse-sdk-linux-x86_64.tar.gz
+          ( cd dist && sha256sum fuse-sdk-linux-x86_64.tar.gz > fuse-sdk-linux-x86_64.tar.gz.sha256 )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fuse-sdk
+          path: dist/*
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            ```sh
+            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sh
+            ```
+
+            Installs to `/usr/local` as root, `~/.local` otherwise. Adding
+            `--prefix DIR` puts it anywhere; `--uninstall` removes it.
+
+            Ships the C/C++ libraries and headers, CMake and pkg-config
+            support, and the Python package.
+
+            ```c
+            #include <fuse/sdk.h>            // C: listen/accept/connect/send/recv
+            ```
+            ```python
+            import fuse                       # Python: fuse.listen(...), fuse.connect(...)
+            ```
+
+            See [docs/SDK.md](https://github.com/${{ github.repository }}/blob/main/docs/SDK.md).

@@ -17,3 +17,11 @@ target_link_libraries(fuse_quickstart_recv PRIVATE fuse::proto)
 
 add_executable(fuse_quickstart_send quickstart_send.cpp)
 target_link_libraries(fuse_quickstart_send PRIVATE fuse::proto)
+
+# SDK examples: a concurrent echo server/client using the socket-style API.
+# These are plain C, exactly as an external developer would write them.
+add_executable(fuse_echo_sdk_server sdk/echo_server.c)
+target_link_libraries(fuse_echo_sdk_server PRIVATE fuse::proto)
+
+add_executable(fuse_echo_sdk_client sdk/echo_client.c)
+target_link_libraries(fuse_echo_sdk_client PRIVATE fuse::proto)
