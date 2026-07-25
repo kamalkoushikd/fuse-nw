@@ -24,3 +24,6 @@ _deps/
 # Rust benchmark baseline build artifacts
 bench/quic/target/
 dist/
+dist-py/
+__pycache__/
+*.pyc

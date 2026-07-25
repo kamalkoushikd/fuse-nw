@@ -1,0 +1,115 @@
+name: Publish to PyPI
+
+# Builds and publishes the `fuse-transport` Python package.
+#
+#     git tag v0.1.0 && git push origin v0.1.0
+#
+# Wheels bundle the compiled transport (libfuse_proto + the wolfSSL it was
+# built against), so `pip install fuse-transport` needs no compiler, no
+# CMake, and no system wolfSSL.
+#
+# Publishing uses PyPI Trusted Publishing (OIDC) — there is no API token to
+# create or rotate. One-time setup on PyPI:
+#
+#   pypi.org -> Your projects -> Publishing -> Add a pending publisher
+#     PyPI project name : fuse-transport
+#     Owner             : kamalkoushikd
+#     Repository        : fuse-nw
+#     Workflow name     : publish-python.yml
+#     Environment       : pypi
+#
+# Run it manually first (Actions -> Publish to PyPI -> Run workflow) to build
+# and test wheels without publishing anything.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to PyPI (otherwise just build and test)"
+        type: boolean
+        default: false
+
+jobs:
+  wheels:
+    name: wheel (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-latest }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+
+      # The bindings are ctypes, not a C extension, so the wheel carries no
+      # CPython ABI and one build covers every interpreter (py3-none-*).
+      # Building it under a single Python is therefore sufficient, not a
+      # compromise — see wheel.py-api in pyproject.toml.
+      - name: Build the wheel
+        uses: pypa/cibuildwheel@v2.21
+        env:
+          CIBW_BUILD: cp312-manylinux_*
+          CIBW_ARCHS: ${{ matrix.arch }}
+          # AlmaLinux 8 based: new enough for C++17 and the UDP GSO / recvmmsg
+          # headers, old enough to run on any currently supported distro.
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
+          # wolfSSL is fetched and built from source inside the container.
+          CIBW_BEFORE_ALL_LINUX: yum install -y git
+          # A wheel that imports but cannot open a socket is worthless, so the
+          # test is a real loopback round-trip through the bundled library.
+          CIBW_TEST_COMMAND: >-
+            python -m fuse selftest &&
+            python -m unittest discover -s {project}/python/tests -v
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the sdist
+        run: pipx run build --sdist
+
+      # Anyone on a platform without a wheel builds from this, so prove it
+      # compiles and runs rather than assuming it does.
+      - name: Install from the sdist and self-test
+        run: |
+          python -m venv /tmp/sdist-venv
+          /tmp/sdist-venv/bin/pip install --no-binary :all: dist/*.tar.gz
+          cd /tmp && /tmp/sdist-venv/bin/python -m fuse selftest
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    name: Publish to PyPI
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || inputs.publish
+    environment: pypi
+    permissions:
+      id-token: write # mints the OIDC token Trusted Publishing verifies
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "{wheels-*,sdist}"
+          merge-multiple: true
+
+      - run: ls -la dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

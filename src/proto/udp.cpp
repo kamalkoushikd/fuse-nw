@@ -19,6 +19,16 @@
 #define SOL_UDP 17
 #endif
 
+// UDP_SEGMENT (generic segmentation offload) arrived in Linux 4.18. Building
+// inside an older sysroot — a manylinux container, say — can miss the
+// definition even though the kernel the wheel eventually runs on supports it.
+// The value is fixed ABI, so defining it keeps the build portable; a kernel
+// that genuinely lacks GSO just fails the setsockopt/cmsg and the sender
+// falls back to unbatched sends.
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
+
 namespace fuse::proto {
 
 UdpSocket::~UdpSocket() {

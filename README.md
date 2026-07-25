@@ -59,12 +59,24 @@ and a userspace network-emulator test harness.
 
 ## Install
 
+**Python**
+
+```sh
+pip install fuse-transport      # or: uv add fuse-transport
+```
+
+Wheels bundle the compiled transport and its wolfSSL, so there is no
+compiler, no CMake, and nothing else to install. Check it with
+`python -m fuse selftest`.
+
+**C / C++**
+
 ```sh
 curl -fsSL https://github.com/kamalkoushikd/fuse-nw/releases/latest/download/install.sh | sh
 ```
 
 Installs to `/usr/local` as root, `~/.local` otherwise (`--prefix DIR` for
-anywhere else, `--uninstall` to remove). One download gives you the C/C++
+anywhere else, `--uninstall` to remove). One download gives you the
 libraries and headers, CMake + pkg-config integration, and the Python
 package — wolfSSL is bundled, so there is nothing else to fetch.
 

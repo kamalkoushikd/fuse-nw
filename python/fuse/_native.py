@@ -18,7 +18,6 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import os
-import sys
 from pathlib import Path
 
 _LIB_NAMES = ("libfuse_proto.so.0", "libfuse_proto.so")
@@ -66,10 +65,14 @@ def _load():
             tried.append(f"  {cand}: {exc}")
     raise ImportError(
         "could not load the Fuse shared library (libfuse_proto.so).\n"
-        "Install the SDK, or point FUSE_LIBRARY at the library:\n\n"
+        "A wheel from PyPI bundles it, so this usually means the package was\n"
+        "installed from source without the native build, or the wheel is for\n"
+        "a different platform.\n\n"
+        "    pip install --force-reinstall fuse-transport\n"
+        "    # or install the full C/C++ SDK:\n"
         "    curl -fsSL https://github.com/kamalkoushikd/fuse-nw/releases/latest/"
         "download/install.sh | sh\n"
-        "    # or, against a build tree:\n"
+        "    # or point at a build tree directly:\n"
         "    export FUSE_LIBRARY=/path/to/build/libfuse_proto.so\n\n"
         "Tried:\n" + "\n".join(tried)
     )

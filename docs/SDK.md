@@ -15,6 +15,24 @@ listen, accept, connect, send, receive — in C or Python.
 
 ## Install
 
+### Python — from PyPI
+
+```sh
+pip install fuse-transport      # or: uv add fuse-transport
+```
+
+The distribution is `fuse-transport` (plain `fuse` was taken); you still
+`import fuse`. Wheels carry the compiled transport and its wolfSSL inside the
+package, so nothing needs a compiler or a system library. Verify with:
+
+```sh
+python -m fuse selftest
+```
+
+which prints the loaded library path and runs a loopback round-trip.
+
+### C, C++, or everything at once
+
 ```sh
 curl -fsSL https://github.com/kamalkoushikd/fuse-nw/releases/latest/download/install.sh | sh
 ```

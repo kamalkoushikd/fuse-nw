@@ -1,0 +1,120 @@
+# Python packaging for the Fuse SDK.
+#
+# This lives at the repository root rather than in python/ on purpose: the
+# wheel has to contain the *compiled* transport, so the build backend needs
+# the C++ sources and CMakeLists.txt beside it. An sdist rooted at python/
+# could not reach ../src, and `pip install fuse-transport` would then produce
+# a package that imports and immediately fails for want of a shared library.
+#
+#   dist name : fuse-transport   (plain "fuse" is taken on PyPI)
+#   import as : fuse
+#
+# scikit-build-core runs the same CMake build the C SDK uses, then installs
+# the resulting shared libraries *inside* the package directory, where
+# fuse/_native.py already looks first. So the wheel is self-contained:
+# libfuse_proto, libfuse, and the wolfSSL it was built against all ship in it.
+
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "fuse-transport"
+dynamic = ["version"]
+description = "Socket-style Python bindings for the Fuse UDP transport protocol"
+readme = "python/README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Kamal Koushik D" }]
+keywords = ["networking", "transport", "udp", "protocol", "sockets", "quic"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Networking",
+    "Typing :: Typed",
+]
+# No runtime dependencies: the bindings are ctypes against a library that
+# ships in the same wheel.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/kamalkoushikd/fuse-nw"
+Documentation = "https://github.com/kamalkoushikd/fuse-nw/blob/main/docs/SDK.md"
+Source = "https://github.com/kamalkoushikd/fuse-nw"
+Issues = "https://github.com/kamalkoushikd/fuse-nw/issues"
+
+# --- scikit-build-core ------------------------------------------------------
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.version = ">=3.16"
+build-dir = "build/wheel/{wheel_tag}"
+
+# The Python sources live in python/fuse; the CMake install lands under the
+# same package directory so the .so files sit next to __init__.py.
+wheel.packages = ["python/fuse"]
+wheel.install-dir = "fuse"
+
+# There is no compiled *extension module* here — only ctypes against a plain
+# shared library — so one wheel serves every CPython and PyPy on a platform.
+wheel.py-api = "py3"
+
+# Keep the wheel to what Python actually needs. Headers, CMake/pkg-config
+# files and docs belong to the C SDK; shipping them here would also bake in a
+# `prefix=` pointing at a staging directory that does not exist on the user's
+# machine, which is worse than not shipping them at all.
+#
+# A wheel is a zip and cannot hold symlinks, so the usual libfoo.so ->
+# libfoo.so.0 -> libfoo.so.0.1.0 chain would be unpacked into three identical
+# copies of every library. Ship only the SONAME-versioned file, which is the
+# name recorded in the NEEDED entry and the first name _native.py tries.
+# libfuse.so is the older C scaffold and is not a dependency of
+# libfuse_proto.so, so Python has no use for it either.
+wheel.exclude = [
+    "fuse/include/**",
+    "fuse/lib/cmake/**",
+    "fuse/lib/pkgconfig/**",
+    "fuse/lib/*.a",
+    "fuse/share/**",
+    "fuse/bin/**",
+    "fuse/lib/libfuse.so*",
+    "fuse/lib/*.so",
+    "fuse/lib/*.so.*.*.*",
+]
+
+[tool.scikit-build.cmake.define]
+FUSE_BUILD_TESTS = "OFF"
+FUSE_BUILD_EXAMPLES = "OFF"
+FUSE_BUILD_BENCH = "OFF"
+BUILD_SHARED_LIBS = "ON"
+# ctypes dlopen()s by filename, so the libraries must land in a directory the
+# package can predict — not lib64/ on Fedora and lib/ on Debian.
+CMAKE_INSTALL_LIBDIR = "lib"
+CMAKE_BUILD_TYPE = "RelWithDebInfo"
+
+# Single source of truth for the version: CMakeLists.txt's project(VERSION).
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "CMakeLists.txt"
+regex = '(?sm)^project\s*\(\s*fuse\s+VERSION\s+(?P<value>[0-9]+(\.[0-9]+)*)'
+
+# The sdist must carry everything needed to rebuild from source, but not the
+# 164 MB of benchmark corpora and Rust build artifacts.
+[tool.scikit-build.sdist]
+exclude = [
+    "bench/quic/target",
+    "bench/**/*.bin",
+    "build",
+    "dist",
+    "dist-py",
+    ".github",
+    # Developer tooling that happens to be committed, not part of the build.
+    "graphify-out",
+    ".agents",
+    ".claude",
+    "BUILD.md",
+]
