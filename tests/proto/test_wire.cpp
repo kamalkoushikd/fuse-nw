@@ -47,10 +47,12 @@ TEST(Wire, HeaderSizesMatchSpec) {
     // (adapting to the link) without the receiver misplacing payloads.
     EXPECT_EQ(kBlockHeaderSize, 21u);
     EXPECT_EQ(kOuterHeaderSize, 2u);
-    // v3 widened the window to a multi-word bitmask, capped at 255 since
-    // window_size still rides in one wire byte (setup.cpp put_u8/get_u8).
-    EXPECT_EQ(kMaxWindow, 255u);
-    EXPECT_EQ(kProtocolVersion, 3u);
+    // v5 widened window_size to a two-byte wire field (setup.cpp
+    // put_u16/get_u16), raising the cap from 255 to 1024 in-flight blocks.
+    EXPECT_EQ(kMaxWindow, 1024u);
+    // v4 added a server-chosen salt to HelloAck (sdk.cpp), so the session
+    // key depends on randomness the client alone can never determine.
+    EXPECT_EQ(kProtocolVersion, 5u);
 
     // The MTU-safe default stays well under a 1500-byte path MTU; the
     // ceiling is only reached by probing a link that proves it can take it.

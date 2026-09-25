@@ -1,4 +1,4 @@
-#include "fuse/proto/aux.hpp"
+#include "fuse/proto/control.hpp"
 
 #include <cstring>
 
@@ -70,7 +70,7 @@ size_t encode_stream_start(const StreamStart &ss, uint8_t *out, size_t out_cap) 
 
 bool decode_stream_start(const uint8_t *in, size_t in_len, StreamStart *ss) {
     size_t off = check_outer(in, in_len, MsgType::StreamStart);
-    if (off == 0 || in_len != kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8) {
+    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8) {
         return false;
     }
     off += get_u16(in + off, &ss->stream_id);
@@ -141,7 +141,7 @@ bool decode_nack(const uint8_t *in, size_t in_len, Nack *nack) {
     if (nack->count > kMaxWindow) {
         return false;
     }
-    if (in_len != kOuterHeaderSize + 2 + 2 + static_cast<size_t>(nack->count) * 8) {
+    if (in_len < kOuterHeaderSize + 2 + 2 + static_cast<size_t>(nack->count) * 8) {
         return false;
     }
     for (uint16_t i = 0; i < nack->count; ++i) {

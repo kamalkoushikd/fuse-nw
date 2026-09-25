@@ -7,6 +7,9 @@
 #include <thread>
 #include <vector>
 
+#include "fuse/proto/block.hpp"
+#include "fuse/proto/control.hpp"
+#include "fuse/proto/udp.hpp"
 #include "fuse/transfer.hpp"
 
 namespace {
@@ -141,11 +144,129 @@ TEST(Transfer, WrongKeyDoesNotYieldData) {
     fuse::send_buffer(tx, payload.data(), payload.size(), nullptr);
     receiver.join();
 
-    EXPECT_NE(rs, fuse::TransferStatus::Ok) << "a mismatched key must not complete a transfer";
+    // Specifically AuthFailed, not just "not Ok": the idle-timeout exit path
+    // used to skip the auth-failure classification entirely (it lived only
+    // after the loop's natural-completion exit, which this scenario can
+    // never reach — every block fails auth, so rx.on_receive is never
+    // called and base_seq_no never advances), so a wrong key always
+    // reported a generic Timeout instead of the more specific, actionable
+    // AuthFailed.
+    EXPECT_EQ(rs, fuse::TransferStatus::AuthFailed) << fuse::to_string(rs);
     EXPECT_NE(got, payload) << "no plaintext may be recovered with the wrong key";
 }
 
 #endif // FUSE_PROTO_WITH_DTLS
+
+// A block claiming an offset near UINT64_MAX, combined with a small
+// payload, makes `offset + payload_len` wrap past zero under naive unsigned
+// addition — small enough to slip past a bounds check of the form
+// "offset + len <= size()", after which the receiver would memcpy at the
+// real, unwrapped (and wildly out-of-range) offset. Nothing authenticates
+// `offset` in plaintext mode, so this is reachable by anyone who can reach
+// the port, not just a party holding the PSK.
+TEST(Transfer, MaliciousOffsetIsRejectedNotWritten) {
+    using namespace fuse::proto;
+    const uint16_t port = next_port();
+    const auto payload = make_payload(64);
+
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = port;
+    rx.lanes = 1;
+    rx.timeout_ms = 3000;
+
+    std::vector<uint8_t> got;
+    fuse::TransferStatus rs = fuse::TransferStatus::Incomplete;
+    std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    UdpSocket atk;
+    ASSERT_TRUE(atk.open("127.0.0.1", 0));
+    PeerAddr dst;
+    ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", port, &dst));
+
+    StreamStart ss;
+    ss.stream_id = 0;
+    ss.total_bytes = payload.size();
+    ss.nonce = 0x1234;
+    uint8_t ssdg[256];
+    const size_t ssn = encode_stream_start(ss, ssdg, sizeof(ssdg));
+    ASSERT_GT(ssn, 0u);
+    ASSERT_TRUE(atk.send_to(ssdg, ssn, dst));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // The malicious block: in-window seq_no (so the receiver's window logic
+    // accepts it) but an offset designed to wrap.
+    {
+        BlockHeader hdr;
+        hdr.stream_id = 0;
+        hdr.seq_no = 1;
+        hdr.flags = 0;
+        hdr.payload_len = 8;
+        hdr.offset = UINT64_MAX - 4;
+        uint8_t body[8] = {0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
+        uint8_t dg[512];
+        const size_t dn = encode_data_datagram(hdr, 0, body, dg, sizeof(dg));
+        ASSERT_GT(dn, 0u);
+        ASSERT_TRUE(atk.send_to(dg, dn, dst));
+    }
+
+    // The real, final block — completes the transfer.
+    {
+        BlockHeader hdr;
+        hdr.stream_id = 0;
+        hdr.seq_no = 0;
+        hdr.flags = kFlagLastBlock;
+        hdr.payload_len = static_cast<uint16_t>(payload.size());
+        hdr.offset = 0;
+        uint8_t dg[512];
+        const size_t dn = encode_data_datagram(hdr, 0, payload.data(), dg, sizeof(dg));
+        ASSERT_GT(dn, 0u);
+        ASSERT_TRUE(atk.send_to(dg, dn, dst));
+    }
+
+    receiver.join();
+    ASSERT_EQ(rs, fuse::TransferStatus::Ok) << fuse::to_string(rs);
+    EXPECT_EQ(got, payload) << "an out-of-range offset must be rejected, not written";
+}
+
+// StreamStart's total_bytes is an unauthenticated wire value even under a
+// PSK (it is read before any per-block auth check). A hostile claim near
+// UINT64_MAX must fail this lane cleanly, not propagate an uncaught
+// allocation-failure exception out of the lane's thread and terminate the
+// whole process.
+TEST(Transfer, HugeStreamStartSizeFailsCleanlyInsteadOfCrashing) {
+    using namespace fuse::proto;
+    const uint16_t port = next_port();
+
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = port;
+    rx.lanes = 1;
+    rx.timeout_ms = 3000;
+
+    std::vector<uint8_t> got;
+    fuse::TransferStatus rs = fuse::TransferStatus::Ok;
+    std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    UdpSocket atk;
+    ASSERT_TRUE(atk.open("127.0.0.1", 0));
+    PeerAddr dst;
+    ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", port, &dst));
+
+    StreamStart ss;
+    ss.stream_id = 0;
+    ss.total_bytes = UINT64_MAX - 8; // exceeds any real allocator's max_size()
+    ss.nonce = 0x5;
+    uint8_t dg[256];
+    const size_t n = encode_stream_start(ss, dg, sizeof(dg));
+    ASSERT_GT(n, 0u);
+    ASSERT_TRUE(atk.send_to(dg, n, dst));
+
+    receiver.join(); // must return promptly, not crash the whole test binary
+    EXPECT_EQ(rs, fuse::TransferStatus::ResourceLimit) << fuse::to_string(rs);
+}
 
 TEST(Transfer, RejectsBadConfiguration) {
     fuse::TransferConfig cfg;

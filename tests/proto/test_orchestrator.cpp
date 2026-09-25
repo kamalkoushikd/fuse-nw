@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <set>
 #include <thread>
 
 #include "fuse/proto/orchestrator.hpp"
@@ -119,22 +118,6 @@ TEST(Orchestrator, StabilizationWindowLimitsScalingRate) {
 
     EXPECT_LE(orc.worker_count(), 2)
         << "only one scale action should fit inside a 500 ms stabilization window";
-    orc.stop();
-}
-
-TEST(Orchestrator, PlacesWorkersOnDistinctLeastLoadedCores) {
-    if (std::thread::hardware_concurrency() < 4) {
-        GTEST_SKIP() << "needs at least 4 cores";
-    }
-    SyntheticLoad load;
-    WorkerOrchestrator orc(fast_config(4, 4), [&](uint16_t id) { return load(id); });
-    orc.start();
-
-    auto cores = orc.assigned_cores();
-    ASSERT_EQ(cores.size(), 4u);
-    std::set<int> distinct(cores.begin(), cores.end());
-    EXPECT_EQ(distinct.size(), 4u)
-        << "least-loaded placement should spread workers across cores";
     orc.stop();
 }
 

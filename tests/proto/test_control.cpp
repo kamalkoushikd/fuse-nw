@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "fuse/proto/aux.hpp"
+#include "fuse/proto/control.hpp"
 
 using namespace fuse::proto;
 

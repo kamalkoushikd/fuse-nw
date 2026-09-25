@@ -13,6 +13,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <new>
 #include <utility>
 
 #ifndef SOL_UDP
@@ -31,16 +32,113 @@
 
 namespace fuse::proto {
 
-UdpSocket::~UdpSocket() {
-    close();
+namespace {
+// The real type behind UdpSocket::batch_scratch_ (kept opaque in the public
+// header — see its comment there).
+struct BatchScratch {
+    mmsghdr msgs[64]{};
+    iovec iovs[64]{};
+    sockaddr_storage addrs[64]{};
+};
+
+// Shared by open() (binds a local address) and resolve() (builds a peer
+// address): nullptr/"0.0.0.0" is the IPv4 wildcard, "::" the IPv6 wildcard,
+// and anything else is tried as an IPv4 literal, then an IPv6 one.
+bool parse_sockaddr(const char *addr, uint16_t port, sockaddr_storage *out, socklen_t *out_len) {
+    std::memset(out, 0, sizeof(*out));
+    if (addr == nullptr || std::strcmp(addr, "0.0.0.0") == 0) {
+        auto *v4 = reinterpret_cast<sockaddr_in *>(out);
+        v4->sin_family = AF_INET;
+        v4->sin_port = htons(port);
+        v4->sin_addr.s_addr = htonl(INADDR_ANY);
+        *out_len = sizeof(sockaddr_in);
+        return true;
+    }
+    if (std::strcmp(addr, "::") == 0) {
+        auto *v6 = reinterpret_cast<sockaddr_in6 *>(out);
+        v6->sin6_family = AF_INET6;
+        v6->sin6_port = htons(port);
+        v6->sin6_addr = in6addr_any;
+        *out_len = sizeof(sockaddr_in6);
+        return true;
+    }
+    auto *v4 = reinterpret_cast<sockaddr_in *>(out);
+    if (inet_pton(AF_INET, addr, &v4->sin_addr) == 1) {
+        v4->sin_family = AF_INET;
+        v4->sin_port = htons(port);
+        *out_len = sizeof(sockaddr_in);
+        return true;
+    }
+    std::memset(out, 0, sizeof(*out));
+    auto *v6 = reinterpret_cast<sockaddr_in6 *>(out);
+    if (inet_pton(AF_INET6, addr, &v6->sin6_addr) == 1) {
+        v6->sin6_family = AF_INET6;
+        v6->sin6_port = htons(port);
+        *out_len = sizeof(sockaddr_in6);
+        return true;
+    }
+    return false;
+}
+} // namespace
+
+bool PeerAddr::operator==(const PeerAddr &o) const {
+    if (addr.ss_family != o.addr.ss_family) {
+        return false;
+    }
+    if (addr.ss_family == AF_INET) {
+        const auto &a = reinterpret_cast<const sockaddr_in &>(addr);
+        const auto &b = reinterpret_cast<const sockaddr_in &>(o.addr);
+        return a.sin_port == b.sin_port && a.sin_addr.s_addr == b.sin_addr.s_addr;
+    }
+    if (addr.ss_family == AF_INET6) {
+        const auto &a = reinterpret_cast<const sockaddr_in6 &>(addr);
+        const auto &b = reinterpret_cast<const sockaddr_in6 &>(o.addr);
+        return a.sin6_port == b.sin6_port &&
+               std::memcmp(&a.sin6_addr, &b.sin6_addr, sizeof(a.sin6_addr)) == 0;
+    }
+    return false;
 }
 
-UdpSocket::UdpSocket(UdpSocket &&other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+uint16_t peer_port(const PeerAddr &p) {
+    if (p.addr.ss_family == AF_INET) {
+        return ntohs(reinterpret_cast<const sockaddr_in &>(p.addr).sin_port);
+    }
+    if (p.addr.ss_family == AF_INET6) {
+        return ntohs(reinterpret_cast<const sockaddr_in6 &>(p.addr).sin6_port);
+    }
+    return 0;
+}
+
+bool peer_to_string(const PeerAddr &p, char *buf, size_t buf_cap) {
+    if (p.addr.ss_family == AF_INET) {
+        return inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in &>(p.addr).sin_addr, buf,
+                         static_cast<socklen_t>(buf_cap)) != nullptr;
+    }
+    if (p.addr.ss_family == AF_INET6) {
+        return inet_ntop(AF_INET6, &reinterpret_cast<const sockaddr_in6 &>(p.addr).sin6_addr, buf,
+                         static_cast<socklen_t>(buf_cap)) != nullptr;
+    }
+    return false;
+}
+
+UdpSocket::~UdpSocket() {
+    close();
+    delete static_cast<BatchScratch *>(batch_scratch_);
+    batch_scratch_ = nullptr;
+}
+
+UdpSocket::UdpSocket(UdpSocket &&other) noexcept
+    : fd_(std::exchange(other.fd_, -1)),
+      gso_failed_(std::exchange(other.gso_failed_, false)),
+      batch_scratch_(std::exchange(other.batch_scratch_, nullptr)) {}
 
 UdpSocket &UdpSocket::operator=(UdpSocket &&other) noexcept {
     if (this != &other) {
         close();
+        delete static_cast<BatchScratch *>(batch_scratch_);
         fd_ = std::exchange(other.fd_, -1);
+        gso_failed_ = std::exchange(other.gso_failed_, false);
+        batch_scratch_ = std::exchange(other.batch_scratch_, nullptr);
     }
     return *this;
 }
@@ -48,22 +146,18 @@ UdpSocket &UdpSocket::operator=(UdpSocket &&other) noexcept {
 bool UdpSocket::open(const char *addr, uint16_t port) {
     close();
 
-    fd_ = socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_storage local{};
+    socklen_t local_len = 0;
+    if (!parse_sockaddr(addr, port, &local, &local_len)) {
+        return false;
+    }
+
+    fd_ = socket(local.ss_family, SOCK_DGRAM, 0);
     if (fd_ < 0) {
         return false;
     }
 
-    sockaddr_in local{};
-    local.sin_family = AF_INET;
-    local.sin_port = htons(port);
-    if (addr == nullptr || std::strcmp(addr, "0.0.0.0") == 0) {
-        local.sin_addr.s_addr = htonl(INADDR_ANY);
-    } else if (inet_pton(AF_INET, addr, &local.sin_addr) != 1) {
-        close();
-        return false;
-    }
-
-    if (bind(fd_, reinterpret_cast<sockaddr *>(&local), sizeof(local)) != 0) {
+    if (bind(fd_, reinterpret_cast<sockaddr *>(&local), local_len) != 0) {
         close();
         return false;
     }
@@ -81,12 +175,12 @@ uint16_t UdpSocket::local_port() const {
     if (fd_ < 0) {
         return 0;
     }
-    sockaddr_in bound{};
-    socklen_t len = sizeof(bound);
-    if (getsockname(fd_, reinterpret_cast<sockaddr *>(&bound), &len) != 0) {
+    PeerAddr bound;
+    bound.len = sizeof(bound.addr);
+    if (getsockname(fd_, reinterpret_cast<sockaddr *>(&bound.addr), &bound.len) != 0) {
         return 0;
     }
-    return ntohs(bound.sin_port);
+    return peer_port(bound);
 }
 
 bool UdpSocket::set_nonblocking(bool nonblocking) {
@@ -102,15 +196,7 @@ bool UdpSocket::set_nonblocking(bool nonblocking) {
 }
 
 bool UdpSocket::resolve(const char *addr, uint16_t port, PeerAddr *out) {
-    out->addr = sockaddr_in{};
-    out->addr.sin_family = AF_INET;
-    out->addr.sin_port = htons(port);
-    out->len = sizeof(sockaddr_in);
-    if (addr == nullptr || std::strcmp(addr, "0.0.0.0") == 0) {
-        out->addr.sin_addr.s_addr = htonl(INADDR_ANY);
-        return true;
-    }
-    return inet_pton(AF_INET, addr, &out->addr.sin_addr) == 1;
+    return parse_sockaddr(addr, port, &out->addr, &out->len);
 }
 
 bool UdpSocket::send_to(const uint8_t *data, size_t len, const PeerAddr &dst) {
@@ -145,7 +231,7 @@ bool UdpSocket::send_segmented(const uint8_t *buf, size_t len, uint16_t segment_
     alignas(cmsghdr) char control[CMSG_SPACE(sizeof(uint16_t))] = {};
 
     msghdr msg{};
-    msg.msg_name = const_cast<sockaddr_in *>(&dst.addr);
+    msg.msg_name = const_cast<sockaddr_storage *>(&dst.addr);
     msg.msg_namelen = dst.len;
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
@@ -175,15 +261,22 @@ int UdpSocket::recv_batch(uint8_t *buf, size_t slot_size, size_t max_msgs, size_
     if (fd_ < 0 || max_msgs == 0 || slot_size == 0) {
         return -1;
     }
-    // Cap the per-call batch so these stay stack-friendly.
+    // Cap the per-call batch to what BatchScratch holds.
     constexpr size_t kMaxBatch = 64;
     if (max_msgs > kMaxBatch) {
         max_msgs = kMaxBatch;
     }
 
-    mmsghdr msgs[kMaxBatch]{};
-    iovec iovs[kMaxBatch]{};
-    sockaddr_in addrs[kMaxBatch]{};
+    if (batch_scratch_ == nullptr) {
+        batch_scratch_ = new (std::nothrow) BatchScratch();
+        if (batch_scratch_ == nullptr) {
+            return -1;
+        }
+    }
+    auto *scratch = static_cast<BatchScratch *>(batch_scratch_);
+    mmsghdr *msgs = scratch->msgs;
+    iovec *iovs = scratch->iovs;
+    sockaddr_storage *addrs = scratch->addrs;
 
     for (size_t i = 0; i < max_msgs; ++i) {
         iovs[i].iov_base = buf + i * slot_size;
@@ -191,7 +284,7 @@ int UdpSocket::recv_batch(uint8_t *buf, size_t slot_size, size_t max_msgs, size_
         msgs[i].msg_hdr.msg_iov = &iovs[i];
         msgs[i].msg_hdr.msg_iovlen = 1;
         msgs[i].msg_hdr.msg_name = &addrs[i];
-        msgs[i].msg_hdr.msg_namelen = sizeof(sockaddr_in);
+        msgs[i].msg_hdr.msg_namelen = sizeof(sockaddr_storage);
     }
 
     // MSG_WAITFORONE is essential, not an optimisation: without it recvmmsg
@@ -217,7 +310,7 @@ bool UdpSocket::recv_from(uint8_t *buf, size_t buf_cap, size_t *out_len, PeerAdd
     if (fd_ < 0) {
         return false;
     }
-    sockaddr_in from{};
+    sockaddr_storage from{};
     socklen_t from_len = sizeof(from);
     ssize_t got = recvfrom(fd_, buf, buf_cap, 0,
                            reinterpret_cast<sockaddr *>(&from), &from_len);

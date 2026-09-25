@@ -9,19 +9,39 @@
 // wrapper's job is only the send/recv discipline: a receive buffer sized
 // to hold the largest possible datagram (so the kernel never truncates a
 // block), and the peer address plumbing the endpoints need to reply.
+//
+// Dual-stack: an address is IPv4 or IPv6 depending on what it parses as.
+// open()/resolve() treat nullptr/"0.0.0.0" as the IPv4 wildcard (existing
+// behavior, unchanged) and "::" as the IPv6 wildcard; any other literal is
+// tried as IPv4 first, then IPv6. There is no dual-stack (v4-mapped-on-v6)
+// socket — a bound address is exactly one family, matching what its callers
+// already assume one UdpSocket instance means one local endpoint.
 
 #include <cstddef>
 #include <cstdint>
 #include <netinet/in.h>
+#include <sys/socket.h>
 
 namespace fuse::proto {
 
-// An opaque, comparable peer address (IPv4). Endpoints copy these around
-// to remember where to send ACKs/NACKs without touching sockaddr directly.
+// An opaque, comparable peer address (IPv4 or IPv6). Endpoints copy these
+// around to remember where to send ACKs/NACKs without touching sockaddr
+// directly — use peer_port()/peer_to_string() below for the rare caller
+// that needs to report an address to a human.
 struct PeerAddr {
-    sockaddr_in addr{};
-    socklen_t   len = sizeof(sockaddr_in);
+    sockaddr_storage addr{};
+    socklen_t        len = 0;
+
+    bool operator==(const PeerAddr &o) const;
 };
+
+// The address's port in host byte order, or 0 if addr is empty/unrecognized.
+uint16_t peer_port(const PeerAddr &p);
+
+// Formats just the address (no port) into buf, e.g. "192.0.2.1" or
+// "2001:db8::1". Returns false if buf is too small or the family is
+// unrecognized.
+bool peer_to_string(const PeerAddr &p, char *buf, size_t buf_cap);
 
 class UdpSocket {
 public:
@@ -93,6 +113,13 @@ public:
 private:
     int fd_ = -1;
     bool gso_failed_ = false; // set once the kernel refuses UDP GSO here
+    // Scratch space for recv_batch's kernel-facing structs (mmsghdr/iovec/
+    // sockaddr_in), heap-allocated once per socket instead of ~5.6KB of
+    // stack pushed and popped on every single call. Kept opaque here (a
+    // raw pointer to a struct defined in udp.cpp) so this public header
+    // doesn't need <sys/socket.h>'s mmsghdr — and the _GNU_SOURCE it
+    // requires — visible to every file that includes udp.hpp.
+    void *batch_scratch_ = nullptr;
 };
 
 } // namespace fuse::proto

@@ -25,7 +25,20 @@ namespace fuse::proto {
 // a multi-word bitmask (kMaskWords words), and added a handshake nonce to
 // StreamStart/Ack so a stale ACK from a prior session can't be mistaken for
 // confirmation of a new one. Both are on-wire size changes, hence the bump.
-inline constexpr uint8_t  kProtocolVersion = 3;
+//
+// v4 added a server-chosen salt to HelloAck (sdk.cpp). The session key used
+// to be derived from the client's salt alone, so replaying (or merely
+// retrying) a HELLO before its first reply arrived could make two live
+// connections derive the identical key while both restart their AEAD
+// sequence numbers at 0 — an AES-GCM (key, nonce) collision. Mixing in a
+// salt the server generates fresh for every HELLO it answers means no two
+// connections ever share a key, regardless of what the client sends.
+//
+// v5 widened window_size (StreamConfig, SETUP) from one wire byte to two, to
+// raise kMaxWindow from 255 to 1024 in-flight blocks per stream. A window
+// that small was the ceiling on throughput over any link with real
+// bandwidth-delay product; the wire field simply couldn't express more.
+inline constexpr uint8_t  kProtocolVersion = 5;
 
 // The default block payload (kDefaultPayloadSize) sits under a typical
 // 1500-byte path MTU once the datagram's own headers are accounted for, so
@@ -41,10 +54,10 @@ inline constexpr uint16_t kMaxPayloadSize = 16384;
 
 // The received-set is tracked as a multi-word bitmask (kMaskWords x
 // uint64), so a stream's window can go up to kMaxWindow in-flight blocks.
-// kMaxWindow is capped at 255 because window_size is negotiated as a single
-// wire byte in SETUP (setup.cpp put_u8/get_u8) — raising the cap further
-// needs that field widened too, a separate wire change.
-inline constexpr uint8_t  kMaxWindow = 255;
+// window_size is negotiated as a two-byte wire field in SETUP (setup.cpp
+// put_u16/get_u16, v5) — raising the cap further needs that field widened
+// too, a separate wire change.
+inline constexpr uint16_t kMaxWindow = 1024;
 inline constexpr size_t   kMaskWords = (static_cast<size_t>(kMaxWindow) + 63) / 64;
 
 enum class MsgType : uint8_t {
