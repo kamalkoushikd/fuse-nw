@@ -117,8 +117,17 @@ int DtlsSession::wire_recv(uint8_t *buf, size_t cap) {
         // to resend; report it as such rather than a hard error.
         return WOLFSSL_CBIO_ERR_TIMEOUT;
     }
-    // A server learns its peer's address from the first datagram received.
-    if (config_.role == DtlsRole::Server) {
+    // A server learns its peer's address from the first datagram received
+    // (there is no address to configure() with beforehand). Once the
+    // handshake is established, though, this must stop: wire_recv runs
+    // before wolfSSL validates anything, so unconditionally re-anchoring
+    // here would let a single spoofed, unauthenticated UDP datagram
+    // silently redirect where the server sends its next ciphertext — a DoS
+    // against the real client with no key needed. A post-handshake
+    // datagram from an unexpected address is still handed to wolfSSL under
+    // the original peer_, so its own record validation rejects it on the
+    // merits instead of the transport layer trusting the source address.
+    if (config_.role == DtlsRole::Server && !established_) {
         peer_ = from;
     }
     return static_cast<int>(got);
@@ -176,17 +185,19 @@ DtlsStatus DtlsSession::configure(const DtlsConfig &config, UdpSocket *socket,
     } else {
         wolfSSL_CTX_set_psk_client_callback(ctx, psk_client_cb);
     }
-    // PSK-only suites: no certificates are involved on either side. The
-    // ephemeral-key variants are listed first deliberately — an ECDHE/DHE
-    // PSK exchange gives forward secrecy, so recording the traffic and
+    // PSK-only suites: no certificates are involved on either side. Every
+    // suite here uses an ephemeral (EC)DHE key exchange, which is the
+    // entire point of choosing DTLS over the plain per-lane AEAD path
+    // (session_crypto.hpp) — forward secrecy, so recording the traffic and
     // later learning the pre-shared key does not retroactively decrypt it.
-    // Static PSK (no ephemeral key) is the last resort and is not even
-    // compiled into wolfSSL by default for exactly that reason.
+    // Static PSK (no ephemeral key, no forward secrecy) is deliberately
+    // left out: including it as a fallback would let a peer that only
+    // offers static PSK still complete a handshake here, silently losing
+    // the one property this path exists to provide.
     if (wolfSSL_CTX_set_cipher_list(ctx,
                                     "ECDHE-PSK-AES128-GCM-SHA256:"
                                     "DHE-PSK-AES128-GCM-SHA256:"
-                                    "ECDHE-PSK-CHACHA20-POLY1305:"
-                                    "PSK-CHACHA20-POLY1305") != WOLFSSL_SUCCESS) {
+                                    "ECDHE-PSK-CHACHA20-POLY1305") != WOLFSSL_SUCCESS) {
         return DtlsStatus::Unsupported;
     }
 

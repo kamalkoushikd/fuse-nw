@@ -4,7 +4,7 @@
 
 namespace fuse::proto {
 
-SenderRegistry::SenderRegistry(uint16_t stream_id, uint8_t window_size)
+SenderRegistry::SenderRegistry(uint16_t stream_id, uint16_t window_size)
     : stream_id_(stream_id) {
     if (window_size < 1) {
         window_size = 1;
@@ -47,9 +47,9 @@ void SenderRegistry::confirm(uint64_t seq_no) {
     }
 }
 
-uint8_t SenderRegistry::valid_count() const {
-    uint8_t n = 0;
-    for (uint8_t i = 0; i < window_size_; ++i) {
+uint16_t SenderRegistry::valid_count() const {
+    uint16_t n = 0;
+    for (uint16_t i = 0; i < window_size_; ++i) {
         if (slots_[i].valid) {
             ++n;
         }

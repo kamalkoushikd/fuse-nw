@@ -30,7 +30,7 @@ SetupPayload sample_payload() {
             static_cast<uint8_t>((i % 2) ? kStreamFlagLossless | kStreamFlagOrdered
                                          : kStreamFlagCoalesce);
         p.streams[i].block_size = static_cast<uint16_t>(1000 + i * 20);
-        p.streams[i].window_size = static_cast<uint8_t>(8 + i);
+        p.streams[i].window_size = static_cast<uint16_t>(8 + i);
     }
     return p;
 }
@@ -52,6 +52,25 @@ TEST(Setup, DataDatagramRoundTrip) {
     EXPECT_TRUE(got == p);
     EXPECT_NE(body, nullptr);
     EXPECT_GT(body_len, 0u);
+}
+
+TEST(Setup, WindowSizeAbove255RoundTrips) {
+    // window_size is a two-byte wire field (v5); confirm a value that
+    // would have overflowed the old one-byte field survives the wire.
+    SetupPayload p;
+    p.num_workers = 1;
+    p.num_streams = 1;
+    p.streams[0].stream_id = 1;
+    p.streams[0].block_size = 1200;
+    p.streams[0].window_size = kMaxWindow; // 1024
+
+    uint8_t buf[kMaxSetupDatagramSize];
+    size_t len = encode_setup_data(p, buf, sizeof(buf));
+    ASSERT_GT(len, 0u);
+
+    SetupPayload got;
+    ASSERT_TRUE(decode_setup_data(buf, len, &got, nullptr, nullptr));
+    EXPECT_EQ(got.streams[0].window_size, kMaxWindow);
 }
 
 TEST(Setup, ZeroStreamsIsValid) {

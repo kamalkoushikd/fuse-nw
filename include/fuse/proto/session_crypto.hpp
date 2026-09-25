@@ -46,10 +46,13 @@ bool session_crypto_available();
 // back to a predictable salt.
 bool random_bytes(uint8_t *out, size_t len);
 
-// Derives the session key from a pre-shared key and a per-session salt
-// (HKDF). Both endpoints run this over the same inputs and get the same key.
-bool derive_session_key(const uint8_t *psk, size_t psk_len,
-                        const uint8_t salt[kSessionSaltLen],
+// Derives the session key from a pre-shared key and salt material (HKDF).
+// Both endpoints must pass byte-identical salt and get the same key. `salt`
+// need not be a single kSessionSaltLen buffer: a caller that wants the key
+// to depend on randomness from both peers (so neither one alone determines
+// it — see sdk.cpp's fuse_accept/fuse_connect) passes the concatenation of
+// both sides' salts.
+bool derive_session_key(const uint8_t *psk, size_t psk_len, const uint8_t *salt, size_t salt_len,
                         uint8_t out_key[kSessionKeyLen]);
 
 // One lane's cipher. Thread-confined: each lane owns one and never shares

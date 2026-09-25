@@ -92,7 +92,7 @@ TEST(Flags, LosslessOneStreamFullyRecoversUnderLoss) {
     };
     for (uint64_t seq = 0; seq < kN; ++seq) {
         if (is_lost(seq)) continue;
-        reasm.on_block(seq, source.data() + seq * kBlock, kBlock);
+        reasm.on_block(seq, seq * kBlock, source.data() + seq * kBlock, kBlock);
     }
     EXPECT_FALSE(reasm.is_complete()) << "not complete while blocks are still missing";
 
@@ -100,7 +100,7 @@ TEST(Flags, LosslessOneStreamFullyRecoversUnderLoss) {
     for (uint64_t seq : lost) {
         const RegistrySlot *slot = reg.lookup(seq);
         ASSERT_NE(slot, nullptr);
-        reasm.on_block(slot->seq_no, slot->payload, slot->payload_len);
+        reasm.on_block(slot->seq_no, slot->offset, slot->payload, slot->payload_len);
     }
 
     EXPECT_TRUE(reasm.is_complete());
@@ -122,7 +122,7 @@ TEST(Flags, UnorderedStreamSurfacesInArrivalOrder) {
     uint8_t blk[kBlock];
     for (uint64_t seq : arrival) {
         fill_block(1, seq, blk, kBlock);
-        uint32_t n = reasm.on_block(seq, blk, kBlock);
+        uint32_t n = reasm.on_block(seq, seq * kBlock, blk, kBlock);
         EXPECT_EQ(n, 1u) << "unordered delivery surfaces each block immediately";
     }
 
@@ -142,7 +142,7 @@ TEST(Flags, OrderedStreamSurfacesInSeqOrder) {
     uint8_t blk[kBlock];
     for (uint64_t seq : arrival) {
         fill_block(1, seq, blk, kBlock);
-        reasm.on_block(seq, blk, kBlock);
+        reasm.on_block(seq, seq * kBlock, blk, kBlock);
     }
 
     std::vector<uint64_t> expected = {0, 1, 2, 3, 4};
@@ -162,7 +162,7 @@ TEST(Flags, OrderedAndUnorderedProduceIdenticalFinalBytes) {
         uint8_t blk[kBlock];
         for (uint64_t seq : arrival) {
             fill_block(1, seq, blk, kBlock);
-            reasm.on_block(seq, blk, kBlock);
+            reasm.on_block(seq, seq * kBlock, blk, kBlock);
         }
         return sink;
     };

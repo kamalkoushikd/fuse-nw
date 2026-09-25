@@ -9,7 +9,7 @@ size_t serialize_setup_payload(const SetupPayload &p, uint8_t *out, size_t out_c
     if (p.num_streams > kMaxStreams) {
         return 0;
     }
-    const size_t total = 1 + 2 + 2 + static_cast<size_t>(p.num_streams) * 8;
+    const size_t total = 1 + 2 + 2 + static_cast<size_t>(p.num_streams) * 9;
     if (out_cap < total) {
         return 0;
     }
@@ -24,7 +24,7 @@ size_t serialize_setup_payload(const SetupPayload &p, uint8_t *out, size_t out_c
         off += put_u16(out + off, s.worker_id);
         off += put_u8(out + off, s.stream_flags);
         off += put_u16(out + off, s.block_size);
-        off += put_u8(out + off, s.window_size);
+        off += put_u16(out + off, s.window_size);
     }
     return off;
 }
@@ -69,7 +69,7 @@ bool decode_setup_data(const uint8_t *in, size_t in_len, SetupPayload *p,
     if (p->num_streams > kMaxStreams) {
         return false;
     }
-    const size_t expected = 1 + 2 + 2 + static_cast<size_t>(p->num_streams) * 8;
+    const size_t expected = 1 + 2 + 2 + static_cast<size_t>(p->num_streams) * 9;
     if (body_len != expected) {
         return false;
     }
@@ -80,7 +80,7 @@ bool decode_setup_data(const uint8_t *in, size_t in_len, SetupPayload *p,
         off += get_u16(body + off, &s.worker_id);
         off += get_u8(body + off, &s.stream_flags);
         off += get_u16(body + off, &s.block_size);
-        off += get_u8(body + off, &s.window_size);
+        off += get_u16(body + off, &s.window_size);
     }
 
     if (raw_body) *raw_body = body;
@@ -187,6 +187,14 @@ size_t SetupResponder::on_datagram(const uint8_t *in, size_t in_len, uint8_t *ou
     }
 
     if (type == MsgType::SetupData) {
+        // Once complete, a late-arriving SetupData (the initiator's
+        // retransmit timer firing on a FINACK that was merely delayed, not
+        // actually lost) must not silently reopen the handshake and
+        // overwrite the config a completed session is already running
+        // with.
+        if (complete_) {
+            return 0;
+        }
         const uint8_t *body = nullptr;
         size_t body_len = 0;
         SetupPayload decoded;

@@ -41,7 +41,15 @@ option(FUSE_FETCH_WOLFSSL "Fetch and build wolfSSL from source if it isn't found
 option(FUSE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(WARNING "fuse targets Linux; other platforms are untested")
+    # This is not "untested elsewhere" — fuse_proto's data plane (udp.cpp)
+    # calls recvmmsg/sendmmsg and sets UDP_SEGMENT directly, all Linux-only
+    # syscalls/socket options with no fallback path. A non-Linux configure
+    # would previously proceed past this warning only to fail with a
+    # confusing missing-symbol compile error deep in udp.cpp; failing here
+    # instead gives the real reason immediately.
+    message(FATAL_ERROR
+        "fuse_proto's data plane requires Linux (recvmmsg/sendmmsg/UDP_SEGMENT, "
+        "no fallback exists for other platforms).")
 endif()
 
 if(FUSE_WITH_CRYPTO)
@@ -110,18 +118,17 @@ endif()
 
 add_library(fuse_proto
     src/proto/block.cpp
-    src/proto/aux.cpp
+    src/proto/control.cpp
     src/proto/registry.cpp
     src/proto/receiver.cpp
     src/proto/udp.cpp
     src/proto/setup.cpp
-    src/proto/worker.cpp
     src/proto/reassembly.cpp
-    src/proto/topology.cpp
     src/proto/dtls.cpp
     src/proto/orchestrator.cpp
     src/proto/session_crypto.cpp
     src/proto/transfer.cpp
+    src/proto/mux_transfer.cpp
     src/proto/sdk.cpp
 )
 add_library(fuse::proto ALIAS fuse_proto)
@@ -138,21 +145,6 @@ else()
 endif()
 
 find_package(Threads REQUIRED)
-
-# Optional NUMA binding for topology-aware placement (Stage 6). Compiled in
-# only when libnuma's development headers are present; otherwise the NUMA
-# hook degrades to a documented no-op and CPU pinning still works.
-find_path(FUSE_NUMA_INCLUDE_DIR numa.h)
-find_library(FUSE_NUMA_LIBRARY numa)
-if(FUSE_NUMA_INCLUDE_DIR AND FUSE_NUMA_LIBRARY)
-    message(STATUS "fuse: libnuma found, enabling NUMA-aware placement")
-    target_compile_definitions(fuse_proto PRIVATE FUSE_HAVE_NUMA=1)
-    target_include_directories(fuse_proto PRIVATE ${FUSE_NUMA_INCLUDE_DIR})
-    target_link_libraries(fuse_proto PRIVATE ${FUSE_NUMA_LIBRARY})
-else()
-    message(STATUS "fuse: libnuma not found, NUMA hook will be a no-op (CPU pinning still active)")
-    target_compile_definitions(fuse_proto PRIVATE FUSE_HAVE_NUMA=0)
-endif()
 
 target_include_directories(fuse_proto
     PUBLIC
