@@ -166,7 +166,7 @@ own hardware rather than trusting a fixed number.
 
 ```sh
 # terminal 1
-fuse_quickstart_recv 4433 /tmp/out.bin 4 [optional-key]
+fuse_quickstart_recv 0.0.0.0 4433 /tmp/out.bin 4 [optional-key]
 # terminal 2
 fuse_quickstart_send 127.0.0.1 4433 /tmp/in.bin 4 [optional-key]
 ```
