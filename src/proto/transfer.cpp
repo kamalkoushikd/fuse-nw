@@ -8,12 +8,14 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <new>
 #include <random>
+#include <stdexcept>
 #include <thread>
 
-#include "fuse/proto/aux.hpp"
 #include "fuse/proto/block.hpp"
 #include "fuse/proto/congestion.hpp"
+#include "fuse/proto/control.hpp"
 #include "fuse/proto/receiver.hpp"
 #include "fuse/proto/registry.hpp"
 #include "fuse/proto/session_crypto.hpp"
@@ -25,10 +27,17 @@ using namespace fuse::proto;
 
 namespace {
 
-constexpr uint8_t kWindow = kMaxWindow;
+constexpr uint16_t kWindow = kMaxWindow;
 constexpr size_t kRxBatch = 64;
 constexpr size_t kGsoBudget = 60000;
 constexpr uint32_t kCleanBatchesToGrow = 8;
+// A small block_size can otherwise pack far more segments into one
+// send_segmented() call than the kernel's per-call GSO segment limit (64 or
+// 128 depending on version) — that EINVAL isn't distinguishable from "this
+// route doesn't support GSO at all", so it permanently latches gso_failed_
+// on the socket (udp.cpp) even though a smaller batch would have worked
+// fine. Capping here avoids ever hitting that limit.
+constexpr size_t kMaxGsoSegments = 64;
 
 uint64_t now_ns() {
     timespec ts{};
@@ -58,11 +67,12 @@ uint64_t random_nonce() {
     return rng();
 }
 
-size_t build_aad(uint8_t *out, uint16_t lane, uint64_t seq, uint64_t offset) {
+size_t build_aad(uint8_t *out, uint16_t lane, uint64_t seq, uint64_t offset, uint8_t flags) {
     size_t n = 0;
     n += put_u16(out + n, lane);
     n += put_u64(out + n, seq);
     n += put_u64(out + n, offset);
+    n += put_u8(out + n, flags);
     return n;
 }
 
@@ -120,13 +130,35 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
     int idle = 0;
     const int max_idle = static_cast<int>(cfg.timeout_ms / 200) + 5;
 
+    // An active MITM/corruption attack fails most blocks' auth check rather
+    // than merely dropping some — that pattern is distinguishable from
+    // ordinary loss (which NACK/retransmit already resolves) and deserves a
+    // status the caller can act on differently from "just incomplete" or
+    // "just timed out". Shared between every exit path below (the natural
+    // completion path used to be the only one that checked this, which made
+    // the classification dead code for the common wrong-key case: that
+    // scenario never reaches natural completion — every block fails auth,
+    // so `rx.on_receive` is never called, `base_seq_no` never advances, and
+    // the lane can only ever leave via the idle-timeout branch instead).
+    // Require a minimum sample size so a couple of early failures during
+    // key/salt setup don't misreport a healthy transfer.
+    const auto classify = [&](TransferStatus fallback) {
+        const uint64_t auth_sample = delivered + auth_failures;
+        if (auth_sample >= 20 && auth_failures * 2 > auth_sample) {
+            return TransferStatus::AuthFailed;
+        }
+        return fallback;
+    };
+
     for (;;) {
         const int got = sock.recv_batch(rx_buf.data(), slot, kRxBatch, lens.data(), srcs.data());
         if (got > 0) {
             idle = 0;
             if (res->start_ns.load() == 0) res->start_ns.store(now_ns());
         } else if (++idle > max_idle) {
-            res->status.store(static_cast<int>(TransferStatus::Timeout));
+            res->bytes.store(written);
+            res->auth_failures.store(auth_failures);
+            res->status.store(static_cast<int>(classify(TransferStatus::Timeout)));
             return;
         }
 
@@ -140,16 +172,33 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
                 StreamStart ss;
                 if (!decode_stream_start(dg, dlen, &ss)) continue;
                 if (!have_start) {
+                    // ss.total_bytes is an unauthenticated wire value at
+                    // this point (the PSK proof, if any, is checked per
+                    // block, not here) — a hostile or corrupt claim near
+                    // UINT64_MAX must not be able to take the whole process
+                    // down via an uncaught allocation failure escaping this
+                    // thread. Try the allocation before committing any
+                    // state, so a rejected StreamStart leaves this lane
+                    // exactly as if it had never arrived.
+                    try {
+                        shard->assign(ss.total_bytes, 0);
+                    } catch (const std::bad_alloc &) {
+                        res->status.store(static_cast<int>(TransferStatus::ResourceLimit));
+                        return;
+                    } catch (const std::length_error &) {
+                        res->status.store(static_cast<int>(TransferStatus::ResourceLimit));
+                        return;
+                    }
                     have_start = true;
                     peer_nonce = ss.nonce;
                     peer = srcs[i];
                     have_peer = true;
                     shard_bytes = ss.total_bytes;
-                    shard->assign(shard_bytes, 0);
                     if (want_crypto) {
                         uint8_t key[kSessionKeyLen];
                         if (!derive_session_key(reinterpret_cast<const uint8_t *>(psk.data()),
-                                                psk.size(), ss.session_salt, key) ||
+                                                psk.size(), ss.session_salt, kSessionSaltLen,
+                                                key) ||
                             !cipher.init(key)) {
                             res->status.store(static_cast<int>(TransferStatus::Unsupported));
                             return;
@@ -171,7 +220,6 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
             uint64_t send_time = 0;
             const uint8_t *payload = nullptr;
             if (!decode_data_datagram(dg, dlen, &hdr, &send_time, &payload)) continue;
-            if (hdr.flags & kFlagLastBlock) final_seq = hdr.seq_no;
 
             const uint8_t *body = payload;
             uint16_t body_len = hdr.payload_len;
@@ -179,9 +227,11 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
             if (want_crypto) {
                 // Authenticate before admitting the block to the window: a
                 // forged block that advanced `base` would slide the window
-                // past data never written.
-                uint8_t aad[18];
-                const size_t al = build_aad(aad, lane, hdr.seq_no, hdr.offset);
+                // past data never written. `flags` rides in the AAD (not
+                // just lane/seq/offset) so LastBlock can't be flipped on an
+                // otherwise-authentic block to end the lane early.
+                uint8_t aad[19];
+                const size_t al = build_aad(aad, lane, hdr.seq_no, hdr.offset, hdr.flags);
                 if (payload == nullptr || hdr.payload_len < kAeadTagLen ||
                     !cipher.open(lane, hdr.seq_no, aad, al, payload, hdr.payload_len,
                                  opened.data())) {
@@ -192,32 +242,55 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
                 body_len = static_cast<uint16_t>(hdr.payload_len - kAeadTagLen);
             }
 
-            // This block just proved itself (authenticated, if encrypted;
-            // structurally valid for this stream otherwise) — safe to trust
-            // its source as where to send ACKs, even if it differs from the
-            // address we've been using. This is what makes an in-progress
-            // transfer survive the sender's NAT mapping changing mid-flight
-            // (an ISP-forced reconnect, a mobile handover, a CGNAT re-lease):
-            // the very next block the sender emits re-anchors the receiver's
-            // reply address, with no session drop and no explicit handshake.
-            peer = srcs[i];
-            have_peer = true;
+            // flags is only trustworthy once the block has cleared the auth
+            // check above (or in plaintext mode, where nothing claims
+            // otherwise) — setting this any earlier would let a forged
+            // packet end the lane early even under encryption.
+            if (hdr.flags & kFlagLastBlock) final_seq = hdr.seq_no;
 
-            // A retransmission arriving after we NACK'd measures one RTT on
-            // the receiver's own clock (no cross-host clock comparison).
-            if ((hdr.flags & kFlagRetransmission) && nack_sent_ns != 0) {
-                const uint64_t sample = now_ns() - nack_sent_ns;
-                rtt_est_ns = (rtt_est_ns == 0) ? sample : (rtt_est_ns * 7 + sample) / 8;
-                nack_sent_ns = 0;
-            }
+            // Re-anchoring and RTT sampling both wait for on_receive's
+            // verdict now: `Accepted` means this block is both authentic
+            // (if encrypted) AND new, not a replay of something already
+            // delivered. That second part matters even for an
+            // authenticated block — AEAD doesn't add freshness against an
+            // exact-replay, so without this an attacker who captures one
+            // genuine datagram and resends it from their own address could
+            // redirect where this lane's Acks go, no key needed.
+            const ReceiveResult rr = rx.on_receive(hdr.seq_no, send_time, now_ns());
+            if (rr == ReceiveResult::Accepted) {
+                // This block just proved itself and is new — safe to trust
+                // its source as where to send ACKs, even if it differs from
+                // the address we've been using. This is what makes an
+                // in-progress transfer survive the sender's NAT mapping
+                // changing mid-flight (an ISP-forced reconnect, a mobile
+                // handover, a CGNAT re-lease): the next new block the
+                // sender emits re-anchors the receiver's reply address,
+                // with no session drop and no explicit handshake.
+                peer = srcs[i];
+                have_peer = true;
 
-            if (rx.on_receive(hdr.seq_no, send_time, now_ns()) == ReceiveResult::Accepted &&
-                body != nullptr) {
-                if (hdr.offset + body_len <= shard->size()) {
-                    std::memcpy(shard->data() + hdr.offset, body, body_len);
-                    written += body_len;
+                // A retransmission arriving after we NACK'd measures one
+                // RTT on the receiver's own clock (no cross-host clock
+                // comparison).
+                if ((hdr.flags & kFlagRetransmission) && nack_sent_ns != 0) {
+                    const uint64_t sample = now_ns() - nack_sent_ns;
+                    rtt_est_ns = (rtt_est_ns == 0) ? sample : (rtt_est_ns * 7 + sample) / 8;
+                    nack_sent_ns = 0;
                 }
-                ++delivered;
+
+                if (body != nullptr) {
+                    // Checked this way round so `hdr.offset + body_len`
+                    // (wire fields, attacker-controlled) never gets
+                    // computed: with the addition done first, an offset
+                    // near UINT64_MAX wraps the sum small enough to pass a
+                    // naive "<= size()" check, and the memcpy below then
+                    // writes out of bounds at the unwrapped offset.
+                    if (hdr.offset <= shard->size() && body_len <= shard->size() - hdr.offset) {
+                        std::memcpy(shard->data() + hdr.offset, body, body_len);
+                        written += body_len;
+                    }
+                    ++delivered;
+                }
             }
         }
 
@@ -263,20 +336,8 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
 
     res->bytes.store(written);
     res->auth_failures.store(auth_failures);
-
-    // An active MITM/corruption attack fails most blocks' auth check rather
-    // than merely dropping some — that pattern is distinguishable from
-    // ordinary loss (which NACK/retransmit already resolves) and deserves a
-    // status the caller can act on differently from "just incomplete".
-    // Require a minimum sample size so a couple of early failures during
-    // key/salt setup don't misreport a healthy transfer.
-    const uint64_t auth_sample = delivered + auth_failures;
-    if (auth_sample >= 20 && auth_failures * 2 > auth_sample) {
-        res->status.store(static_cast<int>(TransferStatus::AuthFailed));
-    } else {
-        res->status.store(static_cast<int>(written == shard_bytes ? TransferStatus::Ok
-                                                                  : TransferStatus::Incomplete));
-    }
+    res->status.store(static_cast<int>(
+        classify(written == shard_bytes ? TransferStatus::Ok : TransferStatus::Incomplete)));
 }
 
 // --- Sender lane ---------------------------------------------------------
@@ -357,6 +418,16 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     uint32_t clean_batches = 0;
     uint64_t base = 0, next_seq = 0, next_offset = 0, retransmits = 0;
     uint64_t last_base = 0, last_progress = now_ns();
+    // Deliberately separate from `last_progress`: that one also advances on
+    // a merely-*attempted* local retransmit send succeeding, which paces
+    // the RTO but is not evidence the peer is still there — on loopback a
+    // local send to a dead/wrong-keyed peer keeps "succeeding" forever, so
+    // reusing it for the overall deadline check below would make this loop
+    // literally unbounded against an unreachable peer instead of honoring
+    // timeout_ms. This one only moves when `base` is actually confirmed by
+    // an Ack.
+    uint64_t last_real_progress = now_ns();
+    uint64_t last_rtt_echo = 0; // dedupes repeated Ack echoes (see N13 below)
     const uint64_t t0 = now_ns();
     const uint64_t deadline_ns = static_cast<uint64_t>(cfg.timeout_ms) * 1000000ull;
     bool sent_last = false;
@@ -368,14 +439,21 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
         const uint64_t window = std::min<uint64_t>(kWindow, std::max<uint32_t>(4, cc.window()));
         bool did_work = false;
 
-        if (next_offset < shard_bytes && next_seq < base + window) {
+        // A zero-length shard (an empty send_buffer call, or an uneven
+        // split across lanes leaving one lane with nothing) still needs its
+        // own completion signal: without this, next_offset(0) < shard_bytes
+        // (0) is false from the start, the packing loop below never runs,
+        // `sent_last` never gets set, and the lane spins until timeout
+        // instead of completing immediately.
+        const bool need_empty_last = (shard_bytes == 0 && next_seq == 0);
+        if ((next_offset < shard_bytes || need_empty_last) && next_seq < base + window) {
             const uint16_t seg = static_cast<uint16_t>(kDataPrefixSize + block +
                                                        (keys.enabled ? kAeadTagLen : 0));
-            const size_t max_segs =
-                std::min<size_t>(kGsoBudget / seg, window - (next_seq - base));
+            const size_t max_segs = std::min<size_t>(
+                {kGsoBudget / seg, window - (next_seq - base), kMaxGsoSegments});
             size_t packed = 0, bytes_in_batch = 0;
 
-            while (packed < max_segs && next_offset < shard_bytes) {
+            while (packed < max_segs && (next_offset < shard_bytes || need_empty_last)) {
                 const uint64_t remaining = shard_bytes - next_offset;
                 if (remaining < block && packed > 0) break;
 
@@ -393,8 +471,8 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
 
                 const uint8_t *body = data + next_offset;
                 if (keys.enabled) {
-                    uint8_t aad[18];
-                    const size_t al = build_aad(aad, lane, next_seq, next_offset);
+                    uint8_t aad[19];
+                    const size_t al = build_aad(aad, lane, next_seq, next_offset, hdr.flags);
                     if (!cipher.seal(lane, next_seq, aad, al, data + next_offset, len,
                                      sealed.data())) {
                         break; // fail closed rather than emit plaintext
@@ -449,10 +527,23 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 // recv_lane does for the sender's address.
                 dst = src;
                 if (ack.base_seq_no > base) {
-                    for (uint64_t s = base; s < ack.base_seq_no; ++s) reg.confirm(s);
-                    base = ack.base_seq_no;
+                    // Acks are unauthenticated even under PSK (only the
+                    // nonce above is checked), so base_seq_no is untrusted
+                    // input: clamp to what has actually been sent, or a
+                    // forged huge value spins this loop ~2^64 times.
+                    const uint64_t new_base = std::min(ack.base_seq_no, next_seq);
+                    for (uint64_t s = base; s < new_base; ++s) reg.confirm(s);
+                    base = new_base;
                 }
-                if (ack.echoed_send_time > 0) {
+                // The receiver only updates its echoed send-time when a new
+                // highest-seq block arrives (receiver.cpp) — every
+                // periodic/final Ack in between repeats the same value.
+                // Treating each repeat as a fresh sample manufactures an
+                // ever-growing fake RTT while the sender is stalled on a
+                // gap, which stretches the RTO and congestion-control
+                // epochs right when they need to stay responsive.
+                if (ack.echoed_send_time > 0 && ack.echoed_send_time != last_rtt_echo) {
+                    last_rtt_echo = ack.echoed_send_time;
                     const uint64_t t = now_ns();
                     if (t > ack.echoed_send_time) cc.on_rtt_sample(t - ack.echoed_send_time);
                 }
@@ -473,8 +564,8 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                     hdr.offset = sl->offset;
                     const uint8_t *body = sl->payload;
                     if (keys.enabled) {
-                        uint8_t aad[18];
-                        const size_t al = build_aad(aad, lane, seq, hdr.offset);
+                        uint8_t aad[19];
+                        const size_t al = build_aad(aad, lane, seq, hdr.offset, hdr.flags);
                         if (!cipher.seal(lane, seq, aad, al, sl->payload, sl->payload_len,
                                          sealed.data())) {
                             continue;
@@ -489,14 +580,6 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             }
         }
 
-        if (loss_seen) {
-            block = std::min<uint16_t>(cfg.block_size, block_ceiling);
-            clean_batches = 0;
-        } else if (++clean_batches >= kCleanBatchesToGrow && block < block_ceiling) {
-            clean_batches = 0;
-            block = static_cast<uint16_t>(std::min<uint32_t>(block_ceiling, block * 2u));
-        }
-
         // Retransmission timeout, adaptive to the measured RTT. A fixed 5 ms
         // is right for loopback but catastrophic on any real path: it fires
         // ~RTT/5ms times before the ACK can arrive, so the sender retransmits
@@ -509,9 +592,11 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                  : 1'000'000'000ull;
 
         const uint64_t t = now_ns();
-        if (base != last_base) {
+        const bool base_advanced = (base != last_base);
+        if (base_advanced) {
             last_base = base;
             last_progress = t;
+            last_real_progress = t;
         } else if (t - last_progress > rto_ns) {
             cc.on_loss();
             const RegistrySlot *sl = reg.lookup(base);
@@ -524,8 +609,8 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 hdr.offset = sl->offset;
                 const uint8_t *body = sl->payload;
                 if (keys.enabled) {
-                    uint8_t aad[18];
-                    const size_t al = build_aad(aad, lane, base, hdr.offset);
+                    uint8_t aad[19];
+                    const size_t al = build_aad(aad, lane, base, hdr.offset, hdr.flags);
                     if (cipher.seal(lane, base, aad, al, sl->payload, sl->payload_len,
                                     sealed.data())) {
                         body = sealed.data();
@@ -548,8 +633,28 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             }
         }
 
+        // Block size only grows on a real run of ACK-confirmed batches, not
+        // merely on loop iterations (which include idle naps and can rack
+        // up kCleanBatchesToGrow well within a single RTT, before any ACK
+        // has even had time to arrive — growing past path MTU and
+        // fragmenting on an ordinary network, the opposite of wire.hpp's
+        // intent).
+        if (loss_seen) {
+            block = std::min<uint16_t>(cfg.block_size, block_ceiling);
+            clean_batches = 0;
+        } else if (base_advanced && ++clean_batches >= kCleanBatchesToGrow &&
+                  block < block_ceiling) {
+            clean_batches = 0;
+            block = static_cast<uint16_t>(std::min<uint32_t>(block_ceiling, block * 2u));
+        }
+
         if (sent_last && base >= next_seq) break;
-        if (t - t0 > deadline_ns) {
+        // TransferConfig::timeout_ms is documented as "no progress for this
+        // long", not a total deadline — `last_real_progress` (only moves on
+        // an Ack-confirmed advance of `base`) is what makes this match that
+        // contract and the receiver's own idle-based timeout, instead of
+        // failing a transfer that is slow but still moving.
+        if (t - last_real_progress > deadline_ns) {
             res->status.store(static_cast<int>(TransferStatus::Timeout));
             return;
         }
@@ -566,11 +671,33 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     res->status.store(static_cast<int>(TransferStatus::Ok));
 }
 
+// Ranks each status by how much it should dominate the others when lanes
+// disagree, so the caller learns about the most actionable problem rather
+// than whichever lane's thread happened to store its result last.
+// Config/socket/unsupported outrank everything else: nothing could run at
+// all, which matters more than a peer lane merely running short. Auth and
+// resource-limit issues are security-relevant and outrank ordinary
+// transport failures. Timeout outranks Incomplete since it means the lane
+// gave up entirely, versus Incomplete's "the loop finished but fell short".
+int severity(TransferStatus s) {
+    switch (s) {
+        case TransferStatus::Ok: return 0;
+        case TransferStatus::Incomplete: return 1;
+        case TransferStatus::Timeout: return 2;
+        case TransferStatus::AuthFailed: return 3;
+        case TransferStatus::ResourceLimit: return 4;
+        case TransferStatus::SocketError: return 5;
+        case TransferStatus::ConfigError: return 6;
+        case TransferStatus::Unsupported: return 6;
+    }
+    return 0;
+}
+
 TransferStatus worst(const std::vector<LaneResult> &lanes) {
     TransferStatus st = TransferStatus::Ok;
     for (const auto &l : lanes) {
         const auto s = static_cast<TransferStatus>(l.status.load());
-        if (s != TransferStatus::Ok) st = s;
+        if (severity(s) > severity(st)) st = s;
     }
     return st;
 }
@@ -605,6 +732,7 @@ const char *to_string(TransferStatus s) {
         case TransferStatus::AuthFailed: return "authentication failed";
         case TransferStatus::Incomplete: return "incomplete transfer";
         case TransferStatus::Unsupported: return "unsupported (built without crypto)";
+        case TransferStatus::ResourceLimit: return "peer's claimed size could not be allocated";
     }
     return "unknown";
 }
@@ -613,7 +741,8 @@ bool encryption_available() { return session_crypto_available(); }
 
 TransferStatus send_buffer(const TransferConfig &cfg, const uint8_t *data, size_t len,
                            TransferStats *stats) {
-    if (cfg.lanes == 0 || cfg.base_port == 0 || (data == nullptr && len > 0)) {
+    if (cfg.lanes == 0 || cfg.base_port == 0 || cfg.block_size == 0 ||
+        (data == nullptr && len > 0)) {
         return TransferStatus::ConfigError;
     }
     Keys keys;
@@ -624,7 +753,8 @@ TransferStatus send_buffer(const TransferConfig &cfg, const uint8_t *data, size_
         // nonce, not by key, so crypto stays parallel.
         if (!random_bytes(keys.salt, kSessionSaltLen) ||
             !derive_session_key(reinterpret_cast<const uint8_t *>(cfg.pre_shared_key.data()),
-                                cfg.pre_shared_key.size(), keys.salt, keys.key)) {
+                                cfg.pre_shared_key.size(), keys.salt, kSessionSaltLen,
+                                keys.key)) {
             return TransferStatus::Unsupported;
         }
     }
@@ -670,12 +800,23 @@ TransferStatus receive_buffer(const TransferConfig &cfg, std::vector<uint8_t> *o
 
     uint64_t total = 0;
     for (const auto &s : shards) total += s.size();
+
+    // A failed lane's shard is sized to what the sender claimed but only
+    // partially (or never) written — concatenating it in regardless would
+    // hand the caller a full-length buffer that looks complete but is
+    // zero-filled garbage wherever that lane fell short. Only a fully
+    // successful transfer gets to populate `*out`, matching what
+    // receive_file already does with this same status before writing to
+    // disk.
+    const TransferStatus status = worst(results);
     out->clear();
-    out->reserve(total);
-    for (const auto &s : shards) out->insert(out->end(), s.begin(), s.end());
+    if (status == TransferStatus::Ok) {
+        out->reserve(total);
+        for (const auto &s : shards) out->insert(out->end(), s.begin(), s.end());
+    }
 
     fill_stats(results, total, stats);
-    return worst(results);
+    return status;
 }
 
 TransferStatus send_file(const TransferConfig &cfg, const std::string &path,

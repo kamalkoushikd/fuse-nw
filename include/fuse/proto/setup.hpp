@@ -14,7 +14,7 @@
 //
 // Wire formats (each prefixed by the 2-byte outer header from wire.hpp):
 //   SetupData      : [protocol_version:1][num_workers:2][num_streams:2]
-//                    [ stream_id:2 worker_id:2 flags:1 block_size:2 window_size:1 ]*num_streams
+//                    [ stream_id:2 worker_id:2 flags:1 block_size:2 window_size:2 ]*num_streams
 //   SetupHashReply : [hash:8]
 //   SetupFinAck    : [hash:8]
 
@@ -39,7 +39,7 @@ struct StreamConfig {
     uint16_t worker_id    = 0;   // explicit assignment, never a computed formula
     uint8_t  stream_flags = 0;
     uint16_t block_size   = 0;
-    uint8_t  window_size  = 0;
+    uint16_t window_size  = 0;
 
     bool operator==(const StreamConfig &o) const {
         return stream_id == o.stream_id && worker_id == o.worker_id &&
@@ -67,8 +67,10 @@ struct SetupPayload {
 };
 
 // Largest a SETUP datagram can be: outer + fixed prefix + full stream table.
+// Each stream entry is 9 bytes: stream_id(2) + worker_id(2) + flags(1) +
+// block_size(2) + window_size(2).
 inline constexpr size_t kMaxSetupDatagramSize =
-    kOuterHeaderSize + 1 + 2 + 2 + static_cast<size_t>(kMaxStreams) * 8;
+    kOuterHeaderSize + 1 + 2 + 2 + static_cast<size_t>(kMaxStreams) * 9;
 
 // Serializes just the SETUP payload body (everything after the outer
 // header) into `out`. Returns the byte count, or 0 on overflow / an

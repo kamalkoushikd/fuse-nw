@@ -24,20 +24,20 @@ gtest_discover_tests(fuse_tests)
 # Stage 1 datagram-protocol tests (fuse_proto).
 add_executable(fuse_proto_tests
     proto/test_wire.cpp
+    proto/test_udp.cpp
     proto/test_block.cpp
-    proto/test_aux.cpp
+    proto/test_control.cpp
     proto/test_registry.cpp
     proto/test_receiver.cpp
     proto/test_stage1_loopback.cpp
     proto/test_setup.cpp
-    proto/test_worker.cpp
     proto/test_flags.cpp
     proto/test_congestion.cpp
-    proto/test_topology.cpp
     proto/test_dtls.cpp
     proto/test_orchestrator.cpp
     proto/test_session_crypto.cpp
     proto/test_transfer.cpp
+    proto/test_mux_transfer.cpp
     proto/test_sdk.cpp
 )
 

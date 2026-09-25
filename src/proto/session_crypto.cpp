@@ -22,7 +22,7 @@ bool session_crypto_available() {
 // Built without a crypto backend: every entry point fails closed so a caller
 // can never end up "encrypting" with a key it did not actually derive.
 bool random_bytes(uint8_t *, size_t) { return false; }
-bool derive_session_key(const uint8_t *, size_t, const uint8_t *, uint8_t *) { return false; }
+bool derive_session_key(const uint8_t *, size_t, const uint8_t *, size_t, uint8_t *) { return false; }
 LaneCipher::LaneCipher() = default;
 LaneCipher::~LaneCipher() = default;
 bool LaneCipher::init(const uint8_t *) { return false; }
@@ -67,10 +67,9 @@ bool random_bytes(uint8_t *out, size_t len) {
     return ok;
 }
 
-bool derive_session_key(const uint8_t *psk, size_t psk_len,
-                        const uint8_t salt[kSessionSaltLen],
+bool derive_session_key(const uint8_t *psk, size_t psk_len, const uint8_t *salt, size_t salt_len,
                         uint8_t out_key[kSessionKeyLen]) {
-    if (psk == nullptr || psk_len == 0 || salt == nullptr || out_key == nullptr) {
+    if (psk == nullptr || psk_len == 0 || salt == nullptr || salt_len == 0 || out_key == nullptr) {
         return false;
     }
     // wc_Tls13_HKDF_Extract wants a mutable ikm; copy rather than cast away
@@ -82,7 +81,7 @@ bool derive_session_key(const uint8_t *psk, size_t psk_len,
     std::memcpy(ikm, psk, psk_len);
 
     uint8_t prk[WC_SHA256_DIGEST_SIZE];
-    if (wc_Tls13_HKDF_Extract(prk, salt, static_cast<word32>(kSessionSaltLen), ikm,
+    if (wc_Tls13_HKDF_Extract(prk, salt, static_cast<word32>(salt_len), ikm,
                               static_cast<word32>(psk_len), WC_SHA256) != 0) {
         return false;
     }
@@ -132,7 +131,11 @@ bool LaneCipher::init(const uint8_t key[kSessionKeyLen]) {
 
 bool LaneCipher::seal(uint16_t lane, uint64_t seq, const uint8_t *aad, size_t aad_len,
                       const uint8_t *pt, uint16_t pt_len, uint8_t *out) const {
-    if (aes_ == nullptr || out == nullptr) {
+    // Checking `initialized_` (not just aes_ != nullptr) matters because
+    // init() allocates aes_ before it can know whether wc_AesGcmSetKey
+    // actually succeeds — a failed SetKey leaves aes_ non-null but
+    // unkeyed, which the old `aes_ == nullptr` check couldn't detect.
+    if (!initialized_ || out == nullptr) {
         return false;
     }
     uint8_t nonce[kAeadNonceLen];
@@ -146,7 +149,7 @@ bool LaneCipher::seal(uint16_t lane, uint64_t seq, const uint8_t *aad, size_t aa
 
 bool LaneCipher::open(uint16_t lane, uint64_t seq, const uint8_t *aad, size_t aad_len,
                       const uint8_t *in, uint16_t in_len, uint8_t *out) const {
-    if (aes_ == nullptr || out == nullptr || in_len < kAeadTagLen) {
+    if (!initialized_ || out == nullptr || in_len < kAeadTagLen) {
         return false;
     }
     const uint16_t ct_len = static_cast<uint16_t>(in_len - kAeadTagLen);

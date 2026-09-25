@@ -78,6 +78,7 @@ enum class TransferStatus {
     AuthFailed,    // encryption enabled but blocks failed to authenticate
     Incomplete,    // finished without delivering every byte
     Unsupported,   // encryption requested from a build without a crypto backend
+    ResourceLimit, // peer's claimed transfer size could not be allocated
 };
 
 // Human-readable form, for logs and error messages.

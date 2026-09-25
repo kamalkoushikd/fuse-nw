@@ -15,8 +15,8 @@
 #include <cstring>
 #include <ctime>
 
-#include "fuse/proto/aux.hpp"
 #include "fuse/proto/block.hpp"
+#include "fuse/proto/control.hpp"
 #include "fuse/proto/registry.hpp"
 #include "fuse/proto/udp.hpp"
 

@@ -65,6 +65,9 @@ and a userspace network-emulator test harness.
 pip install fuse-transport      # or: uv add fuse-transport
 ```
 
+The PyPI package name is `fuse-transport`, but the module you import is
+`fuse` — see the Quickstart below.
+
 Wheels bundle the compiled transport and its wolfSSL, so there is no
 compiler, no CMake, and nothing else to install. Check it with
 `python -m fuse selftest`.
@@ -274,8 +277,8 @@ C scaffold's socket wrapper, not the protocol.
 ```
 
 Runs a mixed workload (large ordered bulk transfer + many small
-loss-tolerant messages) across single-threaded, multi-worker, and pinned
+loss-tolerant messages) across single-threaded and multi-worker
 configurations, with and without encryption. Current results and their
-caveats are in `docs/ROADMAP.md` — including the finding that **CPU
-pinning measurably hurt** on the test host and is therefore not claimed
-as a win.
+caveats are in **[bench/RESULTS.md](bench/RESULTS.md)**. CPU pinning was
+measured to measurably hurt throughput on the test host, so it is not a
+supported option — thread placement is left entirely to the OS scheduler.

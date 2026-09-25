@@ -39,10 +39,10 @@ public:
     // window_size is clamped to [1, kMaxWindow]; the storage is always
     // kMaxWindow slots, but only the first window_size are used, matching
     // the per-stream window negotiated at SETUP (Stage 2).
-    explicit SenderRegistry(uint16_t stream_id, uint8_t window_size);
+    explicit SenderRegistry(uint16_t stream_id, uint16_t window_size);
 
     uint16_t stream_id() const { return stream_id_; }
-    uint8_t  window_size() const { return window_size_; }
+    uint16_t window_size() const { return window_size_; }
 
     // Records a to-be-sent block, overwriting whatever slot its seq_no
     // maps to, and marks the slot valid. Returns false if payload_len
@@ -63,7 +63,7 @@ public:
 
     // Number of currently-valid (unacked, resident) slots — a metric, not
     // used on the hot path.
-    uint8_t valid_count() const;
+    uint16_t valid_count() const;
 
 private:
     size_t index_of(uint64_t seq_no) const {
@@ -71,7 +71,7 @@ private:
     }
 
     uint16_t stream_id_;
-    uint8_t  window_size_;
+    uint16_t window_size_;
     std::vector<RegistrySlot> slots_;
 };
 

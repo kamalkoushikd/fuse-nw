@@ -19,7 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "fuse/proto/aux.hpp"
+#include "fuse/proto/control.hpp"
 #include "fuse/proto/wire.hpp"
 
 namespace fuse::proto {
@@ -35,10 +35,10 @@ public:
     // `lossless` reflects the stream's LOSSLESS flag (Stage 4). When false,
     // gaps are still tracked for statistics but collect_nacks never reports
     // them — a loss-tolerant stream accepts drops rather than retransmitting.
-    explicit ReceiverStream(uint16_t stream_id, uint8_t window_size, bool lossless = true);
+    explicit ReceiverStream(uint16_t stream_id, uint16_t window_size, bool lossless = true);
 
     uint16_t stream_id() const { return stream_id_; }
-    uint8_t  window_size() const { return window_size_; }
+    uint16_t window_size() const { return window_size_; }
     uint64_t base_seq_no() const { return base_seq_no_; }
     // Word 0 of the received-set (positions base_seq_no()..+63) — enough for
     // any window_size <= 64, which covers every existing caller/test; use
@@ -73,7 +73,7 @@ private:
     void slide_base_over_contiguous_prefix();
 
     uint16_t stream_id_;
-    uint8_t  window_size_;
+    uint16_t window_size_;
     bool     lossless_;
 
     uint64_t base_seq_no_ = 0;

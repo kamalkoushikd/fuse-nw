@@ -36,9 +36,9 @@
 #include <thread>
 #include <vector>
 
-#include "fuse/proto/aux.hpp"
 #include "fuse/proto/block.hpp"
 #include "fuse/proto/congestion.hpp"
+#include "fuse/proto/control.hpp"
 #include "fuse/proto/hash.hpp"
 #include "fuse/proto/receiver.hpp"
 #include "fuse/proto/registry.hpp"
@@ -49,7 +49,7 @@ using namespace fuse::proto;
 
 namespace {
 
-constexpr uint8_t kWindow = kMaxWindow; // 64: the ACK bitmask width
+constexpr uint16_t kWindow = kMaxWindow; // full window: the ACK bitmask width
 constexpr size_t kRxBatch = 64;         // datagrams per recvmmsg
 constexpr size_t kGsoBudget = 60000;    // bytes per GSO sendmsg (<64 KiB)
 
@@ -189,7 +189,7 @@ void recv_lane(uint16_t port, uint16_t lane, std::vector<uint8_t> *shard, LaneSt
                         uint8_t key[kSessionKeyLen];
                         if (!derive_session_key(
                                 reinterpret_cast<const uint8_t *>(g_psk.data()), g_psk.size(),
-                                ss.session_salt, key) ||
+                                ss.session_salt, kSessionSaltLen, key) ||
                             !cipher.init(key)) {
                             std::fprintf(stderr, "lane %u: key derivation failed\n", lane);
                             return;
@@ -736,7 +736,8 @@ int main(int argc, char **argv) {
             // shared by every lane, rather than N independent handshakes.
             if (!random_bytes(g_session_salt, kSessionSaltLen) ||
                 !derive_session_key(reinterpret_cast<const uint8_t *>(g_psk.data()),
-                                    g_psk.size(), g_session_salt, g_session_key)) {
+                                    g_psk.size(), g_session_salt, kSessionSaltLen,
+                                    g_session_key)) {
                 std::fprintf(stderr, "failed to establish session key\n");
                 return 1;
             }

@@ -71,7 +71,7 @@ bool decode_data_datagram(const uint8_t *in, size_t in_len,
     if (hdr->payload_len > kMaxPayloadSize) {
         return false;
     }
-    if (in_len != kDataPrefixSize + hdr->payload_len) {
+    if (in_len < kDataPrefixSize + hdr->payload_len) {
         return false;
     }
 

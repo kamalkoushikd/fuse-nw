@@ -6,12 +6,12 @@
 // plan calls for:
 //
 //   (a) single-threaded baseline
-//   (b) multi-worker, no topology pinning
-//   (c) multi-worker, with topology pinning (Stage 6)
+//   (b) multi-worker
 //
 // each optionally with encryption forced on (Stage 7), so DTLS overhead is
-// measured separately from the threading/pinning comparison rather than
-// conflated with it.
+// measured separately from the threading comparison rather than conflated
+// with it. (CPU pinning was measured to cost throughput with no benefit and
+// is not a supported option.)
 //
 // Metrics: bulk throughput, small-message delivery latency (p50/p99, taken
 // from the send timestamp each block already carries), CPU time, and peak
@@ -41,7 +41,6 @@
 #include "fuse/proto/receiver.hpp"
 #include "fuse/proto/registry.hpp"
 #include "fuse/proto/setup.hpp"
-#include "fuse/proto/topology.hpp"
 #include "fuse/proto/udp.hpp"
 
 using namespace fuse::proto;
@@ -190,12 +189,7 @@ void receiver_thread(Lane *lane, const Workload &wl, bool encrypted, const std::
 
 // Sender: interleaves its share of the bulk transfer and the telemetry
 // stream, storing every block in a registry as the real data path would.
-void sender_thread(Lane *lane, const Workload &wl, bool encrypted, const std::string &psk,
-                   int pin_core) {
-    if (pin_core >= 0) {
-        pin_current_thread_to_core(pin_core);
-    }
-
+void sender_thread(Lane *lane, const Workload &wl, bool encrypted, const std::string &psk) {
     DtlsSession sess;
     DtlsConfig cfg;
     cfg.encryption_required = encrypted;
@@ -253,8 +247,7 @@ void sender_thread(Lane *lane, const Workload &wl, bool encrypted, const std::st
     }
 }
 
-Result run_config(const std::string &name, const Workload &wl, int lanes, bool pin,
-                  bool encrypted) {
+Result run_config(const std::string &name, const Workload &wl, int lanes, bool encrypted) {
     const std::string psk = "fuse-bench-preshared-key";
     const uint64_t bulk_blocks_total = wl.bulk_bytes / wl.bulk_block;
 
@@ -287,9 +280,8 @@ Result run_config(const std::string &name, const Workload &wl, int lanes, bool p
     // Give receivers a moment to be ready (and to complete DTLS accept).
     std::this_thread::sleep_for(std::chrono::milliseconds(encrypted ? 60 : 20));
     for (int i = 0; i < lanes; ++i) {
-        int core = pin ? (i % static_cast<int>(std::thread::hardware_concurrency())) : -1;
         tx_threads.emplace_back(sender_thread, lane_objs[i].get(), std::cref(wl), encrypted,
-                                std::cref(psk), core);
+                                std::cref(psk));
     }
     for (auto &t : tx_threads) t.join();
     for (auto &t : rx_threads) t.join();
@@ -358,17 +350,15 @@ int main(int argc, char **argv) {
 
     std::vector<Result> plain, crypt;
 
-    plain.push_back(run_config("(a) single-threaded", wl, 1, false, false));
-    plain.push_back(run_config("(b) multi-worker, unpinned", wl, wl.lanes, false, false));
-    plain.push_back(run_config("(c) multi-worker, pinned", wl, wl.lanes, true, false));
+    plain.push_back(run_config("(a) single-threaded", wl, 1, false));
+    plain.push_back(run_config("(b) multi-worker", wl, wl.lanes, false));
 
-    print_header("=== Threading / topology comparison (encryption OFF) ===");
+    print_header("=== Threading comparison (encryption OFF) ===");
     for (const auto &r : plain) print_row(r);
 
     if (dtls_available()) {
-        crypt.push_back(run_config("(a) single-threaded + DTLS", wl, 1, false, true));
-        crypt.push_back(run_config("(b) multi-worker, unpinned + DTLS", wl, wl.lanes, false, true));
-        crypt.push_back(run_config("(c) multi-worker, pinned + DTLS", wl, wl.lanes, true, true));
+        crypt.push_back(run_config("(a) single-threaded + DTLS", wl, 1, true));
+        crypt.push_back(run_config("(b) multi-worker + DTLS", wl, wl.lanes, true));
 
         print_header("=== Same configurations with encryption FORCED ON (Stage 7) ===");
         for (const auto &r : crypt) print_row(r);

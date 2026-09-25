@@ -19,7 +19,6 @@
 
 #include "fuse/sdk.h"
 
-#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 
@@ -37,9 +36,9 @@
 #include <thread>
 #include <vector>
 
-#include "fuse/proto/aux.hpp"
 #include "fuse/proto/block.hpp"
 #include "fuse/proto/congestion.hpp"
+#include "fuse/proto/control.hpp"
 #include "fuse/proto/receiver.hpp"
 #include "fuse/proto/registry.hpp"
 #include "fuse/proto/session_crypto.hpp"
@@ -50,9 +49,16 @@ using namespace fuse::proto;
 
 namespace {
 
-constexpr uint8_t kWindow = kMaxWindow;              // 64 blocks in flight
+constexpr uint16_t kWindow = kMaxWindow;             // blocks in flight
 constexpr uint16_t kBlockSize = kDefaultPayloadSize; // 1200: MTU-safe
 constexpr size_t kMaxMessage = 64u << 20;            // 64 MiB per message
+// A fast sender and a slow-reading application otherwise have no backpressure
+// between them: inbox is an unbounded deque, and Acks go out regardless of
+// how much sits in it undrained. This caps total queued-but-undelivered
+// bytes; once hit, new blocks are simply not admitted (see
+// handle_data_locked), so the sender's own NACK/RTO retry naturally stalls
+// until fuse_recv/fuse_recv_alloc drains room.
+constexpr size_t kMaxInboxBytes = 256u << 20; // 256 MiB undrained
 constexpr size_t kRxBatch = 32;
 constexpr uint32_t kDefaultTimeoutMs = 10000;
 
@@ -83,13 +89,16 @@ void set_bufs(int fd, int bytes) {
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
 }
 
-// Associated data binds a block to its position so a valid block cannot be
-// replayed elsewhere in the stream.
-size_t build_aad(uint8_t *out, uint16_t lane, uint64_t seq, uint64_t offset) {
+// Associated data binds a block to its position AND its flags so neither
+// can be tampered with — without `flags` here, LastBlock is forgeable on an
+// otherwise-authentic block even with encryption on, since flags rides
+// outside the AEAD envelope on the wire.
+size_t build_aad(uint8_t *out, uint16_t lane, uint64_t seq, uint64_t offset, uint8_t flags) {
     size_t n = 0;
     n += put_u16(out + n, lane);
     n += put_u64(out + n, seq);
     n += put_u64(out + n, offset);
+    n += put_u8(out + n, flags);
     return n;
 }
 
@@ -114,18 +123,27 @@ bool decode_hello(const uint8_t *in, size_t len, uint8_t salt[kSessionSaltLen],
     return true;
 }
 
-size_t encode_hello_ack(const uint8_t proof[kProofLen], uint8_t *out) {
+// server_salt (v4) lets the server contribute randomness the client cannot
+// predict or control into the session key (see the derive below), all-zero
+// when the connection is unencrypted — the same convention StreamStart uses
+// for session_salt.
+size_t encode_hello_ack(const uint8_t server_salt[kSessionSaltLen], const uint8_t proof[kProofLen],
+                        uint8_t *out) {
     size_t off = 0;
     off += put_u8(out + off, kProtocolVersion);
     off += put_u8(out + off, static_cast<uint8_t>(MsgType::HelloAck));
+    std::memcpy(out + off, server_salt, kSessionSaltLen);
+    off += kSessionSaltLen;
     std::memcpy(out + off, proof, kProofLen);
     return off + kProofLen;
 }
 
-bool decode_hello_ack(const uint8_t *in, size_t len, uint8_t proof[kProofLen]) {
-    if (len != kOuterHeaderSize + kProofLen) return false;
+bool decode_hello_ack(const uint8_t *in, size_t len, uint8_t server_salt[kSessionSaltLen],
+                      uint8_t proof[kProofLen]) {
+    if (len != kOuterHeaderSize + kSessionSaltLen + kProofLen) return false;
     if (in[0] != kProtocolVersion || static_cast<MsgType>(in[1]) != MsgType::HelloAck) return false;
-    std::memcpy(proof, in + kOuterHeaderSize, kProofLen);
+    std::memcpy(server_salt, in + kOuterHeaderSize, kSessionSaltLen);
+    std::memcpy(proof, in + kOuterHeaderSize + kSessionSaltLen, kProofLen);
     return true;
 }
 
@@ -168,15 +186,19 @@ struct fuse_conn {
     uint64_t tx_base = 0; // lowest unacknowledged sequence number
     TxMeta tx_meta[kMaxWindow] = {};
     uint64_t last_progress_ns = 0;
+    uint64_t last_rtt_echo_ns = 0; // dedupes repeated Ack echoes, see N13
 
     ReceiverStream rx{0, kWindow, true};
     std::vector<uint8_t> asm_buf;      // message under reassembly
     uint64_t asm_end_seq = UINT64_MAX; // sequence carrying kFlagLastBlock
     size_t asm_total = 0;
     std::deque<std::vector<uint8_t>> inbox;
+    size_t inbox_bytes = 0; // sum of inbox message sizes, for the cap below
 
     bool peer_closed = false;
     bool failed = false;
+    bool closing = false; // set by fuse_close, so a blocked wait_for() bails
+    bool send_busy = false; // serializes whole-message fuse_send calls
     bool ack_pending = false;
     uint64_t last_ack_ns = 0;
     uint64_t rtt_est_ns = 0; // receiver-side estimate, for NACK pacing
@@ -186,6 +208,14 @@ struct fuse_conn {
 
     std::thread pump;
     std::atomic<bool> stop{false};
+
+    // Counts application threads currently inside fuse_send/fuse_recv/
+    // fuse_recv_alloc (see InUseGuard). fuse_close waits for this to reach
+    // zero before `delete c`, so a call already in flight when close starts
+    // — including one already parked in wait_for()'s condition wait, which
+    // `closing` above unblocks promptly — finishes touching `c` before it's
+    // freed, instead of racing a concurrent delete.
+    std::atomic<int> in_use{0};
 
     fuse_conn() {
         // ReceiverStream/SenderRegistry lane ids are set properly in setup().
@@ -200,8 +230,7 @@ struct fuse_listener {
     // Small ring of recently seen handshakes, so a client's HELLO retry does
     // not manufacture a second connection.
     struct Seen {
-        uint32_t addr = 0;
-        uint16_t port = 0;
+        PeerAddr addr{};
         uint8_t challenge[kChallengeLen] = {};
         bool used = false;
     };
@@ -210,8 +239,7 @@ struct fuse_listener {
 
     bool is_duplicate(const PeerAddr &from, const uint8_t challenge[kChallengeLen]) {
         for (const Seen &s : recent) {
-            if (s.used && s.addr == from.addr.sin_addr.s_addr &&
-                s.port == from.addr.sin_port &&
+            if (s.used && s.addr == from &&
                 std::memcmp(s.challenge, challenge, kChallengeLen) == 0) {
                 return true;
             }
@@ -219,8 +247,7 @@ struct fuse_listener {
         Seen &slot = recent[recent_at];
         recent_at = (recent_at + 1) % (sizeof(recent) / sizeof(recent[0]));
         slot.used = true;
-        slot.addr = from.addr.sin_addr.s_addr;
-        slot.port = from.addr.sin_port;
+        slot.addr = from;
         std::memcpy(slot.challenge, challenge, kChallengeLen);
         return false;
     }
@@ -257,8 +284,8 @@ void retransmit_locked(fuse_conn *c, uint64_t seq, uint8_t *scratch, size_t cap)
     const uint8_t *body = slot->payload;
     uint8_t sealed[kMaxPayloadSize + kAeadTagLen];
     if (c->encrypted) {
-        uint8_t aad[18];
-        const size_t al = build_aad(aad, c->tx_lane, seq, meta.offset);
+        uint8_t aad[19];
+        const size_t al = build_aad(aad, c->tx_lane, seq, meta.offset, hdr.flags);
         if (!c->tx_cipher.seal(c->tx_lane, seq, aad, al, slot->payload, slot->payload_len,
                                sealed)) {
             return;
@@ -290,8 +317,8 @@ void handle_data_locked(fuse_conn *c, const uint8_t *dg, size_t dlen, uint8_t *p
         // Authenticate BEFORE admitting the block to the window: a forged
         // block that advanced the window would slide it past data that was
         // never written.
-        uint8_t aad[18];
-        const size_t al = build_aad(aad, c->rx_lane, hdr.seq_no, hdr.offset);
+        uint8_t aad[19];
+        const size_t al = build_aad(aad, c->rx_lane, hdr.seq_no, hdr.offset, hdr.flags);
         if (hdr.payload_len < kAeadTagLen ||
             !c->rx_cipher.open(c->rx_lane, hdr.seq_no, aad, al, payload, hdr.payload_len,
                                plain)) {
@@ -302,31 +329,52 @@ void handle_data_locked(fuse_conn *c, const uint8_t *dg, size_t dlen, uint8_t *p
         body_len = static_cast<uint16_t>(hdr.payload_len - kAeadTagLen);
     }
 
-    // This block just proved itself (AEAD-authenticated when encrypted;
-    // structurally valid for our stream_id otherwise) — trust its source
-    // for replies even if it differs from c->peer. That's what lets a
-    // connection survive the peer's NAT mapping changing mid-session (an
-    // ISP-forced reconnect, a mobile handover) instead of going silent
-    // until fuse_recv/fuse_send time out.
-    c->peer = src;
+    // Backpressure: too many completed messages are already sitting
+    // undrained. Skip admitting this block (rather than reassembling it
+    // and growing inbox further) so the sender's own retry loop stalls
+    // until the application catches up, instead of buffering an unbounded
+    // amount of memory for a slow reader.
+    if (c->inbox_bytes >= kMaxInboxBytes) return;
 
-    // A retransmission arriving after we NACKed measures one RTT on our own
-    // clock, with no cross-host clock comparison.
-    if ((hdr.flags & kFlagRetransmission) && c->nack_sent_ns != 0) {
-        const uint64_t sample = now_ns() - c->nack_sent_ns;
-        c->rtt_est_ns = (c->rtt_est_ns == 0) ? sample : (c->rtt_est_ns * 7 + sample) / 8;
-        c->nack_sent_ns = 0;
-    }
+    // Re-anchoring and RTT sampling both wait for on_receive's verdict:
+    // `Accepted` means this block is both authentic (if encrypted) AND new,
+    // not a replay of something already delivered. That second part
+    // matters even for an authenticated block — AEAD doesn't add freshness
+    // against an exact-replay, so without this an attacker who captures one
+    // genuine datagram and resends it from their own address could
+    // redirect where this connection's Acks (and, in plaintext mode, all
+    // further data) go, no key needed.
+    const ReceiveResult rr = c->rx.on_receive(hdr.seq_no, send_time, now_ns());
+    if (rr == ReceiveResult::Accepted) {
+        // This block just proved itself and is new — trust its source for
+        // replies even if it differs from c->peer. That's what lets a
+        // connection survive the peer's NAT mapping changing mid-session
+        // (an ISP-forced reconnect, a mobile handover) instead of going
+        // silent until fuse_recv/fuse_send time out.
+        c->peer = src;
 
-    if (c->rx.on_receive(hdr.seq_no, send_time, now_ns()) == ReceiveResult::Accepted) {
-        const size_t end = static_cast<size_t>(hdr.offset) + body_len;
-        if (end <= kMaxMessage) {
+        // A retransmission arriving after we NACKed measures one RTT on
+        // our own clock, with no cross-host clock comparison.
+        if ((hdr.flags & kFlagRetransmission) && c->nack_sent_ns != 0) {
+            const uint64_t sample = now_ns() - c->nack_sent_ns;
+            c->rtt_est_ns = (c->rtt_est_ns == 0) ? sample : (c->rtt_est_ns * 7 + sample) / 8;
+            c->nack_sent_ns = 0;
+        }
+
+        // Checked this way round so `hdr.offset + body_len` (wire fields,
+        // untrusted before this point in plaintext mode) never gets
+        // computed: with the addition done first, an offset near
+        // UINT64_MAX wraps the sum small enough to pass a naive
+        // "<= kMaxMessage" check, and the memcpy below then writes out of
+        // bounds at the unwrapped offset.
+        if (hdr.offset <= kMaxMessage && body_len <= kMaxMessage - hdr.offset) {
+            const size_t end = static_cast<size_t>(hdr.offset) + body_len;
             if (c->asm_buf.size() < end) c->asm_buf.resize(end);
             if (body_len > 0) std::memcpy(c->asm_buf.data() + hdr.offset, body, body_len);
-        }
-        if (hdr.flags & kFlagLastBlock) {
-            c->asm_end_seq = hdr.seq_no;
-            c->asm_total = end;
+            if (hdr.flags & kFlagLastBlock) {
+                c->asm_end_seq = hdr.seq_no;
+                c->asm_total = end;
+            }
         }
     }
     c->ack_pending = true;
@@ -335,6 +383,7 @@ void handle_data_locked(fuse_conn *c, const uint8_t *dg, size_t dlen, uint8_t *p
     // one has arrived contiguously.
     if (c->asm_end_seq != UINT64_MAX && c->rx.base_seq_no() > c->asm_end_seq) {
         c->asm_buf.resize(c->asm_total);
+        c->inbox_bytes += c->asm_buf.size();
         c->inbox.push_back(std::move(c->asm_buf));
         c->asm_buf.clear();
         c->asm_end_seq = UINT64_MAX;
@@ -357,6 +406,7 @@ void pump_main(fuse_conn *c) {
         const int got = c->sock.recv_batch(rxbuf.data(), slot, kRxBatch, lens.data(), srcs.data());
 
         std::unique_lock<std::mutex> lk(c->mu);
+        bool got_data = false;
         for (int i = 0; i < got; ++i) {
             const uint8_t *dg = rxbuf.data() + i * slot;
             MsgType type;
@@ -365,6 +415,7 @@ void pump_main(fuse_conn *c) {
             switch (type) {
                 case MsgType::Data:
                     handle_data_locked(c, dg, lens[i], plain.data(), srcs[i]);
+                    got_data = true;
                     break;
                 case MsgType::Ack: {
                     Ack ack;
@@ -377,12 +428,25 @@ void pump_main(fuse_conn *c) {
                     // acknowledgements at a dead mapping.
                     c->peer = srcs[i];
                     if (ack.base_seq_no > c->tx_base) {
-                        for (uint64_t s = c->tx_base; s < ack.base_seq_no; ++s) c->reg.confirm(s);
-                        c->tx_base = ack.base_seq_no;
+                        // Acks are unauthenticated even under PSK, so
+                        // base_seq_no is untrusted input: clamp to what has
+                        // actually been sent, or a forged huge value spins
+                        // this loop ~2^64 times while holding c->mu.
+                        const uint64_t new_base = std::min(ack.base_seq_no, c->tx_next_seq);
+                        for (uint64_t s = c->tx_base; s < new_base; ++s) c->reg.confirm(s);
+                        c->tx_base = new_base;
                         c->last_progress_ns = now_ns();
                         c->cv.notify_all();
                     }
-                    if (ack.echoed_send_time > 0) {
+                    // The receiver only updates its echoed send-time when a
+                    // new highest-seq block arrives (receiver.cpp) — every
+                    // periodic/final Ack in between repeats the same value.
+                    // Treating each repeat as a fresh sample manufactures
+                    // an ever-growing fake RTT while the sender is stalled
+                    // on a gap, stretching the RTO right when it needs to
+                    // stay responsive.
+                    if (ack.echoed_send_time > 0 && ack.echoed_send_time != c->last_rtt_echo_ns) {
+                        c->last_rtt_echo_ns = ack.echoed_send_time;
                         const uint64_t t = now_ns();
                         if (t > ack.echoed_send_time) c->cc.on_rtt_sample(t - ack.echoed_send_time);
                     }
@@ -416,8 +480,12 @@ void pump_main(fuse_conn *c) {
         c->cc.poll(t);
 
         // Acknowledge promptly: the peer's send() is blocked until it hears
-        // from us.
-        if (c->ack_pending || (got > 0)) {
+        // from us. Gated on actual Data having been processed (or an Ack
+        // already owed for other reasons) — not merely "a batch arrived",
+        // which included a batch that was itself only an Ack. Two idle
+        // peers each acking the other's Ack is an unbounded ping-pong that
+        // never involves any data at all.
+        if (c->ack_pending || got_data) {
             send_ack_locked(c, scratch.data(), scratch.size());
         }
 
@@ -466,12 +534,19 @@ bool send_block_locked(fuse_conn *c, uint64_t seq, uint64_t offset, const uint8_
 
     c->reg.store(seq, data, len, now_ns(), offset);
     c->tx_meta[seq % kWindow] = TxMeta{offset, hdr.flags};
+    // last_progress_ns is otherwise only touched by the Ack handler and the
+    // RTO branch, so after an idle stretch (nothing in flight, so neither
+    // of those ran) it sits stale. Without this, the very next send after
+    // an idle period sees `t - last_progress_ns` equal to the whole idle
+    // duration, immediately exceeds the RTO, and retransmits a block that
+    // was just sent moments ago — spuriously halving the congestion window.
+    if (seq == c->tx_base) c->last_progress_ns = now_ns();
 
     const uint8_t *body = data;
     uint8_t sealed[kMaxPayloadSize + kAeadTagLen];
     if (c->encrypted) {
-        uint8_t aad[18];
-        const size_t al = build_aad(aad, c->tx_lane, seq, offset);
+        uint8_t aad[19];
+        const size_t al = build_aad(aad, c->tx_lane, seq, offset, hdr.flags);
         if (!c->tx_cipher.seal(c->tx_lane, seq, aad, al, data, len, sealed)) return false;
         body = sealed;
         hdr.payload_len = static_cast<uint16_t>(len + kAeadTagLen);
@@ -489,6 +564,11 @@ fuse_status wait_for(fuse_conn *c, std::unique_lock<std::mutex> &lk,
                           std::chrono::milliseconds(timeout_ms < 0 ? 0 : timeout_ms);
     while (!ready()) {
         if (c->failed) return FUSE_ERR_INTERNAL;
+        // fuse_close notifies under the lock right after setting this, so a
+        // thread already parked below wakes up and leaves instead of still
+        // being inside this wait (and about to touch `c`) once fuse_close
+        // deletes it.
+        if (c->closing) return FUSE_ERR_CLOSED;
         if (timeout_ms < 0) {
             c->cv.wait_for(lk, std::chrono::milliseconds(100));
         } else {
@@ -498,6 +578,17 @@ fuse_status wait_for(fuse_conn *c, std::unique_lock<std::mutex> &lk,
     }
     return FUSE_OK;
 }
+
+// Counts one application thread's presence inside fuse_send/fuse_recv/
+// fuse_recv_alloc for the guard's lifetime, so fuse_close can wait for that
+// count to reach zero before deleting the connection those calls still
+// reference. Construct it before acquiring c->mu (RAII covers every return
+// path, including early ones before the lock is taken).
+struct InUseGuard {
+    std::atomic<int> &n;
+    explicit InUseGuard(std::atomic<int> &n_) : n(n_) { n.fetch_add(1, std::memory_order_acq_rel); }
+    ~InUseGuard() { n.fetch_sub(1, std::memory_order_acq_rel); }
+};
 
 void start_conn(fuse_conn *c, uint16_t tx_lane, uint16_t rx_lane, uint32_t timeout_ms) {
     c->tx_lane = tx_lane;
@@ -591,27 +682,36 @@ fuse_conn *fuse_accept(fuse_listener *l, int timeout_ms, fuse_status *err) {
     // Poll in slices so a negative (infinite) timeout is still interruptible
     // by closing the listener.
     set_rcv_timeout_ms(l->sock.fd(), 100);
+    // timeout_ms == 0 means "one non-blocking sweep, then give up" — the
+    // socket itself must be non-blocking for that, not merely given a short
+    // timeout, or a single recv_from could still block up to 100ms. Reset
+    // explicitly on every call (not just when one_shot) so a prior
+    // timeout_ms==0 call's non-blocking flag can't leak into this one.
+    const bool one_shot = (timeout_ms == 0);
+    l->sock.set_nonblocking(one_shot);
 
     uint8_t buf[512];
     for (;;) {
-        if (timeout_ms == 0 || (timeout_ms > 0 && std::chrono::steady_clock::now() >= deadline)) {
-            if (timeout_ms == 0) {
-                // one non-blocking sweep only
-            } else {
-                return fail(FUSE_ERR_TIMEOUT);
-            }
+        if (!one_shot && timeout_ms > 0 && std::chrono::steady_clock::now() >= deadline) {
+            return fail(FUSE_ERR_TIMEOUT);
         }
 
         size_t got = 0;
         PeerAddr from;
         if (!l->sock.recv_from(buf, sizeof(buf), &got, &from)) {
-            if (timeout_ms == 0) return fail(FUSE_ERR_TIMEOUT);
+            if (one_shot) return fail(FUSE_ERR_TIMEOUT);
             continue;
         }
 
         uint8_t salt[kSessionSaltLen], challenge[kChallengeLen];
-        if (!decode_hello(buf, got, salt, challenge)) continue;
-        if (l->is_duplicate(from, challenge)) continue;
+        // A non-HELLO datagram or a duplicate must not silently re-block
+        // for another slice when the caller asked for exactly one sweep —
+        // that turned timeout_ms==0 into "block up to 100ms per stray
+        // datagram" instead of the immediate return a poll implies.
+        if (!decode_hello(buf, got, salt, challenge) || l->is_duplicate(from, challenge)) {
+            if (one_shot) return fail(FUSE_ERR_TIMEOUT);
+            continue;
+        }
 
         auto *c = new (std::nothrow) fuse_conn();
         if (c == nullptr) return fail(FUSE_ERR_INTERNAL);
@@ -624,11 +724,24 @@ fuse_conn *fuse_accept(fuse_listener *l, int timeout_ms, fuse_status *err) {
         }
         c->peer = from;
 
+        uint8_t server_salt[kSessionSaltLen] = {};
         uint8_t proof[kProofLen] = {};
         if (!l->psk.empty()) {
+            // Freshly random for every HELLO answered, so two connections
+            // never derive the same key even if a client's salt is somehow
+            // repeated (a retry, or a captured-and-replayed HELLO): the key
+            // is never determined by the client's contribution alone.
+            if (!random_bytes(server_salt, sizeof(server_salt))) {
+                delete c;
+                return fail(FUSE_ERR_INTERNAL);
+            }
+            uint8_t combined[2 * kSessionSaltLen];
+            std::memcpy(combined, salt, kSessionSaltLen);
+            std::memcpy(combined + kSessionSaltLen, server_salt, kSessionSaltLen);
+
             uint8_t key[kSessionKeyLen];
             if (!derive_session_key(reinterpret_cast<const uint8_t *>(l->psk.data()),
-                                    l->psk.size(), salt, key) ||
+                                    l->psk.size(), combined, sizeof(combined), key) ||
                 !c->tx_cipher.init(key) || !c->rx_cipher.init(key)) {
                 delete c;
                 return fail(FUSE_ERR_UNSUPPORTED);
@@ -642,7 +755,7 @@ fuse_conn *fuse_accept(fuse_listener *l, int timeout_ms, fuse_status *err) {
         }
 
         uint8_t ack[64];
-        const size_t n = encode_hello_ack(proof, ack);
+        const size_t n = encode_hello_ack(server_salt, proof, ack);
         // Sent from the NEW socket: its source port is what the client adopts.
         c->sock.send_to(ack, n, c->peer);
 
@@ -676,17 +789,14 @@ fuse_conn *fuse_connect(const fuse_config *cfg, fuse_status *err) {
         return fail(FUSE_ERR_CONFIG);
     }
 
+    // Key derivation is deferred until the server's HelloAck contributes its
+    // own salt (below) — mixing in salt the server alone controls is what
+    // stops a captured/retried HELLO from ever reproducing a previously
+    // issued key (see wire.hpp's v4 note).
     uint8_t salt[kSessionSaltLen] = {};
-    uint8_t key[kSessionKeyLen] = {};
-    if (want_crypto) {
-        if (!random_bytes(salt, sizeof(salt)) ||
-            !derive_session_key(reinterpret_cast<const uint8_t *>(cfg->pre_shared_key),
-                                std::strlen(cfg->pre_shared_key), salt, key) ||
-            !c->tx_cipher.init(key) || !c->rx_cipher.init(key)) {
-            delete c;
-            return fail(FUSE_ERR_UNSUPPORTED);
-        }
-        c->encrypted = true;
+    if (want_crypto && !random_bytes(salt, sizeof(salt))) {
+        delete c;
+        return fail(FUSE_ERR_UNSUPPORTED);
     }
 
     const uint32_t total_ms = cfg->timeout_ms ? cfg->timeout_ms : kDefaultTimeoutMs;
@@ -696,19 +806,26 @@ fuse_conn *fuse_connect(const fuse_config *cfg, fuse_status *err) {
         std::chrono::steady_clock::now() + std::chrono::milliseconds(total_ms);
     uint8_t hello[64], reply[128];
 
-    while (std::chrono::steady_clock::now() < deadline) {
-        // A fresh challenge per attempt, so a retry is a distinct handshake
-        // and cannot be answered by a stale reply.
-        uint8_t challenge[kChallengeLen];
-        if (!want_crypto) {
-            std::memset(challenge, 0, sizeof(challenge));
-            const uint64_t t = now_ns();
-            std::memcpy(challenge, &t, sizeof(challenge));
-        } else if (!random_bytes(challenge, sizeof(challenge))) {
-            delete c;
-            return fail(FUSE_ERR_INTERNAL);
-        }
+    // One challenge for the whole call, not one per retry attempt: a
+    // HelloAck answering an earlier attempt that arrives late (the reply
+    // was just slow, not a distinct/stale session) used to fail this
+    // memcmp against whichever attempt's challenge was current by then,
+    // hard-aborting the connect with FUSE_ERR_AUTH on ordinary latency
+    // rather than continuing to wait or retry. Freshness against a truly
+    // stale/replayed reply from an unrelated earlier connect() call
+    // doesn't depend on this: that reply would carry a different `salt`
+    // and so derive a different key entirely (wire.hpp's v4 note).
+    uint8_t challenge[kChallengeLen];
+    if (!want_crypto) {
+        std::memset(challenge, 0, sizeof(challenge));
+        const uint64_t t = now_ns();
+        std::memcpy(challenge, &t, sizeof(challenge));
+    } else if (!random_bytes(challenge, sizeof(challenge))) {
+        delete c;
+        return fail(FUSE_ERR_INTERNAL);
+    }
 
+    while (std::chrono::steady_clock::now() < deadline) {
         const size_t hn = encode_hello(salt, challenge, hello);
         if (!c->sock.send_to(hello, hn, server)) {
             delete c;
@@ -721,10 +838,25 @@ fuse_conn *fuse_connect(const fuse_config *cfg, fuse_status *err) {
             continue; // timed out; retry
         }
 
+        uint8_t server_salt[kSessionSaltLen];
         uint8_t proof[kProofLen];
-        if (!decode_hello_ack(reply, got, proof)) continue;
+        if (!decode_hello_ack(reply, got, server_salt, proof)) continue;
 
         if (want_crypto) {
+            uint8_t combined[2 * kSessionSaltLen];
+            std::memcpy(combined, salt, kSessionSaltLen);
+            std::memcpy(combined + kSessionSaltLen, server_salt, kSessionSaltLen);
+
+            uint8_t key[kSessionKeyLen];
+            if (!derive_session_key(reinterpret_cast<const uint8_t *>(cfg->pre_shared_key),
+                                    std::strlen(cfg->pre_shared_key), combined, sizeof(combined),
+                                    key) ||
+                !c->tx_cipher.init(key) || !c->rx_cipher.init(key)) {
+                delete c;
+                return fail(FUSE_ERR_UNSUPPORTED);
+            }
+            c->encrypted = true;
+
             uint8_t opened[kChallengeLen];
             if (!c->rx_cipher.open(0xFFFF, 0, nullptr, 0, proof, kProofLen, opened) ||
                 std::memcmp(opened, challenge, kChallengeLen) != 0) {
@@ -754,9 +886,31 @@ fuse_status fuse_send(fuse_conn *c, const void *data, size_t len) {
     const auto *bytes = static_cast<const uint8_t *>(data);
     if (bytes == nullptr && len > 0) return FUSE_ERR_CONFIG;
 
+    InUseGuard in_use_guard(c->in_use);
     std::vector<uint8_t> scratch(kMaxDatagramSize + 64);
     std::unique_lock<std::mutex> lk(c->mu);
-    if (c->peer_closed) return FUSE_ERR_CLOSED;
+    if (c->peer_closed || c->closing) return FUSE_ERR_CLOSED;
+
+    // Serializes whole-message sends against each other: the per-block
+    // room-wait below releases c->mu between blocks, so two concurrent
+    // fuse_send calls would otherwise interleave their blocks onto the
+    // same tx_next_seq while each computes its own message-relative offset
+    // from 0 — the receiver's reassembly has no message id to disambiguate,
+    // so interleaved blocks from two sends silently overwrite each other.
+    // sdk.h documents one sender thread and one receiver thread per
+    // connection, not two concurrent senders.
+    const auto not_busy = [&] { return !c->send_busy || c->peer_closed || c->closing; };
+    fuse_status busy_st = wait_for(c, lk, not_busy, static_cast<int>(c->timeout_ms));
+    if (busy_st != FUSE_OK) return busy_st;
+    if (c->peer_closed || c->closing) return FUSE_ERR_CLOSED;
+    c->send_busy = true;
+    struct BusyGuard {
+        fuse_conn *conn;
+        ~BusyGuard() {
+            conn->send_busy = false;
+            conn->cv.notify_all();
+        }
+    } busy_guard{c};
 
     const size_t nblocks = (len == 0) ? 1 : (len + kBlockSize - 1) / kBlockSize;
     const uint64_t first_seq = c->tx_next_seq;
@@ -797,6 +951,7 @@ fuse_status fuse_send(fuse_conn *c, const void *data, size_t len) {
 
 fuse_status fuse_recv(fuse_conn *c, void *buf, size_t cap, size_t *out_len, int timeout_ms) {
     if (c == nullptr || out_len == nullptr) return FUSE_ERR_CONFIG;
+    InUseGuard in_use_guard(c->in_use);
     std::unique_lock<std::mutex> lk(c->mu);
 
     const auto have = [&] { return !c->inbox.empty() || c->peer_closed; };
@@ -811,12 +966,14 @@ fuse_status fuse_recv(fuse_conn *c, void *buf, size_t cap, size_t *out_len, int 
         return FUSE_ERR_BUFFER;
     }
     if (!front.empty() && buf != nullptr) std::memcpy(buf, front.data(), front.size());
+    c->inbox_bytes -= front.size();
     c->inbox.pop_front();
     return FUSE_OK;
 }
 
 fuse_status fuse_recv_alloc(fuse_conn *c, void **out, size_t *out_len, int timeout_ms) {
     if (c == nullptr || out == nullptr || out_len == nullptr) return FUSE_ERR_CONFIG;
+    InUseGuard in_use_guard(c->in_use);
     std::unique_lock<std::mutex> lk(c->mu);
 
     const auto have = [&] { return !c->inbox.empty() || c->peer_closed; };
@@ -825,6 +982,7 @@ fuse_status fuse_recv_alloc(fuse_conn *c, void **out, size_t *out_len, int timeo
     if (c->inbox.empty()) return FUSE_ERR_CLOSED;
 
     std::vector<uint8_t> msg = std::move(c->inbox.front());
+    c->inbox_bytes -= msg.size();
     c->inbox.pop_front();
     lk.unlock();
 
@@ -842,13 +1000,18 @@ void fuse_free(void *p) { std::free(p); }
 
 fuse_status fuse_conn_peer(const fuse_conn *c, char *addr, size_t addr_cap, uint16_t *port) {
     if (c == nullptr) return FUSE_ERR_CONFIG;
+    // c->peer is written under c->mu by the pump thread (Data/Ack/Nack
+    // handling, NAT-migration re-anchoring) — reading it without the lock,
+    // as this used to, is a data race under the C++ memory model, same
+    // class of bug the sibling functions below already guard against.
+    auto *m = const_cast<fuse_conn *>(c);
+    std::lock_guard<std::mutex> lk(m->mu);
     if (addr != nullptr && addr_cap > 0) {
-        if (inet_ntop(AF_INET, &c->peer.addr.sin_addr, addr, static_cast<socklen_t>(addr_cap)) ==
-            nullptr) {
+        if (!peer_to_string(c->peer, addr, addr_cap)) {
             return FUSE_ERR_INTERNAL;
         }
     }
-    if (port != nullptr) *port = ntohs(c->peer.addr.sin_port);
+    if (port != nullptr) *port = peer_port(c->peer);
     return FUSE_OK;
 }
 
@@ -871,14 +1034,37 @@ void fuse_close(fuse_conn *c) {
     if (c == nullptr) return;
     {
         std::lock_guard<std::mutex> lk(c->mu);
+        c->closing = true;
         uint8_t bye[8];
         const size_t n = encode_close(bye);
         // Best effort, and repeated: this is a courtesy so the peer's recv
         // returns promptly instead of waiting out its timeout.
         for (int i = 0; i < 3; ++i) c->sock.send_to(bye, n, c->peer);
+        // Wakes any thread already parked in wait_for() (fuse_send/
+        // fuse_recv/fuse_recv_alloc), so it observes `closing` and returns
+        // FUSE_ERR_CLOSED instead of still being inside this connection's
+        // state once it's deleted below.
+        c->cv.notify_all();
     }
     c->stop.store(true, std::memory_order_relaxed);
     if (c->pump.joinable()) c->pump.join();
+
+    // A thread that was already past wait_for's check and mid-flight
+    // through the rest of fuse_send/fuse_recv/fuse_recv_alloc (running,
+    // not blocked) needs to finish touching `c` before this deletes it —
+    // in_use (see InUseGuard) tracks that. Every such call either isn't
+    // blocked at all (finishes in microseconds) or is blocked in
+    // wait_for, which the notify above plus the `closing` check already
+    // unblocks within one poll interval, so this drains almost
+    // immediately in the normal case; the cap is only a backstop against
+    // a caller that violated the "not from another thread concurrently
+    // with close, without your own synchronization" contract this shares
+    // with most C handle APIs (pthread, BSD sockets, ...).
+    for (int waited_ms = 0; c->in_use.load(std::memory_order_acquire) > 0 && waited_ms < 2000;
+        ++waited_ms) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
     delete c;
 }
 

@@ -71,7 +71,8 @@ struct Endpoint {
 struct HandshakeOutcome {
     bool client_ok = false;
     bool server_ok = false;
-    std::string wire_sample; // bytes actually put on the wire by the client
+    std::string wire_sample;      // bytes actually put on the wire by the client
+    std::string server_received;  // plaintext the server decrypted, if exchange_data
     uint64_t client_wire_bytes = 0;
 };
 
@@ -108,14 +109,20 @@ HandshakeOutcome run_dtls(const std::string &client_psk, const std::string &serv
     if (server->sess.configure(scfg, &server->sock, client_addr) != DtlsStatus::Ok) return out;
     if (client->sess.configure(ccfg, &client->sock, server_addr) != DtlsStatus::Ok) return out;
 
+    // Written only by server_thread, read only after its join() below — same
+    // discipline as `server_ok`, so nothing touches `out` from two threads
+    // concurrently (it has no synchronization of its own).
     std::atomic<bool> server_ok{false};
+    std::string server_received;
     std::thread server_thread([&] {
         if (server->sess.handshake() != DtlsStatus::Ok) return;
         server_ok.store(true);
         if (!exchange_data) return;
         uint8_t buf[512];
         size_t got = 0;
-        server->sess.recv(buf, sizeof(buf), &got);
+        if (server->sess.recv(buf, sizeof(buf), &got) == DtlsStatus::Ok) {
+            server_received.assign(reinterpret_cast<char *>(buf), got);
+        }
     });
 
     out.client_ok = (client->sess.handshake() == DtlsStatus::Ok);
@@ -124,6 +131,7 @@ HandshakeOutcome run_dtls(const std::string &client_psk, const std::string &serv
     }
     server_thread.join();
     out.server_ok = server_ok.load();
+    out.server_received = std::move(server_received);
 
     out.client_wire_bytes = client->sess.wire_bytes_sent();
     out.wire_sample.assign(reinterpret_cast<const char *>(client->sess.last_wire_datagram()),
@@ -145,6 +153,19 @@ TEST(Dtls, MatchingPskCompletesAndPutsCiphertextOnTheWire) {
     ASSERT_FALSE(r.wire_sample.empty());
     EXPECT_EQ(r.wire_sample.find(kPlaintext), std::string::npos)
         << "plaintext must never appear in the datagram put on the wire";
+}
+
+// End-to-end: not just that the handshake succeeds and the wire carries no
+// plaintext, but that application data sent over the tunnel actually
+// arrives at the far end byte-for-byte — the two tests above check the
+// handshake and the record layer in isolation, neither confirms data
+// really gets through.
+TEST(Dtls, ApplicationDataArrivesIntactEndToEnd) {
+    HandshakeOutcome r = run_dtls(kPsk, kPsk);
+    ASSERT_TRUE(r.client_ok);
+    ASSERT_TRUE(r.server_ok);
+    EXPECT_EQ(r.server_received, kPlaintext)
+        << "the server must decrypt exactly what the client sent";
 }
 
 // Acceptance: a PSK mismatch is rejected at the DTLS handshake, not

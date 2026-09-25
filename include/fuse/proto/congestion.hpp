@@ -27,7 +27,7 @@ public:
     // `max_window` is the stream's SETUP-negotiated window (the cap).
     // `enabled` mirrors the LOSSLESS flag: a non-lossless stream passes
     // false and its window stays pinned at max_window forever.
-    explicit CongestionController(uint8_t max_window, bool enabled = true,
+    explicit CongestionController(uint16_t max_window, bool enabled = true,
                                   uint32_t clean_windows_to_grow = 3,
                                   uint32_t grow_step = 2)
         : enabled_(enabled),

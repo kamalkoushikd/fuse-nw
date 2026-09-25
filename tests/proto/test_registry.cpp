@@ -52,12 +52,11 @@ TEST(Registry, LookupMissingSeqReturnsNull) {
 }
 
 TEST(Registry, WindowSizeClamped) {
-    // window_size is a uint8_t, so its max representable value (255) already
-    // equals kMaxWindow — the over-kMaxWindow clamp branch exists for any
-    // future caller with a wider window_size type, but can't be exercised
-    // through this uint8_t parameter today.
-    SenderRegistry at_max(1, 255);
+    SenderRegistry at_max(1, kMaxWindow);
     EXPECT_EQ(at_max.window_size(), kMaxWindow);
+
+    SenderRegistry over_max(1, kMaxWindow + 1);
+    EXPECT_EQ(over_max.window_size(), kMaxWindow);
 
     SenderRegistry zero(1, 0);
     EXPECT_EQ(zero.window_size(), 1);

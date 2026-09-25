@@ -1,9 +1,13 @@
-#ifndef FUSE_PROTO_AUX_HPP
-#define FUSE_PROTO_AUX_HPP
+#ifndef FUSE_PROTO_CONTROL_HPP
+#define FUSE_PROTO_CONTROL_HPP
 
-// Stage 1.5 aux channel: the signalling messages that ride alongside the
-// data plane, distinguished from DATA by their outer-header msg_type.
+// Stage 1.5 control channel: the signalling messages that ride alongside
+// the data plane, distinguished from DATA by their outer-header msg_type.
 // None of these carry payload bytes; they only carry control signals.
+//
+// (Named control.hpp, not aux.hpp: AUX is a reserved device name on
+// Windows in any directory — a checkout via native Windows tooling can't
+// create or open a file by that name.)
 //
 //   Heartbeat : [outer][stream_id:2][highest_seq_no:8]
 //   Ack       : [outer][stream_id:2][base_seq_no:8][received_bitmask:8*kMaskWords][echoed_send_time:8][nonce:8]
@@ -88,4 +92,4 @@ inline constexpr size_t kMaxAuxDatagramSize =
 
 } // namespace fuse::proto
 
-#endif // FUSE_PROTO_AUX_HPP
+#endif // FUSE_PROTO_CONTROL_HPP

@@ -9,7 +9,9 @@
 // as soon as load changes. Benchmarking also showed throughput is not
 // monotonic in worker count (4 lanes beat 8 on this host), so the right
 // concurrency is something to discover at runtime, not configure ahead of
-// time.
+// time. Core placement — pinned or merely hinted — added complexity with
+// no measured benefit, so this orchestrator leaves thread placement to the
+// OS scheduler entirely.
 //
 // This orchestrator borrows the shape of a Kubernetes horizontal pod
 // autoscaler:
@@ -18,10 +20,7 @@
 //   * min/max replica bounds,
 //   * a stabilisation window so it cannot flap between scale decisions,
 //   * graceful drain: a retired worker finishes its current work and exits
-//     rather than being killed mid-operation,
-//   * placement as a *soft* hint — a new worker is started on the
-//     least-loaded core, but is not hard-pinned there unless asked, so the
-//     scheduler keeps its freedom to migrate.
+//     rather than being killed mid-operation.
 //
 // The orchestrator is workload-agnostic: it runs a caller-supplied task and
 // only needs to know whether each invocation did useful work.
@@ -49,11 +48,6 @@ struct OrchestratorConfig {
     // Minimum time between scaling actions. Without this the controller
     // reacts to noise and thrashes threads.
     uint64_t stabilization_ns = 200'000'000; // 200 ms
-
-    // Hard-pin each worker to its assigned core. Off by default because
-    // measurement showed pinning cost throughput; placement still picks the
-    // least-loaded core either way.
-    bool pin_to_core = false;
 };
 
 struct OrchestratorStats {
@@ -88,13 +82,9 @@ public:
     uint16_t worker_count() const;
     OrchestratorStats stats() const;
 
-    // Cores currently assigned to live workers, for inspection/tests.
-    std::vector<int> assigned_cores() const;
-
 private:
     struct Worker {
         uint16_t id = 0;
-        int core = -1;
         std::thread thread;
         std::atomic<bool> drain{false};
         std::atomic<uint64_t> busy_ns{0};
@@ -105,14 +95,12 @@ private:
     void scale_out(uint64_t now_ns);
     void scale_in(uint64_t now_ns);
     void run_worker(Worker *w);
-    int least_loaded_core() const; // caller holds mutex_
 
     OrchestratorConfig config_;
     WorkerTask task_;
 
     mutable std::mutex mutex_;
     std::vector<std::unique_ptr<Worker>> workers_;
-    std::vector<uint16_t> core_load_; // workers currently placed per core
     uint16_t next_id_ = 0;
     uint64_t last_action_ns_ = 0;
     bool running_ = false;

@@ -12,8 +12,8 @@
 #include <cstdlib>
 #include <ctime>
 
-#include "fuse/proto/aux.hpp"
 #include "fuse/proto/block.hpp"
+#include "fuse/proto/control.hpp"
 #include "fuse/proto/receiver.hpp"
 #include "fuse/proto/udp.hpp"
 

@@ -2,8 +2,6 @@
 
 #include <ctime>
 
-#include "fuse/proto/topology.hpp"
-
 namespace fuse::proto {
 
 namespace {
@@ -19,8 +17,6 @@ WorkerOrchestrator::WorkerOrchestrator(const OrchestratorConfig &config, WorkerT
     if (config_.max_workers < config_.min_workers) {
         config_.max_workers = config_.min_workers;
     }
-    unsigned cores = std::thread::hardware_concurrency();
-    core_load_.assign(cores > 0 ? cores : 1, 0);
 }
 
 WorkerOrchestrator::~WorkerOrchestrator() {
@@ -38,10 +34,6 @@ void WorkerOrchestrator::start() {
         // scale_out expects the lock held; inline the same steps.
         auto w = std::make_unique<Worker>();
         w->id = next_id_++;
-        w->core = least_loaded_core();
-        if (w->core >= 0 && static_cast<size_t>(w->core) < core_load_.size()) {
-            ++core_load_[w->core];
-        }
         Worker *raw = w.get();
         raw->thread = std::thread([this, raw] { run_worker(raw); });
         workers_.push_back(std::move(w));
@@ -60,7 +52,6 @@ void WorkerOrchestrator::stop() {
             w->drain.store(true, std::memory_order_release);
         }
         doomed.swap(workers_);
-        std::fill(core_load_.begin(), core_load_.end(), 0);
     }
     // Join outside the lock so a worker finishing its task cannot deadlock
     // against a control-thread tick.
@@ -71,26 +62,7 @@ void WorkerOrchestrator::stop() {
     }
 }
 
-int WorkerOrchestrator::least_loaded_core() const {
-    int best = -1;
-    uint16_t best_load = UINT16_MAX;
-    for (size_t i = 0; i < core_load_.size(); ++i) {
-        if (core_load_[i] < best_load) {
-            best_load = core_load_[i];
-            best = static_cast<int>(i);
-        }
-    }
-    return best;
-}
-
 void WorkerOrchestrator::run_worker(Worker *w) {
-    // Placement is a hint by default: choose a core, but only actually pin
-    // when explicitly configured, since pinning measured slower than letting
-    // the scheduler place threads itself.
-    if (config_.pin_to_core && w->core >= 0) {
-        pin_current_thread_to_core(w->core);
-    }
-
     while (!w->drain.load(std::memory_order_acquire)) {
         const uint64_t t0 = now_ns();
         bool did_work = false;
@@ -143,10 +115,6 @@ void WorkerOrchestrator::tick(uint64_t now) {
         if (util > config_.target_utilization && workers_.size() < config_.max_workers) {
             auto w = std::make_unique<Worker>();
             w->id = next_id_++;
-            w->core = least_loaded_core();
-            if (w->core >= 0 && static_cast<size_t>(w->core) < core_load_.size()) {
-                ++core_load_[w->core];
-            }
             Worker *raw = w.get();
             raw->thread = std::thread([this, raw] { run_worker(raw); });
             workers_.push_back(std::move(w));
@@ -155,10 +123,6 @@ void WorkerOrchestrator::tick(uint64_t now) {
         } else if (util < config_.scale_in_utilization && workers_.size() > config_.min_workers) {
             retired = std::move(workers_.back());
             workers_.pop_back();
-            if (retired->core >= 0 && static_cast<size_t>(retired->core) < core_load_.size() &&
-                core_load_[retired->core] > 0) {
-                --core_load_[retired->core];
-            }
             // Graceful drain: ask it to finish, join below without the lock.
             retired->drain.store(true, std::memory_order_release);
             last_action_ns_ = now;
@@ -183,16 +147,6 @@ OrchestratorStats WorkerOrchestrator::stats() const {
     s.ticks = ticks_.load(std::memory_order_relaxed);
     s.last_utilization = last_util_milli_.load(std::memory_order_relaxed) / 1000.0;
     return s;
-}
-
-std::vector<int> WorkerOrchestrator::assigned_cores() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<int> cores;
-    cores.reserve(workers_.size());
-    for (const auto &w : workers_) {
-        cores.push_back(w->core);
-    }
-    return cores;
 }
 
 } // namespace fuse::proto

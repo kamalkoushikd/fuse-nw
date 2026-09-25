@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -7,6 +8,8 @@
 #include <thread>
 #include <vector>
 
+#include "fuse/proto/block.hpp"
+#include "fuse/proto/udp.hpp"
 #include "fuse/sdk.h"
 
 namespace {
@@ -151,6 +154,69 @@ TEST(Sdk, BidirectionalTraffic) {
         EXPECT_EQ(std::string(buf, n), "echo:" + out);
     }
     echo.join();
+
+    fuse_close(cli);
+    fuse_close(srv);
+}
+
+// A Data block's offset is an unauthenticated wire value in plaintext mode
+// (it is only covered by the AEAD AAD once a PSK is set), so a block
+// claiming an offset near UINT64_MAX plus a small payload can make
+// `offset + payload_len` wrap past zero under naive unsigned addition —
+// small enough to pass a bounds check of the form "offset + len <= cap",
+// after which reassembly would memcpy at the real, unwrapped offset: a
+// heap out-of-bounds write reachable by anyone who can reach the
+// connection's ephemeral port, no key needed.
+TEST(Sdk, MaliciousOffsetIsRejectedNotWritten) {
+    using namespace fuse::proto;
+    Server s;
+    fuse_conn *srv = nullptr;
+    std::thread acceptor([&] { srv = fuse_accept(s.l, 5000, nullptr); });
+    fuse_conn *cli = client_connect(s.port, nullptr, nullptr);
+    acceptor.join();
+    ASSERT_NE(cli, nullptr);
+    ASSERT_NE(srv, nullptr);
+
+    // The server answers HELLO from a fresh per-connection ephemeral
+    // socket and the client adopts that as its peer — so `cli`'s peer
+    // address *is* the server connection's own receiving port, the one
+    // handle_data_locked() runs against.
+    char addr[64] = {};
+    uint16_t target_port = 0;
+    ASSERT_EQ(fuse_conn_peer(cli, addr, sizeof(addr), &target_port), FUSE_OK);
+
+    UdpSocket atk;
+    ASSERT_TRUE(atk.open("127.0.0.1", 0));
+    PeerAddr dst;
+    ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", target_port, &dst));
+
+    // stream_id 0 is the client->server lane (kLaneClientToServer in
+    // sdk.cpp) — an in-window seq_no so the receive window accepts it, an
+    // offset designed to wrap.
+    {
+        BlockHeader hdr;
+        hdr.stream_id = 0;
+        hdr.seq_no = 1;
+        hdr.flags = 0;
+        hdr.payload_len = 8;
+        hdr.offset = UINT64_MAX - 4;
+        uint8_t body[8] = {0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
+        uint8_t dg[512];
+        const size_t dn = encode_data_datagram(hdr, 0, body, dg, sizeof(dg));
+        ASSERT_GT(dn, 0u);
+        ASSERT_TRUE(atk.send_to(dg, dn, dst));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // The connection must still be healthy: a legitimate message sent
+    // afterward arrives intact, proving the malicious block's payload was
+    // dropped rather than written into the reassembly buffer (or worse).
+    const std::string msg = "still healthy after the attack";
+    ASSERT_EQ(fuse_send(cli, msg.data(), msg.size()), FUSE_OK);
+    char buf[256];
+    size_t n = 0;
+    ASSERT_EQ(fuse_recv(srv, buf, sizeof(buf), &n, 5000), FUSE_OK);
+    EXPECT_EQ(std::string(buf, n), msg);
 
     fuse_close(cli);
     fuse_close(srv);
@@ -358,6 +424,81 @@ TEST(Sdk, RejectsBadConfig) {
     cfg.port = 0; // a client needs a real destination port
     EXPECT_EQ(fuse_connect(&cfg, &err), nullptr);
     EXPECT_EQ(err, FUSE_ERR_CONFIG);
+}
+
+// fuse_close on one thread while another is blocked in fuse_recv must
+// unblock that call with FUSE_ERR_CLOSED, not leave it referencing a
+// connection that gets deleted out from under it. sdk.h documents one
+// sender thread and one receiver thread per connection as the supported
+// concurrency pattern, which makes "someone else closes while my recv is
+// still blocked" an ordinary, expected interleaving, not a misuse case.
+TEST(Sdk, CloseWhileRecvBlockedUnblocksCleanly) {
+    Server s;
+    fuse_conn *srv = nullptr;
+    std::thread acceptor([&] { srv = fuse_accept(s.l, 5000, nullptr); });
+    fuse_conn *cli = client_connect(s.port, nullptr, nullptr);
+    acceptor.join();
+    ASSERT_NE(cli, nullptr);
+    ASSERT_NE(srv, nullptr);
+
+    fuse_status rs = FUSE_OK;
+    char buf[64];
+    size_t n = 0;
+    std::thread receiver([&] { rs = fuse_recv(cli, buf, sizeof(buf), &n, 5000); });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    fuse_close(cli); // waits for the blocked recv to actually leave first
+    receiver.join();
+
+    EXPECT_EQ(rs, FUSE_ERR_CLOSED);
+
+    fuse_close(srv);
+}
+
+// Two threads calling fuse_send concurrently on the same connection must
+// not corrupt either message. Before send_busy serialization, wait_for's
+// per-block room-wait released c->mu between blocks, so two concurrent
+// sends could interleave their blocks onto the same tx_next_seq while each
+// computed its own message-relative offset from 0 — the receiver's
+// reassembly has no message id to disambiguate, silently corrupting both.
+TEST(Sdk, ConcurrentSendsDoNotCorruptMessages) {
+    Server s;
+    fuse_conn *srv = nullptr;
+    std::thread acceptor([&] { srv = fuse_accept(s.l, 5000, nullptr); });
+    fuse_conn *cli = client_connect(s.port, nullptr, nullptr);
+    acceptor.join();
+    ASSERT_NE(cli, nullptr);
+    ASSERT_NE(srv, nullptr);
+
+    const std::string a(50000, 'A'); // spans many blocks (kBlockSize=1200)
+    const std::string b(50000, 'B');
+
+    fuse_status sa = FUSE_OK, sb = FUSE_OK;
+    std::thread t1([&] { sa = fuse_send(cli, a.data(), a.size()); });
+    std::thread t2([&] { sb = fuse_send(cli, b.data(), b.size()); });
+
+    std::vector<std::string> got;
+    for (int i = 0; i < 2; ++i) {
+        void *p = nullptr;
+        size_t n = 0;
+        ASSERT_EQ(fuse_recv_alloc(srv, &p, &n, 5000), FUSE_OK);
+        got.emplace_back(static_cast<char *>(p), n);
+        fuse_free(p);
+    }
+    t1.join();
+    t2.join();
+
+    EXPECT_EQ(sa, FUSE_OK);
+    EXPECT_EQ(sb, FUSE_OK);
+
+    // send_busy only prevents interleaving, not a fixed arrival order.
+    std::sort(got.begin(), got.end());
+    std::vector<std::string> want = {a, b};
+    std::sort(want.begin(), want.end());
+    EXPECT_EQ(got, want) << "a concurrent send corrupted or interleaved a message";
+
+    fuse_close(cli);
+    fuse_close(srv);
 }
 
 #if FUSE_PROTO_WITH_DTLS

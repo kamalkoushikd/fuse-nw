@@ -24,7 +24,7 @@ void shift_right_one(std::array<uint64_t, kMaskWords> &mask) {
 
 } // namespace
 
-ReceiverStream::ReceiverStream(uint16_t stream_id, uint8_t window_size, bool lossless)
+ReceiverStream::ReceiverStream(uint16_t stream_id, uint16_t window_size, bool lossless)
     : stream_id_(stream_id), lossless_(lossless) {
     if (window_size < 1) {
         window_size = 1;
@@ -50,7 +50,7 @@ void ReceiverStream::slide_base_over_contiguous_prefix() {
         shift_right_one(received_mask_);
         base_seq_no_ += 1;
 
-        for (uint8_t i = 0; i + 1 < window_size_; ++i) {
+        for (uint16_t i = 0; i + 1 < window_size_; ++i) {
             first_missing_ns_[i] = first_missing_ns_[i + 1];
             last_nack_ns_[i] = last_nack_ns_[i + 1];
         }
@@ -89,7 +89,7 @@ ReceiveResult ReceiverStream::on_receive(uint64_t seq_no, uint64_t send_time_ns,
 
     // Any lower position still unset is now a genuine gap (a higher block
     // arrived without it). Timestamp each newly-exposed gap once.
-    for (uint8_t gap_rel = 0; gap_rel < window_size_; ++gap_rel) {
+    for (uint16_t gap_rel = 0; gap_rel < window_size_; ++gap_rel) {
         if (!is_expected(gap_rel) || test_bit(received_mask_, gap_rel)) {
             continue;
         }
@@ -124,7 +124,7 @@ uint16_t ReceiverStream::collect_nacks(uint64_t now_ns, uint64_t reorder_delay_n
         return 0;
     }
 
-    for (uint8_t rel = 0; rel < window_size_; ++rel) {
+    for (uint16_t rel = 0; rel < window_size_; ++rel) {
         if (!is_expected(rel) || test_bit(received_mask_, rel)) {
             continue;
         }

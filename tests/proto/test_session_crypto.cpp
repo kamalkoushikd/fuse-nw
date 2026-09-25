@@ -23,7 +23,7 @@ Keyed make_keys() {
     Keyed k;
     EXPECT_TRUE(random_bytes(k.salt, sizeof(k.salt)));
     EXPECT_TRUE(derive_session_key(reinterpret_cast<const uint8_t *>(kPsk.data()), kPsk.size(),
-                                   k.salt, k.key));
+                                   k.salt, sizeof(k.salt), k.key));
     return k;
 }
 } // namespace
@@ -38,9 +38,9 @@ TEST(SessionCrypto, SameInputsDeriveSameKeyOnBothEnds) {
 
     uint8_t a[kSessionKeyLen], b[kSessionKeyLen];
     ASSERT_TRUE(derive_session_key(reinterpret_cast<const uint8_t *>(kPsk.data()), kPsk.size(),
-                                   salt, a));
+                                   salt, sizeof(salt), a));
     ASSERT_TRUE(derive_session_key(reinterpret_cast<const uint8_t *>(kPsk.data()), kPsk.size(),
-                                   salt, b));
+                                   salt, sizeof(salt), b));
     EXPECT_EQ(0, std::memcmp(a, b, kSessionKeyLen))
         << "both endpoints must derive an identical key from the same PSK and salt";
 }
@@ -198,7 +198,8 @@ TEST(SessionCrypto, FailsClosedWithoutBackend) {
     uint8_t salt[kSessionSaltLen] = {};
     uint8_t key[kSessionKeyLen] = {};
     EXPECT_FALSE(random_bytes(salt, sizeof(salt)));
-    EXPECT_FALSE(derive_session_key(reinterpret_cast<const uint8_t *>("x"), 1, salt, key));
+    EXPECT_FALSE(derive_session_key(reinterpret_cast<const uint8_t *>("x"), 1, salt, sizeof(salt),
+                                    key));
     LaneCipher c;
     EXPECT_FALSE(c.init(key));
 }
