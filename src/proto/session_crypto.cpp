@@ -108,6 +108,12 @@ LaneCipher::~LaneCipher() {
 }
 
 bool LaneCipher::init(const uint8_t key[kSessionKeyLen]) {
+    if (initialized_) {
+        // See the header comment: re-init would silently allow (key, nonce)
+        // reuse if the caller passed the same key twice (e.g. an unchanged
+        // salt across a session reset). Fail closed instead.
+        return false;
+    }
     if (aes_ == nullptr) {
         aes_ = new (std::nothrow) Aes{};
         if (aes_ == nullptr) {
@@ -119,8 +125,9 @@ bool LaneCipher::init(const uint8_t key[kSessionKeyLen]) {
             return false;
         }
     }
-    return wc_AesGcmSetKey(static_cast<Aes *>(aes_), key,
-                           static_cast<word32>(kSessionKeyLen)) == 0;
+    initialized_ = wc_AesGcmSetKey(static_cast<Aes *>(aes_), key,
+                                   static_cast<word32>(kSessionKeyLen)) == 0;
+    return initialized_;
 }
 
 bool LaneCipher::seal(uint16_t lane, uint64_t seq, const uint8_t *aad, size_t aad_len,

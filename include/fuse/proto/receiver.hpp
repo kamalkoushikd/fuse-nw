@@ -3,10 +3,12 @@
 
 // Stage 1.3 / 1.4 receiver-side tracking for one stream.
 //
-// State is a single uint64 received-bitmask plus a base sequence number:
-// bit i set means (base_seq_no + i) has arrived. Missing-block detection
-// is one bitwise op — expected & ~received — with set bits enumerated via
-// __builtin_ctzll, so it is O(popcount) with no hashing and no allocation.
+// State is a multi-word (kMaskWords x uint64) received-bitmask plus a base
+// sequence number: bit i of word i/64 set means (base_seq_no + i) has
+// arrived. Missing-block detection is one bitwise op per word — expected &
+// ~received — with set bits enumerated via __builtin_ctzll, so it stays
+// O(popcount) with no hashing and no allocation, just spread across
+// kMaskWords words instead of one.
 //
 // A gap is not NACKed the instant it is noticed: a block that is merely
 // reordered (slightly late but still arriving) must not be mistaken for a
@@ -38,7 +40,15 @@ public:
     uint16_t stream_id() const { return stream_id_; }
     uint8_t  window_size() const { return window_size_; }
     uint64_t base_seq_no() const { return base_seq_no_; }
-    uint64_t received_bitmask() const { return received_mask_; }
+    // Word 0 of the received-set (positions base_seq_no()..+63) — enough for
+    // any window_size <= 64, which covers every existing caller/test; use
+    // is_received() for positions in wider windows.
+    uint64_t received_bitmask() const { return received_mask_[0]; }
+    // Bit `rel` (0-based, relative to base_seq_no()) lives in word rel/64,
+    // bit rel%64 of that word.
+    bool is_received(uint64_t rel) const {
+        return rel < kMaxWindow && (received_mask_[rel / 64] & (1ull << (rel % 64))) != 0;
+    }
     uint64_t window_overflow_count() const { return window_overflow_count_; }
 
     // Records receipt of `seq_no` (with the send_time echoed back later in
@@ -56,9 +66,9 @@ public:
                            uint64_t renack_interval_ns, Nack *out);
 
 private:
-    // Bitmask of positions [0 .. highest_rel] that should have arrived by
-    // now (everything at or below the highest block we've seen).
-    uint64_t expected_mask() const;
+    // True iff relative position `rel` should have arrived by now (at or
+    // below the highest block seen).
+    bool is_expected(uint64_t rel) const;
 
     void slide_base_over_contiguous_prefix();
 
@@ -67,7 +77,7 @@ private:
     bool     lossless_;
 
     uint64_t base_seq_no_ = 0;
-    uint64_t received_mask_ = 0;
+    std::array<uint64_t, kMaskWords> received_mask_{};
     uint64_t highest_received_ = 0;
     bool     have_any_ = false;
 

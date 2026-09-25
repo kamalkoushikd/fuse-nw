@@ -79,7 +79,7 @@ int main(int argc, char **argv) {
     // Send all blocks, withholding drop_seq on its first pass.
     for (uint64_t seq = 0; seq < count; ++seq) {
         for (uint16_t i = 0; i < kLen; ++i) payload[i] = static_cast<uint8_t>(seq * 31 + i);
-        registry.store(seq, payload, kLen, now_ns());
+        registry.store(seq, payload, kLen, now_ns(), seq * kLen);
 
         if (static_cast<int64_t>(seq) == drop_seq) {
             std::printf("send seq=%llu  [deliberately dropped]\n",

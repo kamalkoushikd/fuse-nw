@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <random>
 #include <thread>
 
 #include "fuse/proto/aux.hpp"
@@ -49,6 +50,14 @@ void set_timeout_us(int fd, long us) {
 
 // Associated data binds a block to its identity so a valid block cannot be
 // replayed at another position.
+// Handshake anti-replay nonce for StreamStart (kept independent of the
+// crypto backend: this guards session identity, not confidentiality, so it
+// must work in unencrypted transfers too).
+uint64_t random_nonce() {
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    return rng();
+}
+
 size_t build_aad(uint8_t *out, uint16_t lane, uint64_t seq, uint64_t offset) {
     size_t n = 0;
     n += put_u16(out + n, lane);
@@ -93,6 +102,7 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
     const size_t slot = kMaxDatagramSize + 64;
     std::vector<uint8_t> rx_buf(kRxBatch * slot);
     std::vector<size_t> lens(kRxBatch);
+    std::vector<PeerAddr> srcs(kRxBatch);
     std::vector<uint8_t> tx(kMaxAuxDatagramSize + 64);
 
     uint64_t shard_bytes = 0, final_seq = UINT64_MAX, written = 0;
@@ -105,17 +115,15 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
     // defaults are used rather than the loopback-tight ones.
     uint64_t rtt_est_ns = 0, nack_sent_ns = 0;
     bool have_start = false, have_peer = false;
+    uint64_t peer_nonce = 0; // echoed in every Ack once StreamStart arrives
     PeerAddr peer{};
     int idle = 0;
     const int max_idle = static_cast<int>(cfg.timeout_ms / 200) + 5;
 
     for (;;) {
-        PeerAddr src;
-        const int got = sock.recv_batch(rx_buf.data(), slot, kRxBatch, lens.data(), &src);
+        const int got = sock.recv_batch(rx_buf.data(), slot, kRxBatch, lens.data(), srcs.data());
         if (got > 0) {
             idle = 0;
-            peer = src;
-            have_peer = true;
             if (res->start_ns.load() == 0) res->start_ns.store(now_ns());
         } else if (++idle > max_idle) {
             res->status.store(static_cast<int>(TransferStatus::Timeout));
@@ -133,6 +141,9 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
                 if (!decode_stream_start(dg, dlen, &ss)) continue;
                 if (!have_start) {
                     have_start = true;
+                    peer_nonce = ss.nonce;
+                    peer = srcs[i];
+                    have_peer = true;
                     shard_bytes = ss.total_bytes;
                     shard->assign(shard_bytes, 0);
                     if (want_crypto) {
@@ -144,6 +155,13 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
                             return;
                         }
                     }
+                } else if (ss.nonce == peer_nonce) {
+                    // A retried StreamStart (our first Ack was lost) carrying
+                    // the same nonce we already accepted — safe to treat as
+                    // this session even if it now arrives from a different
+                    // address (the sender's NAT mapping may have rotated).
+                    peer = srcs[i];
+                    have_peer = true;
                 }
                 continue;
             }
@@ -174,6 +192,17 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
                 body_len = static_cast<uint16_t>(hdr.payload_len - kAeadTagLen);
             }
 
+            // This block just proved itself (authenticated, if encrypted;
+            // structurally valid for this stream otherwise) — safe to trust
+            // its source as where to send ACKs, even if it differs from the
+            // address we've been using. This is what makes an in-progress
+            // transfer survive the sender's NAT mapping changing mid-flight
+            // (an ISP-forced reconnect, a mobile handover, a CGNAT re-lease):
+            // the very next block the sender emits re-anchors the receiver's
+            // reply address, with no session drop and no explicit handshake.
+            peer = srcs[i];
+            have_peer = true;
+
             // A retransmission arriving after we NACK'd measures one RTT on
             // the receiver's own clock (no cross-host clock comparison).
             if ((hdr.flags & kFlagRetransmission) && nack_sent_ns != 0) {
@@ -198,7 +227,8 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
         if (delivered - last_ack_blocks >= 8 || t - last_ack_ns > 200000) {
             last_ack_blocks = delivered;
             last_ack_ns = t;
-            const Ack ack = rx.build_ack();
+            Ack ack = rx.build_ack();
+            ack.nonce = peer_nonce;
             const size_t n = encode_ack(ack, tx.data(), tx.size());
             if (n) sock.send_to(tx.data(), n, peer);
         }
@@ -225,15 +255,28 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
     }
 
     for (int i = 0; i < 8; ++i) {
-        const Ack ack = rx.build_ack();
+        Ack ack = rx.build_ack();
+        ack.nonce = peer_nonce;
         const size_t n = encode_ack(ack, tx.data(), tx.size());
         if (n) sock.send_to(tx.data(), n, peer);
     }
 
     res->bytes.store(written);
     res->auth_failures.store(auth_failures);
-    res->status.store(static_cast<int>(written == shard_bytes ? TransferStatus::Ok
-                                                              : TransferStatus::Incomplete));
+
+    // An active MITM/corruption attack fails most blocks' auth check rather
+    // than merely dropping some — that pattern is distinguishable from
+    // ordinary loss (which NACK/retransmit already resolves) and deserves a
+    // status the caller can act on differently from "just incomplete".
+    // Require a minimum sample size so a couple of early failures during
+    // key/salt setup don't misreport a healthy transfer.
+    const uint64_t auth_sample = delivered + auth_failures;
+    if (auth_sample >= 20 && auth_failures * 2 > auth_sample) {
+        res->status.store(static_cast<int>(TransferStatus::AuthFailed));
+    } else {
+        res->status.store(static_cast<int>(written == shard_bytes ? TransferStatus::Ok
+                                                                  : TransferStatus::Incomplete));
+    }
 }
 
 // --- Sender lane ---------------------------------------------------------
@@ -277,6 +320,11 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     ss.block_size = cfg.block_size;
     ss.total_bytes = shard_bytes;
     if (keys.enabled) std::memcpy(ss.session_salt, keys.salt, kSessionSaltLen);
+    // Fixed for the whole handshake (all 200 retries send the same nonce) so
+    // any one matching Ack confirms it — but unique to this attempt at this
+    // lane, so a stale Ack left over from an earlier session on this port
+    // can't be mistaken for confirmation of this one.
+    ss.nonce = random_nonce();
 
     bool started = false;
     for (int attempt = 0; attempt < 200 && !started; ++attempt) {
@@ -285,7 +333,12 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
         size_t got = 0;
         if (sock.recv_from(ctl.data(), ctl.size(), &got, nullptr)) {
             MsgType t;
-            if (peek_msg_type(ctl.data(), got, &t) && t == MsgType::Ack) started = true;
+            if (peek_msg_type(ctl.data(), got, &t) && t == MsgType::Ack) {
+                Ack ack;
+                if (decode_ack(ctl.data(), got, &ack) && ack.nonce == ss.nonce) {
+                    started = true;
+                }
+            }
         }
     }
     if (!started) {
@@ -307,9 +360,6 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     const uint64_t t0 = now_ns();
     const uint64_t deadline_ns = static_cast<uint64_t>(cfg.timeout_ms) * 1000000ull;
     bool sent_last = false;
-
-    std::vector<std::pair<uint64_t, uint16_t>> meta;
-    meta.reserve(shard_bytes / (cfg.block_size ? cfg.block_size : 1200) + 8);
 
     res->start_ns.store(t0);
 
@@ -339,9 +389,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 hdr.payload_len = len;
                 hdr.offset = next_offset;
 
-                reg.store(next_seq, data + next_offset, len, now_ns());
-                if (meta.size() <= next_seq) meta.resize(next_seq + 1);
-                meta[next_seq] = {next_offset, len};
+                reg.store(next_seq, data + next_offset, len, now_ns(), next_offset);
 
                 const uint8_t *body = data + next_offset;
                 if (keys.enabled) {
@@ -384,7 +432,8 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
         bool loss_seen = false;
         for (int drain = 0; drain < 64; ++drain) {
             size_t got = 0;
-            if (!sock.recv_from(ctl.data(), ctl.size(), &got, nullptr)) break;
+            PeerAddr src;
+            if (!sock.recv_from(ctl.data(), ctl.size(), &got, &src)) break;
             did_work = true;
             MsgType type;
             if (!peek_msg_type(ctl.data(), got, &type)) continue;
@@ -392,6 +441,13 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             if (type == MsgType::Ack) {
                 Ack ack;
                 if (!decode_ack(ctl.data(), got, &ack)) continue;
+                if (ack.nonce != ss.nonce) continue; // not this session
+                // The Ack proved it holds this session's nonce, so its
+                // source is safe to trust even if it differs from `dst` —
+                // this is what lets a transfer survive the receiver's NAT
+                // mapping changing mid-flight, symmetric to the migration
+                // recv_lane does for the sender's address.
+                dst = src;
                 if (ack.base_seq_no > base) {
                     for (uint64_t s = base; s < ack.base_seq_no; ++s) reg.confirm(s);
                     base = ack.base_seq_no;
@@ -408,13 +464,13 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 for (uint16_t i = 0; i < nack.count; ++i) {
                     const uint64_t seq = nack.missing[i];
                     const RegistrySlot *sl = reg.lookup(seq);
-                    if (!sl || seq >= meta.size()) continue;
+                    if (!sl) continue;
                     BlockHeader hdr;
                     hdr.stream_id = lane;
                     hdr.seq_no = seq;
                     hdr.flags = kFlagRetransmission;
                     hdr.payload_len = sl->payload_len;
-                    hdr.offset = meta[seq].first;
+                    hdr.offset = sl->offset;
                     const uint8_t *body = sl->payload;
                     if (keys.enabled) {
                         uint8_t aad[18];
@@ -459,13 +515,13 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
         } else if (t - last_progress > rto_ns) {
             cc.on_loss();
             const RegistrySlot *sl = reg.lookup(base);
-            if (sl && base < meta.size()) {
+            if (sl) {
                 BlockHeader hdr;
                 hdr.stream_id = lane;
                 hdr.seq_no = base;
                 hdr.flags = kFlagRetransmission;
                 hdr.payload_len = sl->payload_len;
-                hdr.offset = meta[base].first;
+                hdr.offset = sl->offset;
                 const uint8_t *body = sl->payload;
                 if (keys.enabled) {
                     uint8_t aad[18];

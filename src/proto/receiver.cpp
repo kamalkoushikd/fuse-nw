@@ -2,6 +2,28 @@
 
 namespace fuse::proto {
 
+namespace {
+
+bool test_bit(const std::array<uint64_t, kMaskWords> &mask, uint64_t rel) {
+    return (mask[rel / 64] & (1ull << (rel % 64))) != 0;
+}
+
+void set_bit(std::array<uint64_t, kMaskWords> &mask, uint64_t rel) {
+    mask[rel / 64] |= (1ull << (rel % 64));
+}
+
+// Shifts the whole multi-word mask right by one bit (bit 0 of word i+1
+// becomes the new top bit of word i), matching what a single uint64 >>= 1
+// used to do before the window widened past 64.
+void shift_right_one(std::array<uint64_t, kMaskWords> &mask) {
+    for (size_t i = 0; i + 1 < kMaskWords; ++i) {
+        mask[i] = (mask[i] >> 1) | (mask[i + 1] << 63);
+    }
+    mask[kMaskWords - 1] >>= 1;
+}
+
+} // namespace
+
 ReceiverStream::ReceiverStream(uint16_t stream_id, uint8_t window_size, bool lossless)
     : stream_id_(stream_id), lossless_(lossless) {
     if (window_size < 1) {
@@ -12,23 +34,20 @@ ReceiverStream::ReceiverStream(uint16_t stream_id, uint8_t window_size, bool los
     window_size_ = window_size;
 }
 
-uint64_t ReceiverStream::expected_mask() const {
+bool ReceiverStream::is_expected(uint64_t rel) const {
     if (!have_any_ || highest_received_ < base_seq_no_) {
-        return 0;
+        return false;
     }
     uint64_t rel_high = highest_received_ - base_seq_no_;
-    if (rel_high >= 63) {
-        return ~0ull;
-    }
-    return (1ull << (rel_high + 1)) - 1;
+    return rel <= rel_high;
 }
 
 void ReceiverStream::slide_base_over_contiguous_prefix() {
     // Advance base across every contiguously-received low bit. Each step
     // shifts the received bitmask and the two gap-timing arrays down by
     // one so index i keeps meaning "seq base_seq_no_ + i".
-    while (received_mask_ & 1ull) {
-        received_mask_ >>= 1;
+    while (test_bit(received_mask_, 0)) {
+        shift_right_one(received_mask_);
         base_seq_no_ += 1;
 
         for (uint8_t i = 0; i + 1 < window_size_; ++i) {
@@ -57,11 +76,10 @@ ReceiveResult ReceiverStream::on_receive(uint64_t seq_no, uint64_t send_time_ns,
         return ReceiveResult::OutOfWindow;
     }
 
-    uint64_t bit = 1ull << rel;
-    if (received_mask_ & bit) {
+    if (test_bit(received_mask_, rel)) {
         return ReceiveResult::Duplicate;
     }
-    received_mask_ |= bit;
+    set_bit(received_mask_, rel);
 
     if (!have_any_ || seq_no > highest_received_) {
         highest_received_ = seq_no;
@@ -71,14 +89,13 @@ ReceiveResult ReceiverStream::on_receive(uint64_t seq_no, uint64_t send_time_ns,
 
     // Any lower position still unset is now a genuine gap (a higher block
     // arrived without it). Timestamp each newly-exposed gap once.
-    uint64_t missing = expected_mask() & ~received_mask_;
-    while (missing) {
-        uint64_t m = missing & (~missing + 1); // lowest set bit
-        int gap_rel = __builtin_ctzll(missing);
+    for (uint8_t gap_rel = 0; gap_rel < window_size_; ++gap_rel) {
+        if (!is_expected(gap_rel) || test_bit(received_mask_, gap_rel)) {
+            continue;
+        }
         if (first_missing_ns_[gap_rel] == 0) {
             first_missing_ns_[gap_rel] = now_ns;
         }
-        missing ^= m;
     }
 
     slide_base_over_contiguous_prefix();
@@ -89,7 +106,9 @@ Ack ReceiverStream::build_ack() const {
     Ack ack;
     ack.stream_id = stream_id_;
     ack.base_seq_no = base_seq_no_;
-    ack.received_bitmask = received_mask_;
+    for (size_t i = 0; i < kMaskWords; ++i) {
+        ack.received_bitmask[i] = received_mask_[i];
+    }
     ack.echoed_send_time = last_send_time_;
     return ack;
 }
@@ -105,11 +124,10 @@ uint16_t ReceiverStream::collect_nacks(uint64_t now_ns, uint64_t reorder_delay_n
         return 0;
     }
 
-    uint64_t missing = expected_mask() & ~received_mask_;
-    while (missing) {
-        uint64_t m = missing & (~missing + 1);
-        int rel = __builtin_ctzll(missing);
-        missing ^= m;
+    for (uint8_t rel = 0; rel < window_size_; ++rel) {
+        if (!is_expected(rel) || test_bit(received_mask_, rel)) {
+            continue;
+        }
 
         uint64_t first = first_missing_ns_[rel];
         if (first == 0 || now_ns - first < reorder_delay_ns) {

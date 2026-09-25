@@ -78,7 +78,7 @@ TEST(Flags, LosslessOneStreamFullyRecoversUnderLoss) {
     SenderRegistry reg(kStream, kWindow);
     for (uint64_t seq = 0; seq < kN; ++seq) {
         fill_block(kStream, seq, source.data() + seq * kBlock, kBlock);
-        ASSERT_TRUE(reg.store(seq, source.data() + seq * kBlock, kBlock, seq));
+        ASSERT_TRUE(reg.store(seq, source.data() + seq * kBlock, kBlock, seq, seq * kBlock));
     }
 
     std::vector<uint8_t> sink(kN * kBlock, 0);

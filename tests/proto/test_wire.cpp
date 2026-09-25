@@ -47,8 +47,10 @@ TEST(Wire, HeaderSizesMatchSpec) {
     // (adapting to the link) without the receiver misplacing payloads.
     EXPECT_EQ(kBlockHeaderSize, 21u);
     EXPECT_EQ(kOuterHeaderSize, 2u);
-    EXPECT_EQ(kMaxWindow, 64u);
-    EXPECT_EQ(kProtocolVersion, 2u);
+    // v3 widened the window to a multi-word bitmask, capped at 255 since
+    // window_size still rides in one wire byte (setup.cpp put_u8/get_u8).
+    EXPECT_EQ(kMaxWindow, 255u);
+    EXPECT_EQ(kProtocolVersion, 3u);
 
     // The MTU-safe default stays well under a 1500-byte path MTU; the
     // ceiling is only reached by probing a link that proves it can take it.

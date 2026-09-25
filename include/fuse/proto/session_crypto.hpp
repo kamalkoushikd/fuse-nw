@@ -62,6 +62,10 @@ public:
     LaneCipher(const LaneCipher &) = delete;
     LaneCipher &operator=(const LaneCipher &) = delete;
 
+    // Fails if this instance was already initialised: nonce uniqueness rests
+    // on (key, seq_no) never repeating, and re-initialising the same object
+    // (e.g. a session reset that reuses a salt) is exactly how a caller could
+    // silently break that guarantee. Construct a fresh LaneCipher instead.
     bool init(const uint8_t key[kSessionKeyLen]);
 
     // Encrypts `pt_len` bytes into `out`, which must have room for
@@ -79,6 +83,7 @@ public:
 
 private:
     void *aes_ = nullptr; // wolfSSL Aes, kept opaque to avoid leaking the dep
+    bool  initialized_ = false;
 };
 
 } // namespace fuse::proto

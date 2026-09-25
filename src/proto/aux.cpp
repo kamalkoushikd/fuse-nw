@@ -44,7 +44,7 @@ size_t encode_heartbeat(const Heartbeat &hb, uint8_t *out, size_t out_cap) {
 
 bool decode_heartbeat(const uint8_t *in, size_t in_len, Heartbeat *hb) {
     size_t off = check_outer(in, in_len, MsgType::Heartbeat);
-    if (off == 0 || in_len != kOuterHeaderSize + 2 + 8) {
+    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8) {
         return false;
     }
     off += get_u16(in + off, &hb->stream_id);
@@ -53,7 +53,7 @@ bool decode_heartbeat(const uint8_t *in, size_t in_len, Heartbeat *hb) {
 }
 
 size_t encode_stream_start(const StreamStart &ss, uint8_t *out, size_t out_cap) {
-    const size_t total = kOuterHeaderSize + 2 + 8 + 2 + 8 + 16;
+    const size_t total = kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8;
     if (out_cap < total) {
         return 0;
     }
@@ -64,12 +64,13 @@ size_t encode_stream_start(const StreamStart &ss, uint8_t *out, size_t out_cap) 
     off += put_u64(out + off, ss.total_bytes);
     std::memcpy(out + off, ss.session_salt, sizeof(ss.session_salt));
     off += sizeof(ss.session_salt);
+    off += put_u64(out + off, ss.nonce);
     return off;
 }
 
 bool decode_stream_start(const uint8_t *in, size_t in_len, StreamStart *ss) {
     size_t off = check_outer(in, in_len, MsgType::StreamStart);
-    if (off == 0 || in_len != kOuterHeaderSize + 2 + 8 + 2 + 8 + 16) {
+    if (off == 0 || in_len != kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8) {
         return false;
     }
     off += get_u16(in + off, &ss->stream_id);
@@ -78,31 +79,38 @@ bool decode_stream_start(const uint8_t *in, size_t in_len, StreamStart *ss) {
     off += get_u64(in + off, &ss->total_bytes);
     std::memcpy(ss->session_salt, in + off, sizeof(ss->session_salt));
     off += sizeof(ss->session_salt);
+    off += get_u64(in + off, &ss->nonce);
     return true;
 }
 
 size_t encode_ack(const Ack &ack, uint8_t *out, size_t out_cap) {
-    const size_t total = kOuterHeaderSize + 2 + 8 + 8 + 8;
+    const size_t total = kOuterHeaderSize + 2 + 8 + kMaskWords * 8 + 8 + 8;
     if (out_cap < total) {
         return 0;
     }
     size_t off = put_outer(out, MsgType::Ack);
     off += put_u16(out + off, ack.stream_id);
     off += put_u64(out + off, ack.base_seq_no);
-    off += put_u64(out + off, ack.received_bitmask);
+    for (size_t i = 0; i < kMaskWords; ++i) {
+        off += put_u64(out + off, ack.received_bitmask[i]);
+    }
     off += put_u64(out + off, ack.echoed_send_time);
+    off += put_u64(out + off, ack.nonce);
     return off;
 }
 
 bool decode_ack(const uint8_t *in, size_t in_len, Ack *ack) {
     size_t off = check_outer(in, in_len, MsgType::Ack);
-    if (off == 0 || in_len != kOuterHeaderSize + 2 + 8 + 8 + 8) {
+    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8 + kMaskWords * 8 + 8 + 8) {
         return false;
     }
     off += get_u16(in + off, &ack->stream_id);
     off += get_u64(in + off, &ack->base_seq_no);
-    off += get_u64(in + off, &ack->received_bitmask);
+    for (size_t i = 0; i < kMaskWords; ++i) {
+        off += get_u64(in + off, &ack->received_bitmask[i]);
+    }
     off += get_u64(in + off, &ack->echoed_send_time);
+    off += get_u64(in + off, &ack->nonce);
     return true;
 }
 

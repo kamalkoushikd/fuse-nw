@@ -275,7 +275,8 @@ void retransmit_locked(fuse_conn *c, uint64_t seq, uint8_t *scratch, size_t cap)
     }
 }
 
-void handle_data_locked(fuse_conn *c, const uint8_t *dg, size_t dlen, uint8_t *plain) {
+void handle_data_locked(fuse_conn *c, const uint8_t *dg, size_t dlen, uint8_t *plain,
+                        const PeerAddr &src) {
     BlockHeader hdr;
     uint64_t send_time = 0;
     const uint8_t *payload = nullptr;
@@ -300,6 +301,14 @@ void handle_data_locked(fuse_conn *c, const uint8_t *dg, size_t dlen, uint8_t *p
         body = plain;
         body_len = static_cast<uint16_t>(hdr.payload_len - kAeadTagLen);
     }
+
+    // This block just proved itself (AEAD-authenticated when encrypted;
+    // structurally valid for our stream_id otherwise) — trust its source
+    // for replies even if it differs from c->peer. That's what lets a
+    // connection survive the peer's NAT mapping changing mid-session (an
+    // ISP-forced reconnect, a mobile handover) instead of going silent
+    // until fuse_recv/fuse_send time out.
+    c->peer = src;
 
     // A retransmission arriving after we NACKed measures one RTT on our own
     // clock, with no cross-host clock comparison.
@@ -339,12 +348,13 @@ void handle_data_locked(fuse_conn *c, const uint8_t *dg, size_t dlen, uint8_t *p
 void pump_main(fuse_conn *c) {
     std::vector<uint8_t> rxbuf(kRxBatch * (kMaxDatagramSize + 64));
     std::vector<size_t> lens(kRxBatch);
+    std::vector<PeerAddr> srcs(kRxBatch);
     std::vector<uint8_t> scratch(kMaxDatagramSize + 64);
     std::vector<uint8_t> plain(kMaxPayloadSize + kAeadTagLen);
     const size_t slot = kMaxDatagramSize + 64;
 
     while (!c->stop.load(std::memory_order_relaxed)) {
-        const int got = c->sock.recv_batch(rxbuf.data(), slot, kRxBatch, lens.data(), nullptr);
+        const int got = c->sock.recv_batch(rxbuf.data(), slot, kRxBatch, lens.data(), srcs.data());
 
         std::unique_lock<std::mutex> lk(c->mu);
         for (int i = 0; i < got; ++i) {
@@ -354,11 +364,18 @@ void pump_main(fuse_conn *c) {
 
             switch (type) {
                 case MsgType::Data:
-                    handle_data_locked(c, dg, lens[i], plain.data());
+                    handle_data_locked(c, dg, lens[i], plain.data(), srcs[i]);
                     break;
                 case MsgType::Ack: {
                     Ack ack;
                     if (!decode_ack(dg, lens[i], &ack)) break;
+                    // This connection owns a dedicated ephemeral socket (one
+                    // per fuse_accept/fuse_connect), so anything arriving on
+                    // it already belongs to this session — safe to re-anchor
+                    // replies here the same way handle_data_locked does for
+                    // Data, so a NAT remap on the sender's end doesn't strand
+                    // acknowledgements at a dead mapping.
+                    c->peer = srcs[i];
                     if (ack.base_seq_no > c->tx_base) {
                         for (uint64_t s = c->tx_base; s < ack.base_seq_no; ++s) c->reg.confirm(s);
                         c->tx_base = ack.base_seq_no;
@@ -374,6 +391,7 @@ void pump_main(fuse_conn *c) {
                 case MsgType::Nack: {
                     Nack nack;
                     if (!decode_nack(dg, lens[i], &nack)) break;
+                    c->peer = srcs[i];
                     c->cc.on_loss();
                     for (uint16_t k = 0; k < nack.count; ++k) {
                         retransmit_locked(c, nack.missing[k], scratch.data(), scratch.size());
@@ -446,7 +464,7 @@ bool send_block_locked(fuse_conn *c, uint64_t seq, uint64_t offset, const uint8_
     hdr.payload_len = len;
     hdr.offset = offset;
 
-    c->reg.store(seq, data, len, now_ns());
+    c->reg.store(seq, data, len, now_ns(), offset);
     c->tx_meta[seq % kWindow] = TxMeta{offset, hdr.flags};
 
     const uint8_t *body = data;

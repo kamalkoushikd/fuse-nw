@@ -51,6 +51,7 @@ public:
 
 private:
     void deliver(uint64_t seq_no, const uint8_t *payload, uint16_t len);
+    void write_sink(uint64_t seq_no, const uint8_t *payload, uint16_t len);
 
     bool ordered_;
     uint16_t block_size_;
@@ -61,13 +62,15 @@ private:
     std::vector<uint64_t> delivery_order_;
 
     // Ordered-mode reorder buffer: a fixed ring keyed by seq_no, bounded by
-    // the window, so it needs no per-block allocation.
+    // the window, so it needs no per-block allocation. An out-of-order
+    // block's payload is written straight to the sink the instant it
+    // arrives (its offset is already known), so the slot is only a
+    // presence flag for the later in-order drain — it holds no payload.
     uint64_t next_expected_ = 0;
     struct Slot {
         uint64_t seq_no = 0;
         uint16_t len = 0;
         bool valid = false;
-        std::array<uint8_t, kMaxPayloadSize> payload{};
     };
     std::array<Slot, kMaxWindow> buffer_{};
 };

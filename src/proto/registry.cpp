@@ -12,16 +12,18 @@ SenderRegistry::SenderRegistry(uint16_t stream_id, uint8_t window_size)
         window_size = kMaxWindow;
     }
     window_size_ = window_size;
+    slots_.resize(window_size_);
 }
 
 bool SenderRegistry::store(uint64_t seq_no, const uint8_t *payload,
-                           uint16_t payload_len, uint64_t send_time_ns) {
+                           uint16_t payload_len, uint64_t send_time_ns, uint64_t offset) {
     if (payload_len > kMaxPayloadSize) {
         return false;
     }
     RegistrySlot &slot = slots_[index_of(seq_no)];
     slot.seq_no = seq_no;
     slot.send_time_ns = send_time_ns;
+    slot.offset = offset;
     slot.payload_len = payload_len;
     slot.valid = true;
     if (payload_len > 0 && payload != nullptr) {

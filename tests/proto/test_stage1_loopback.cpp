@@ -93,7 +93,7 @@ TEST(Stage1Loopback, DropNackRetransmitRoundTrip) {
     // registry regardless (as if they were sent).
     for (uint64_t seq = 0; seq < kTotal; ++seq) {
         make_payload(seq, payload, kLen);
-        ASSERT_TRUE(registry.store(seq, payload, kLen, /*send_time_ns=*/seq));
+        ASSERT_TRUE(registry.store(seq, payload, kLen, /*send_time_ns=*/seq, /*offset=*/seq * kLen));
 
         if (seq == kDrop) {
             continue; // simulate this datagram being lost in flight
@@ -239,7 +239,7 @@ TEST(Stage1Loopback, NoHeapAllocationInSteadyState) {
         hdr.seq_no = seq;
         hdr.flags = 0;
         hdr.payload_len = kLen;
-        registry->store(seq, payload, kLen, seq);
+        registry->store(seq, payload, kLen, seq, seq * kLen);
 
         size_t n = encode_data_datagram(hdr, seq, payload, datagram, sizeof(datagram));
         ok = ok && (n > 0) && tx_sock.send_to(datagram, n, rx_addr);

@@ -171,7 +171,7 @@ bool UdpSocket::send_segmented(const uint8_t *buf, size_t len, uint16_t segment_
 }
 
 int UdpSocket::recv_batch(uint8_t *buf, size_t slot_size, size_t max_msgs, size_t *lens,
-                          PeerAddr *first_src) {
+                          PeerAddr *srcs) {
     if (fd_ < 0 || max_msgs == 0 || slot_size == 0) {
         return -1;
     }
@@ -205,10 +205,10 @@ int UdpSocket::recv_batch(uint8_t *buf, size_t slot_size, size_t max_msgs, size_
     }
     for (int i = 0; i < got; ++i) {
         lens[i] = msgs[i].msg_len;
-    }
-    if (first_src != nullptr && got > 0) {
-        first_src->addr = addrs[0];
-        first_src->len = msgs[0].msg_hdr.msg_namelen;
+        if (srcs != nullptr) {
+            srcs[i].addr = addrs[i];
+            srcs[i].len = msgs[i].msg_hdr.msg_namelen;
+        }
     }
     return got;
 }

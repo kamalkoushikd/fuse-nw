@@ -84,7 +84,7 @@ TEST(Receiver, AckReflectsBaseBitmaskAndEchoedSendTime) {
     Ack ack = rx.build_ack();
     EXPECT_EQ(ack.stream_id, 1);
     EXPECT_EQ(ack.base_seq_no, 1u);
-    EXPECT_EQ(ack.received_bitmask, 0b10u); // seq 2 = rel 1 set, seq 1 = rel 0 missing
+    EXPECT_EQ(ack.received_bitmask[0], 0b10u); // seq 2 = rel 1 set, seq 1 = rel 0 missing
     EXPECT_EQ(ack.echoed_send_time, 700u);  // most recent (highest) block
 }
 

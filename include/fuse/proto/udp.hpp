@@ -81,10 +81,14 @@ public:
 
     // Receives up to `max_msgs` datagrams in one syscall. `buf` must hold
     // max_msgs * slot_size bytes; datagram i lands at buf + i*slot_size with
-    // its length in lens[i]. Returns the number received, 0 if none are
-    // pending, or -1 on error.
+    // its length in lens[i]. If `srcs` is non-null it must have room for
+    // max_msgs entries; srcs[i] gets datagram i's source address — every
+    // datagram, not just the batch's first, since a mid-batch source change
+    // (e.g. the peer's NAT mapping just rotated) is exactly what a caller
+    // doing address-migration tracking needs to see. Returns the number
+    // received, 0 if none are pending, or -1 on error.
     int recv_batch(uint8_t *buf, size_t slot_size, size_t max_msgs, size_t *lens,
-                   PeerAddr *first_src);
+                   PeerAddr *srcs);
 
 private:
     int fd_ = -1;

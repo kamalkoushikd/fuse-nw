@@ -6,8 +6,13 @@
 // None of these carry payload bytes; they only carry control signals.
 //
 //   Heartbeat : [outer][stream_id:2][highest_seq_no:8]
-//   Ack       : [outer][stream_id:2][base_seq_no:8][received_bitmask:8][echoed_send_time:8]
+//   Ack       : [outer][stream_id:2][base_seq_no:8][received_bitmask:8*kMaskWords][echoed_send_time:8][nonce:8]
 //   Nack      : [outer][stream_id:2][count:2][missing_seq_no:8]*count
+//
+// StreamStart's nonce and Ack's echoed nonce (v3) exist purely for handshake
+// anti-replay: a stale ACK left over from a prior session/lane carries a
+// different (or absent) nonce, so it can't be mistaken for confirmation of
+// this StreamStart.
 //
 // The ACK's echoed_send_time is the send_time_ns of the most recent DATA
 // block the receiver has accepted, copied straight back so the sender can
@@ -38,13 +43,19 @@ struct StreamStart {
     // the whole session shares one key, and lanes are separated by nonce, not
     // by key. All-zero means the session is unencrypted.
     uint8_t  session_salt[16] = {};
+    // Handshake anti-replay nonce (v3). Chosen fresh per lane per attempt by
+    // the sender; the receiver must echo it back in every Ack it sends for
+    // this stream, so a stale Ack from an earlier session can't satisfy the
+    // sender's "did the receiver get StreamStart" check.
+    uint64_t nonce = 0;
 };
 
 struct Ack {
     uint16_t stream_id        = 0;
     uint64_t base_seq_no      = 0;
-    uint64_t received_bitmask = 0;
+    uint64_t received_bitmask[kMaskWords] = {};
     uint64_t echoed_send_time = 0;
+    uint64_t nonce            = 0; // echoes the StreamStart nonce (v3)
 };
 
 // A NACK names up to kMaxWindow missing sequence numbers for one stream —

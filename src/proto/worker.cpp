@@ -77,7 +77,8 @@ void Worker::run(uint32_t blocks_per_stream) {
             for (uint16_t b = 0; b < s.block_size; ++b) {
                 payload[b] = static_cast<uint8_t>(s.stream_id ^ i ^ b);
             }
-            s.registry->store(i, payload, s.block_size, now_ns());
+            s.registry->store(i, payload, s.block_size, now_ns(),
+                              static_cast<uint64_t>(i) * s.block_size);
             sent_.fetch_add(1, std::memory_order_relaxed);
         }
     }

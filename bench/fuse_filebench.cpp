@@ -148,13 +148,13 @@ void recv_lane(uint16_t port, uint16_t lane, std::vector<uint8_t> *shard, LaneSt
     LaneCipher cipher;
     std::vector<uint8_t> opened(kMaxPayloadSize + kAeadTagLen);
 
+    std::vector<PeerAddr> srcs(kRxBatch);
     for (;;) {
-        PeerAddr src;
-        int got = sock.recv_batch(rx_buf.data(), slot, kRxBatch, lens.data(), &src);
+        int got = sock.recv_batch(rx_buf.data(), slot, kRxBatch, lens.data(), srcs.data());
 
         if (got > 0) {
             idle = 0;
-            peer = src;
+            peer = srcs[got - 1]; // most recent datagram's source
             have_peer = true;
             if (stats->start_ns.load() == 0) {
                 stats->start_ns.store(now_ns()); // first datagram on this lane
@@ -401,7 +401,7 @@ void send_lane(const std::string &host, uint16_t port, uint16_t lane, const uint
                 hdr.payload_len = len;
                 hdr.offset = next_offset;
 
-                reg.store(next_seq, data + next_offset, len, now_ns());
+                reg.store(next_seq, data + next_offset, len, now_ns(), next_offset);
                 if (sent_meta.size() <= next_seq) sent_meta.resize(next_seq + 1);
                 sent_meta[next_seq] = {next_offset, len};
 

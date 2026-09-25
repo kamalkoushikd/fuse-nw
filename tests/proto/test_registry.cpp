@@ -12,7 +12,7 @@ TEST(Registry, StoreAndLookup) {
     uint8_t payload[16];
     for (int i = 0; i < 16; ++i) payload[i] = static_cast<uint8_t>(i + 1);
 
-    ASSERT_TRUE(reg.store(5, payload, 16, /*send_time_ns=*/999));
+    ASSERT_TRUE(reg.store(5, payload, 16, /*send_time_ns=*/999, /*offset=*/0));
 
     const RegistrySlot *slot = reg.lookup(5);
     ASSERT_NE(slot, nullptr);
@@ -26,7 +26,7 @@ TEST(Registry, StoreAndLookup) {
 TEST(Registry, ConfirmInvalidatesSlot) {
     SenderRegistry reg(1, 8);
     uint8_t payload[4] = {1, 2, 3, 4};
-    reg.store(3, payload, 4, 0);
+    reg.store(3, payload, 4, 0, 0);
     ASSERT_NE(reg.lookup(3), nullptr);
 
     reg.confirm(3);
@@ -38,10 +38,10 @@ TEST(Registry, OverwriteByWindowAdvanceLosesOldSeq) {
     SenderRegistry reg(1, 8);
     uint8_t p[2] = {0xAA, 0xBB};
 
-    reg.store(2, p, 2, 0);
+    reg.store(2, p, 2, 0, 0);
     ASSERT_NE(reg.lookup(2), nullptr);
 
-    reg.store(10, p, 2, 0); // overwrites index 2
+    reg.store(10, p, 2, 0, 0); // overwrites index 2
     EXPECT_EQ(reg.lookup(2), nullptr) << "seq 2 should be gone after seq 10 overwrote its slot";
     EXPECT_NE(reg.lookup(10), nullptr);
 }
@@ -52,8 +52,12 @@ TEST(Registry, LookupMissingSeqReturnsNull) {
 }
 
 TEST(Registry, WindowSizeClamped) {
-    SenderRegistry too_big(1, 200);
-    EXPECT_EQ(too_big.window_size(), kMaxWindow);
+    // window_size is a uint8_t, so its max representable value (255) already
+    // equals kMaxWindow — the over-kMaxWindow clamp branch exists for any
+    // future caller with a wider window_size type, but can't be exercised
+    // through this uint8_t parameter today.
+    SenderRegistry at_max(1, 255);
+    EXPECT_EQ(at_max.window_size(), kMaxWindow);
 
     SenderRegistry zero(1, 0);
     EXPECT_EQ(zero.window_size(), 1);
@@ -62,9 +66,9 @@ TEST(Registry, WindowSizeClamped) {
 TEST(Registry, ValidCountTracksLiveSlots) {
     SenderRegistry reg(1, 8);
     uint8_t p[1] = {0};
-    reg.store(0, p, 1, 0);
-    reg.store(1, p, 1, 0);
-    reg.store(2, p, 1, 0);
+    reg.store(0, p, 1, 0, 0);
+    reg.store(1, p, 1, 0, 0);
+    reg.store(2, p, 1, 0, 0);
     EXPECT_EQ(reg.valid_count(), 3);
     reg.confirm(1);
     EXPECT_EQ(reg.valid_count(), 2);

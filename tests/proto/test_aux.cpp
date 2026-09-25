@@ -51,8 +51,9 @@ TEST(Aux, AckRoundTrip) {
     Ack ack;
     ack.stream_id = 3;
     ack.base_seq_no = 1000;
-    ack.received_bitmask = 0b10110;
+    ack.received_bitmask[0] = 0b10110;
     ack.echoed_send_time = 55555;
+    ack.nonce = 0xdeadbeefULL;
 
     uint8_t buf[kMaxAuxDatagramSize];
     size_t len = encode_ack(ack, buf, sizeof(buf));
@@ -62,8 +63,11 @@ TEST(Aux, AckRoundTrip) {
     ASSERT_TRUE(decode_ack(buf, len, &got));
     EXPECT_EQ(got.stream_id, ack.stream_id);
     EXPECT_EQ(got.base_seq_no, ack.base_seq_no);
-    EXPECT_EQ(got.received_bitmask, ack.received_bitmask);
+    for (size_t i = 0; i < kMaskWords; ++i) {
+        EXPECT_EQ(got.received_bitmask[i], ack.received_bitmask[i]);
+    }
     EXPECT_EQ(got.echoed_send_time, ack.echoed_send_time);
+    EXPECT_EQ(got.nonce, ack.nonce);
 }
 
 TEST(Aux, NackRoundTrip) {

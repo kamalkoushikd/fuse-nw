@@ -20,7 +20,12 @@ namespace fuse::proto {
 // receiver must infer a block's position as seq_no * block_size, which
 // silently breaks the moment block size varies within a stream — and
 // adapting block size to link conditions is exactly what the sender does.
-inline constexpr uint8_t  kProtocolVersion = 2;
+//
+// v3 widened the receive window from a single uint64 bitmask (64 blocks) to
+// a multi-word bitmask (kMaskWords words), and added a handshake nonce to
+// StreamStart/Ack so a stale ACK from a prior session can't be mistaken for
+// confirmation of a new one. Both are on-wire size changes, hence the bump.
+inline constexpr uint8_t  kProtocolVersion = 3;
 
 // The default block payload (kDefaultPayloadSize) sits under a typical
 // 1500-byte path MTU once the datagram's own headers are accounted for, so
@@ -34,10 +39,13 @@ inline constexpr uint8_t  kProtocolVersion = 2;
 inline constexpr uint16_t kDefaultPayloadSize = 1200;
 inline constexpr uint16_t kMaxPayloadSize = 16384;
 
-// The received-set is tracked as a single uint64 bitmask, so a stream's
-// window can never exceed 64 in-flight blocks regardless of the
-// application's requested window_size.
-inline constexpr uint8_t  kMaxWindow = 64;
+// The received-set is tracked as a multi-word bitmask (kMaskWords x
+// uint64), so a stream's window can go up to kMaxWindow in-flight blocks.
+// kMaxWindow is capped at 255 because window_size is negotiated as a single
+// wire byte in SETUP (setup.cpp put_u8/get_u8) — raising the cap further
+// needs that field widened too, a separate wire change.
+inline constexpr uint8_t  kMaxWindow = 255;
+inline constexpr size_t   kMaskWords = (static_cast<size_t>(kMaxWindow) + 63) / 64;
 
 enum class MsgType : uint8_t {
     Data           = 0,  // a data-plane block (Stage 1)

@@ -230,13 +230,15 @@ void sender_thread(Lane *lane, const Workload &wl, bool encrypted, const std::st
             hdr.stream_id = kBulkStream;
             hdr.seq_no = bulk_sent;
             hdr.payload_len = wl.bulk_block;
-            bulk_reg.store(bulk_sent, payload.data(), wl.bulk_block, now_ns());
+            bulk_reg.store(bulk_sent, payload.data(), wl.bulk_block, now_ns(),
+                          bulk_sent * wl.bulk_block);
             ++bulk_sent;
         } else {
             hdr.stream_id = kTelemetryStream;
             hdr.seq_no = tele_sent;
             hdr.payload_len = wl.telemetry_block;
-            tele_reg.store(tele_sent, payload.data(), wl.telemetry_block, now_ns());
+            tele_reg.store(tele_sent, payload.data(), wl.telemetry_block, now_ns(),
+                          tele_sent * wl.telemetry_block);
             ++tele_sent;
         }
 
