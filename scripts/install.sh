@@ -179,7 +179,7 @@ say "             target_link_libraries(app PRIVATE fuse::proto)"
 [ -n "$PY_NOTE" ] && say "  $PY_NOTE"
 say ""
 say "  smoke test:"
-say "    $PREFIX/bin/fuse_quickstart_recv 4433 /tmp/out.bin &"
+say "    $PREFIX/bin/fuse_quickstart_recv 0.0.0.0 4433 /tmp/out.bin &"
 say "    $PREFIX/bin/fuse_quickstart_send 127.0.0.1 4433 /etc/hostname"
 say ""
 
