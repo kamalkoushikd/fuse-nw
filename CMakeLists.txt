@@ -40,16 +40,20 @@ option(FUSE_WITH_CRYPTO "Enable the wolfSSL-backed handshake/crypto module" ON)
 option(FUSE_FETCH_WOLFSSL "Fetch and build wolfSSL from source if it isn't found on the system" ON)
 option(FUSE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # This is not "untested elsewhere" — fuse_proto's data plane (udp.cpp)
-    # calls recvmmsg/sendmmsg and sets UDP_SEGMENT directly, all Linux-only
-    # syscalls/socket options with no fallback path. A non-Linux configure
-    # would previously proceed past this warning only to fail with a
-    # confusing missing-symbol compile error deep in udp.cpp; failing here
-    # instead gives the real reason immediately.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(FUSE_PROTO_UDP_SOURCE src/proto/udp_linux.cpp)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    # macOS only — iOS/tvOS/watchOS builds set CMAKE_SYSTEM_NAME to "iOS" etc.
+    # (via their own toolchain file), not "Darwin", so this doesn't opt them
+    # in. udp_darwin.cpp's batching is a plain per-datagram loop today (no
+    # Linux-only recvmmsg/sendmmsg/UDP_SEGMENT equivalent verified for
+    # Darwin yet — see that file's header comment); the rest of fuse_proto
+    # is unchanged and identical on both platforms.
+    set(FUSE_PROTO_UDP_SOURCE src/proto/udp_darwin.cpp)
+else()
     message(FATAL_ERROR
-        "fuse_proto's data plane requires Linux (recvmmsg/sendmmsg/UDP_SEGMENT, "
-        "no fallback exists for other platforms).")
+        "fuse_proto's data plane supports Linux and macOS only "
+        "(got CMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}).")
 endif()
 
 if(FUSE_WITH_CRYPTO)
@@ -121,7 +125,8 @@ add_library(fuse_proto
     src/proto/control.cpp
     src/proto/registry.cpp
     src/proto/receiver.cpp
-    src/proto/udp.cpp
+    src/proto/udp_common.cpp
+    ${FUSE_PROTO_UDP_SOURCE}
     src/proto/setup.cpp
     src/proto/reassembly.cpp
     src/proto/dtls.cpp
