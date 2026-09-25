@@ -32,6 +32,13 @@ elseif(FUSE_FETCH_WOLFSSL)
     set(WOLFSSL_DTLS yes CACHE STRING "" FORCE)
     set(WOLFSSL_PSK yes CACHE STRING "" FORCE)
 
+    # Off by default in wolfSSL's own CMakeLists.txt, which silently drops
+    # its install(TARGETS wolfssl ...) rules — so `cmake --install` on fuse
+    # would link and run fine from the build tree, then fail at run time
+    # anywhere else with a missing libwolfssl.so, since nothing ever copied
+    # it into the install prefix.
+    set(WOLFSSL_INSTALL yes CACHE STRING "" FORCE)
+
     FetchContent_Declare(wolfssl
         GIT_REPOSITORY https://github.com/wolfSSL/wolfssl.git
         GIT_TAG v5.9.2-stable
