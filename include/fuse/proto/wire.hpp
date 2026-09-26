@@ -77,6 +77,11 @@ enum class MsgType : uint8_t {
     Hello          = 8,
     HelloAck       = 9,
     Close          = 10, // graceful teardown so the peer's recv() ends promptly
+    // Bulk-transfer (fuse/transfer.hpp) end-of-lane signal, either side to
+    // the other: "finished" once every byte is acknowledged, or "aborted"
+    // when a side gives up (cancelled, timed out). Without it the peer can
+    // only learn the other end is gone by waiting out its own timeout.
+    StreamClose    = 11,
 };
 
 // Block header flag bits (Stage 1.1).

@@ -70,6 +70,18 @@ struct Nack {
     uint64_t missing[kMaxWindow] = {};
 };
 
+// Ends one bulk-transfer lane. Carries the lane's StreamStart nonce so a
+// stale close from an earlier session on the same port is ignored. Like Ack,
+// it is not authenticated under a PSK — the nonce is the only session check.
+inline constexpr uint8_t kStreamCloseFinished = 0; // sender: every byte acknowledged
+inline constexpr uint8_t kStreamCloseAborted  = 1; // either side: giving up on this lane
+
+struct StreamClose {
+    uint16_t stream_id = 0;
+    uint64_t nonce     = 0;
+    uint8_t  reason    = kStreamCloseFinished;
+};
+
 // Encode helpers return the datagram length written, or 0 if out_cap is
 // too small. Decode helpers return true on success, false on version
 // mismatch, wrong msg_type, or truncation.
@@ -85,6 +97,9 @@ bool   decode_ack(const uint8_t *in, size_t in_len, Ack *ack);
 
 size_t encode_nack(const Nack &nack, uint8_t *out, size_t out_cap);
 bool   decode_nack(const uint8_t *in, size_t in_len, Nack *nack);
+
+size_t encode_stream_close(const StreamClose &sc, uint8_t *out, size_t out_cap);
+bool   decode_stream_close(const uint8_t *in, size_t in_len, StreamClose *sc);
 
 // Largest aux datagram: a full-window NACK. Used to size receive buffers.
 inline constexpr size_t kMaxAuxDatagramSize =
