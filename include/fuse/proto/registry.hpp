@@ -30,6 +30,9 @@ struct RegistrySlot {
     // block sent before an adaptation.
     uint64_t offset       = 0;
     uint16_t payload_len  = 0;
+    // The block's original flags (e.g. kFlagLastBlock), so a retransmit can
+    // OR in kFlagRetransmission without losing them — see store()'s comment.
+    uint8_t  flags        = 0;
     bool     valid        = false;
     uint8_t  payload[kMaxPayloadSize] = {};
 };
@@ -48,8 +51,16 @@ public:
     // maps to, and marks the slot valid. Returns false if payload_len
     // exceeds kMaxPayloadSize. Caller sends the datagram separately (the
     // registry is storage, not I/O).
+    //
+    // `flags` is the block's original wire flags (e.g. kFlagLastBlock),
+    // defaulting to 0 for callers (tests, the raw-block benchmark) that
+    // never mark anything special. A caller that resends a stored slot on
+    // retransmit should OR flags with kFlagRetransmission rather than
+    // replace it outright — a retransmitted last block is still the last
+    // block, and the receiver has no other way to learn that a stream
+    // finished (see transfer.cpp/mux_transfer.cpp's retransmit paths).
     bool store(uint64_t seq_no, const uint8_t *payload, uint16_t payload_len,
-               uint64_t send_time_ns, uint64_t offset);
+               uint64_t send_time_ns, uint64_t offset, uint8_t flags = 0);
 
     // Looks up a slot for retransmission. Returns a pointer to the slot
     // iff it is valid and still holds exactly this seq_no (i.e. has not

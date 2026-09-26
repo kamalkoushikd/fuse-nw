@@ -15,8 +15,8 @@ SenderRegistry::SenderRegistry(uint16_t stream_id, uint16_t window_size)
     slots_.resize(window_size_);
 }
 
-bool SenderRegistry::store(uint64_t seq_no, const uint8_t *payload,
-                           uint16_t payload_len, uint64_t send_time_ns, uint64_t offset) {
+bool SenderRegistry::store(uint64_t seq_no, const uint8_t *payload, uint16_t payload_len,
+                           uint64_t send_time_ns, uint64_t offset, uint8_t flags) {
     if (payload_len > kMaxPayloadSize) {
         return false;
     }
@@ -25,6 +25,7 @@ bool SenderRegistry::store(uint64_t seq_no, const uint8_t *payload,
     slot.send_time_ns = send_time_ns;
     slot.offset = offset;
     slot.payload_len = payload_len;
+    slot.flags = flags;
     slot.valid = true;
     if (payload_len > 0 && payload != nullptr) {
         std::memcpy(slot.payload, payload, payload_len);
