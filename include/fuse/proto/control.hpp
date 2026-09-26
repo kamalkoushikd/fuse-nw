@@ -52,6 +52,14 @@ struct StreamStart {
     // this stream, so a stale Ack from an earlier session can't satisfy the
     // sender's "did the receiver get StreamStart" check.
     uint64_t nonce = 0;
+    // v6: where this stream sits in the whole transfer, so a receiver can
+    // write each block straight to its final place in the output (a file,
+    // written as blocks arrive) instead of buffering the stream and
+    // concatenating streams at the end. Unauthenticated like the rest of
+    // StreamStart: a receiver must check total_bytes <= file_total_bytes and
+    // stream_base_offset <= file_total_bytes - total_bytes before using them.
+    uint64_t stream_base_offset = 0;
+    uint64_t file_total_bytes   = 0;
 };
 
 struct Ack {

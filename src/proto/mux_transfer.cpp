@@ -70,9 +70,10 @@ int severity(TransferStatus s) {
         case TransferStatus::Cancelled: return 4;
         case TransferStatus::AuthFailed: return 5;
         case TransferStatus::ResourceLimit: return 6;
-        case TransferStatus::SocketError: return 7;
-        case TransferStatus::ConfigError: return 8;
-        case TransferStatus::Unsupported: return 8;
+        case TransferStatus::IoError: return 7;
+        case TransferStatus::SocketError: return 8;
+        case TransferStatus::ConfigError: return 9;
+        case TransferStatus::Unsupported: return 9;
     }
     return 0;
 }

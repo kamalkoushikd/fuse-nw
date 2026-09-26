@@ -1,13 +1,19 @@
 #include "fuse/transfer.hpp"
 
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/uio.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cstring>
 #include <fstream>
+#include <limits>
+#include <memory>
 #include <new>
 #include <random>
 #include <stdexcept>
@@ -19,6 +25,7 @@
 #include "fuse/proto/receiver.hpp"
 #include "fuse/proto/registry.hpp"
 #include "fuse/proto/session_crypto.hpp"
+#include "fuse/proto/spsc_ring.hpp"
 #include "fuse/proto/udp.hpp"
 
 namespace fuse {
@@ -122,33 +129,414 @@ struct Keys {
     uint8_t salt[kSessionSaltLen] = {};
 };
 
-// --- Receiver lane -------------------------------------------------------
+// --- Receive pipeline ----------------------------------------------------
+//
+// Per lane, one *reader* thread owns the socket and the lane's window
+// (ReceiverStream). It receives datagrams, drops blocks it already has, and
+// hands each new data block to a consumer thread through a lock-free
+// single-producer/single-consumer ring (fuse/proto/spsc_ring.hpp). The
+// consumer authenticates/decrypts the block and writes it straight to its
+// final place in the output (a Sink) — no per-lane buffer to stitch
+// together later, and no waiting for earlier gaps to be retransmitted
+// before later blocks reach the disk. The result comes back to the reader
+// on a second ring, and only then does the reader admit the block to its
+// window — so the window, and therefore every ACK the sender sees, only
+// ever covers bytes that are authentic and already written.
+//
+//   reader(lane i) ── ring[i][k] ──► writer k   ── done[i][k] ──► reader(lane i)
+//                  ── rtx_ring[i] ─► rtx thread ── rtx_done[i] ─► reader(lane i)
+//
+// A new block goes to writer ((seq / kRouteRun) % K) — whole runs of
+// consecutive blocks to the same writer, so it can write each run with one
+// pwritev — and one sequence number never reaches two writers;
+// retransmissions go to the dedicated retransmission thread. Every ring has exactly one producer and one consumer, so the
+// whole pipeline needs no mutex: only acquire/release on the ring counters.
+// A full ring never blocks the reader — it drops the datagram and the
+// normal NACK/RTO recovery resends it.
+
+// Where received bytes end up. write() may be called concurrently from
+// several consumer threads, always for disjoint byte ranges.
+class Sink {
+public:
+    virtual ~Sink() = default;
+    // Called once, before any write, with the transfer's total size.
+    virtual bool prepare(uint64_t total_bytes) = 0;
+    // Writes the iovecs back to back starting at `offset`. May modify iov.
+    virtual bool write(uint64_t offset, iovec *iov, int iovcnt, size_t bytes) = 0;
+    // Called once at the end; `ok` says whether the transfer succeeded.
+    // Returns false only if a successful transfer could not be committed.
+    virtual bool finish(bool ok) = 0;
+};
+
+// receive_buffer: straight into the caller's vector.
+class MemorySink final : public Sink {
+public:
+    explicit MemorySink(std::vector<uint8_t> *out) : out_(out) { out_->clear(); }
+
+    bool prepare(uint64_t total_bytes) override {
+        // total_bytes is the sender's unauthenticated claim: a hostile value
+        // must fail this transfer, not throw out of a lane thread.
+        try {
+            out_->assign(total_bytes, 0);
+        } catch (const std::bad_alloc &) {
+            return false;
+        } catch (const std::length_error &) {
+            return false;
+        }
+        return true;
+    }
+
+    bool write(uint64_t offset, iovec *iov, int iovcnt, size_t) override {
+        uint8_t *p = out_->data() + offset;
+        for (int i = 0; i < iovcnt; ++i) {
+            std::memcpy(p, iov[i].iov_base, iov[i].iov_len);
+            p += iov[i].iov_len;
+        }
+        return true;
+    }
+
+    bool finish(bool ok) override {
+        if (!ok) out_->clear(); // only a complete transfer populates *out
+        return true;
+    }
+
+private:
+    std::vector<uint8_t> *out_;
+};
+
+// receive_file: blocks go to "<path>.part" as they arrive; the finished file
+// is synced and then renamed over <path>, so <path> is only ever either
+// untouched or complete. A failed transfer removes the .part file.
+class FileSink final : public Sink {
+public:
+    explicit FileSink(std::string path) : path_(std::move(path)), part_(path_ + ".part") {}
+
+    ~FileSink() override {
+        if (fd_ >= 0) { // finish() never ran: don't leave a partial file behind
+            ::close(fd_);
+            ::unlink(part_.c_str());
+        }
+    }
+
+    bool open() {
+        fd_ = ::open(part_.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        return fd_ >= 0;
+    }
+
+    bool prepare(uint64_t total_bytes) override {
+        if (total_bytes > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) return false;
+        // Sets the final size up front (sparse, so it costs no disk yet);
+        // blocks then land at their own offsets in any order.
+        return ::ftruncate(fd_, static_cast<off_t>(total_bytes)) == 0;
+    }
+
+    bool write(uint64_t offset, iovec *iov, int iovcnt, size_t bytes) override {
+        while (bytes > 0) {
+            const ssize_t n = ::pwritev(fd_, iov, iovcnt, static_cast<off_t>(offset));
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return false;
+            }
+            if (n == 0) return false;
+            // A short write: skip what was written and retry the rest.
+            size_t left = static_cast<size_t>(n);
+            offset += left;
+            bytes -= left;
+            while (iovcnt > 0 && left >= iov->iov_len) {
+                left -= iov->iov_len;
+                ++iov;
+                --iovcnt;
+            }
+            if (iovcnt > 0 && left > 0) {
+                iov->iov_base = static_cast<uint8_t *>(iov->iov_base) + left;
+                iov->iov_len -= left;
+            }
+        }
+        return true;
+    }
+
+    bool finish(bool ok) override {
+        if (fd_ < 0) return !ok;
+        // Sync before the rename, or a crash could leave <path> renamed but
+        // missing data that was still only in the page cache.
+        const bool synced = ok && ::fdatasync(fd_) == 0;
+        const bool closed = ::close(fd_) == 0;
+        fd_ = -1;
+        if (ok && synced && closed && ::rename(part_.c_str(), path_.c_str()) == 0) return true;
+        ::unlink(part_.c_str());
+        return !ok;
+    }
+
+private:
+    std::string path_, part_;
+    int fd_ = -1;
+};
+
+// One data block on its way from a reader to a consumer.
+struct PacketSlot {
+    PeerAddr src;           // where it came from (the reader re-anchors to it once accepted)
+    uint64_t lane_base = 0; // where this lane starts in the output
+    uint64_t lane_total = 0;
+    uint32_t len = 0;
+    uint8_t dg[kMaxDatagramSize]; // the raw datagram (deliberately uninitialised)
+};
+
+enum class WriteResult : uint8_t { Written, AuthFailed, IoFailed };
+
+// A consumer's verdict on one block, on its way back to the reader.
+struct Completion {
+    PeerAddr src;
+    uint64_t seq = 0;
+    uint64_t send_time = 0;
+    uint32_t bytes = 0; // plaintext bytes written (0 for an empty or out-of-range block)
+    uint8_t flags = 0;
+    WriteResult result = WriteResult::Written;
+};
+
+using PacketRing = SpscRing<PacketSlot>;
+using DoneRing = SpscRing<Completion>;
+
+// Written once by a lane's reader (before it dispatches that lane's first
+// block), read by consumers. The ring's release/acquire already orders the
+// key before any block that needs it; `ready` just makes that explicit.
+struct LaneKey {
+    uint8_t key[kSessionKeyLen] = {};
+    std::atomic<bool> ready{false};
+};
+
+struct RxPipeline {
+    RxPipeline(uint16_t lane_count, uint16_t writer_count, uint32_t slots, Sink *out)
+        : lanes(lane_count), writers(writer_count), sink(out), keys(new LaneKey[lane_count]) {
+        const size_t rtx_slots = std::max<uint32_t>(16, slots / 4); // retransmits are rare
+        for (size_t i = 0; i < static_cast<size_t>(lanes) * writers; ++i) {
+            rings.push_back(std::make_unique<PacketRing>(slots));
+            dones.push_back(std::make_unique<DoneRing>(slots));
+        }
+        for (uint16_t i = 0; i < lanes; ++i) {
+            rtx_rings.push_back(std::make_unique<PacketRing>(rtx_slots));
+            rtx_dones.push_back(std::make_unique<DoneRing>(rtx_slots));
+        }
+    }
+
+    PacketRing &ring(uint16_t lane, uint16_t k) { return *rings[lane * writers + k]; }
+    DoneRing &done(uint16_t lane, uint16_t k) { return *dones[lane * writers + k]; }
+
+    const uint16_t lanes;
+    const uint16_t writers;
+    Sink *const sink;
+    std::vector<std::unique_ptr<PacketRing>> rings, rtx_rings;
+    std::vector<std::unique_ptr<DoneRing>> dones, rtx_dones;
+    std::unique_ptr<LaneKey[]> keys;
+
+    // The transfer's total size, claimed by the first valid StreamStart
+    // (UINT64_MAX until then). Every other lane must agree with it. Also
+    // what the receiver reports as its progress total.
+    std::atomic<uint64_t> file_total{UINT64_MAX};
+    // Set by whichever lane won file_total, after sink->prepare().
+    static constexpr int kSinkPending = 0, kSinkReady = 1, kSinkFailed = 2;
+    std::atomic<int> sink_state{kSinkPending};
+    std::atomic<bool> io_failed{false};
+    // Set once every reader has exited: consumers stop (anything still
+    // queued is by then only duplicates nobody is waiting for).
+    std::atomic<bool> stop{false};
+};
+
+// One consumer input: a lane's ring into this consumer and the ring back.
+struct Channel {
+    uint16_t lane;
+    PacketRing *in;
+    DoneRing *out;
+};
+
+constexpr size_t kWriteBatch = 64;
+// New blocks are routed to writers in runs of this many consecutive
+// sequence numbers, not round-robin: consecutive blocks of a lane are
+// consecutive in the output, so a writer that gets a whole run can write it
+// with one large pwritev. Round-robin (seq % K) made every writer's blocks
+// non-adjacent, so each block became its own small write — measured 2-4x
+// slower on a real disk, and far worse as K grew.
+constexpr uint64_t kRouteRun = kWriteBatch;
+
+// Per-consumer scratch, reused for every batch.
+struct ConsumerState {
+    explicit ConsumerState(uint16_t lanes) : ciphers(lanes), plain(kWriteBatch * kMaxPayloadSize) {}
+    std::vector<std::unique_ptr<LaneCipher>> ciphers; // this thread's own, per lane
+    std::vector<uint8_t> plain;                       // decrypted blocks of one batch
+    iovec iov[kWriteBatch];
+};
+
+// This thread's cipher for `lane`, created on first use (LaneCipher is
+// thread-confined, so each consumer keeps its own). nullptr if the lane's
+// key isn't available.
+LaneCipher *cipher_for(RxPipeline &p, ConsumerState &cs, uint16_t lane) {
+    if (!cs.ciphers[lane]) {
+        if (!p.keys[lane].ready.load(std::memory_order_acquire)) return nullptr;
+        auto c = std::make_unique<LaneCipher>();
+        if (!c->init(p.keys[lane].key)) return nullptr;
+        cs.ciphers[lane] = std::move(c);
+    }
+    return cs.ciphers[lane].get();
+}
+
+// Processes up to one batch from a channel: authenticate/decrypt each block,
+// write runs of contiguous blocks with one call each, then report every
+// block's outcome back to the reader. Returns false if there was nothing to do.
+bool drain_channel(RxPipeline &p, ConsumerState &cs, Channel &ch, bool want_crypto) {
+    // Never take more blocks than there is room to report on.
+    const size_t n = std::min({ch.in->readable(), ch.out->writable(), kWriteBatch});
+    if (n == 0) return false;
+
+    struct Item {
+        uint64_t off;
+        const uint8_t *data;
+        uint32_t len;
+    } items[kWriteBatch];
+
+    for (size_t i = 0; i < n; ++i) {
+        const PacketSlot &s = ch.in->slot_for_read(i);
+        Completion &c = ch.out->slot_for_write(i);
+        c.src = s.src;
+        c.bytes = 0;
+        c.result = WriteResult::Written;
+        items[i].len = 0;
+
+        BlockHeader hdr;
+        uint64_t send_time = 0;
+        const uint8_t *payload = nullptr;
+        if (!decode_data_datagram(s.dg, s.len, &hdr, &send_time, &payload)) {
+            c.result = WriteResult::AuthFailed; // the reader already checked; defensive only
+            continue;
+        }
+        c.seq = hdr.seq_no;
+        c.send_time = send_time;
+        c.flags = hdr.flags;
+
+        const uint8_t *body = payload;
+        uint32_t body_len = hdr.payload_len;
+        if (want_crypto) {
+            // `flags` rides in the AAD (not just lane/seq/offset) so
+            // LastBlock can't be flipped on an otherwise-authentic block to
+            // end the lane early.
+            LaneCipher *cipher = cipher_for(p, cs, ch.lane);
+            uint8_t aad[19];
+            const size_t al = build_aad(aad, ch.lane, hdr.seq_no, hdr.offset, hdr.flags);
+            uint8_t *out = cs.plain.data() + i * kMaxPayloadSize;
+            if (cipher == nullptr || payload == nullptr || hdr.payload_len < kAeadTagLen ||
+                !cipher->open(ch.lane, hdr.seq_no, aad, al, payload, hdr.payload_len, out)) {
+                c.result = WriteResult::AuthFailed;
+                continue;
+            }
+            body = out;
+            body_len = hdr.payload_len - kAeadTagLen;
+        }
+
+        // Checked this way round so `hdr.offset + body_len` (wire fields,
+        // attacker-controlled) is never computed: an offset near UINT64_MAX
+        // would wrap that sum small enough to pass a naive bounds check.
+        // An out-of-range block is still reported as received (it keeps
+        // the window moving, as before), it just isn't written.
+        if (body != nullptr && body_len > 0 && hdr.offset <= s.lane_total &&
+            body_len <= s.lane_total - hdr.offset) {
+            items[i] = {s.lane_base + hdr.offset, body, body_len};
+            c.bytes = body_len;
+        }
+    }
+
+    // Coalesce blocks that are contiguous in the output into one write.
+    for (size_t i = 0; i < n;) {
+        if (items[i].len == 0) {
+            ++i;
+            continue;
+        }
+        size_t j = i;
+        uint64_t end = items[i].off;
+        size_t bytes = 0;
+        int cnt = 0;
+        while (j < n && items[j].len != 0 && items[j].off == end) {
+            cs.iov[cnt].iov_base = const_cast<uint8_t *>(items[j].data);
+            cs.iov[cnt].iov_len = items[j].len;
+            end += items[j].len;
+            bytes += items[j].len;
+            ++cnt;
+            ++j;
+        }
+        if (!p.sink->write(items[i].off, cs.iov, cnt, bytes)) {
+            p.io_failed.store(true, std::memory_order_release);
+            for (size_t k = i; k < j; ++k) {
+                Completion &c = ch.out->slot_for_write(k);
+                c.result = WriteResult::IoFailed;
+                c.bytes = 0;
+            }
+        }
+        i = j;
+    }
+
+    ch.out->commit(n);  // outcomes to the reader...
+    ch.in->consume(n);  // ...and the slots back to it
+    return true;
+}
+
+// A consumer thread: writer k serves channel k of every lane; the
+// retransmission thread serves every lane's retransmission channel.
+void consumer_main(RxPipeline *p, std::vector<Channel> channels, bool want_crypto) {
+    ConsumerState cs(p->lanes);
+    unsigned idle = 0;
+    while (!p->stop.load(std::memory_order_acquire)) {
+        bool did = false;
+        for (Channel &ch : channels) did |= drain_channel(*p, cs, ch, want_crypto);
+        if (did) {
+            idle = 0;
+        } else if (++idle < 64) {
+            std::this_thread::yield();
+        } else {
+            // Nothing to do for a while (between transfers' bursts, or at
+            // the tail): back off to a short nap instead of spinning a core.
+            timespec nap{0, 50000};
+            nanosleep(&nap, nullptr);
+        }
+    }
+}
+
+// --- Receiver lane (the reader) ------------------------------------------
 
 // `stop_all` is shared by every lane of one call: a lane that is cancelled or
 // told the peer aborted sets it, and its siblings then stop too — so one
 // lane whose abort datagrams were all lost doesn't sit out its full timeout.
-void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
-               std::vector<uint8_t> *shard, LaneResult *res, std::atomic<bool> *stop_all) {
+void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResult *res,
+               std::atomic<bool> *stop_all) {
     UdpSocket sock;
     if (!sock.open(cfg.bind_address.c_str(), static_cast<uint16_t>(cfg.base_port + lane))) {
         res->status.store(static_cast<int>(TransferStatus::SocketError));
         return;
     }
     set_bufs(sock.fd(), 32 << 20);
-    set_timeout_us(sock.fd(), 200000);
+    // While blocks are out with consumers the reader must come back quickly
+    // to collect their results (the ACKs the sender is waiting for depend on
+    // them), so the receive timeout is short then and longer when idle.
+    long cur_timeout_us = -1;
+    const auto use_timeout_us = [&](long us) {
+        if (us != cur_timeout_us) {
+            set_timeout_us(sock.fd(), us);
+            cur_timeout_us = us;
+        }
+    };
 
     ReceiverStream rx(lane, kWindow, /*lossless=*/true);
-    LaneCipher cipher; // initialised once the sender's salt arrives
-    const bool want_crypto = !psk.empty();
+    const bool want_crypto = !cfg.pre_shared_key.empty();
 
-    std::vector<uint8_t> opened(kMaxPayloadSize + kAeadTagLen);
     const size_t slot = kMaxDatagramSize + 64;
     std::vector<uint8_t> rx_buf(kRxBatch * slot);
     std::vector<size_t> lens(kRxBatch);
     std::vector<PeerAddr> srcs(kRxBatch);
     std::vector<uint8_t> tx(kMaxAuxDatagramSize + 64);
 
-    uint64_t shard_bytes = 0, final_seq = UINT64_MAX, written = 0;
+    // dispatched[seq % kWindow] == seq while that block is with a consumer,
+    // so a duplicate arriving meanwhile isn't handed out (and written) twice.
+    // Every block in flight is inside the window, so no two collide.
+    std::vector<uint64_t> dispatched(kWindow, UINT64_MAX);
+    uint64_t pending = 0; // blocks handed to consumers, result not yet back
+
+    uint64_t lane_base = 0, shard_bytes = 0, final_seq = UINT64_MAX, written = 0;
     uint64_t delivered = 0, last_ack_blocks = 0, last_ack_ns = 0, auth_failures = 0;
     // The reorder-tolerance and re-NACK intervals must scale with the path
     // RTT, or a WAN path storms duplicate NACKs (a re-NACK every few ms while
@@ -159,42 +547,31 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
     uint64_t rtt_est_ns = 0, nack_sent_ns = 0;
     // Set once every byte has arrived; the loop keeps running (still
     // answering with fresh Acks on its normal cadence below) instead of
-    // exiting immediately. Firing a single burst of Acks and abandoning the
-    // socket right away — the previous behavior — means that if that whole
-    // burst is lost together (a real risk: they went out back-to-back with
-    // no spacing, so they're correlated, not independent draws), the sender
-    // can NEVER get confirmation once this socket is gone, and sits
-    // retransmitting into the void until its own timeout_ms (2 minutes, by
-    // default) gives up. Exit as soon as the peer goes quiet for a couple of
-    // idle ticks after completion (it got an Ack and left — the common case,
-    // adding well under a second) rather than always waiting out the full
-    // grace window; kCloseGraceNs is only the upper bound for the lossy case
-    // where every Ack sent so far may have been missed.
+    // exiting immediately, in case the Acks already sent were all lost and
+    // the sender is still waiting for one. It leaves as soon as the sender's
+    // "finished" close arrives, or the sender goes quiet (it got an Ack and
+    // left without the close reaching us), or after kCloseGraceNs at most.
     uint64_t completed_at_ns = 0;
-    int idle_at_completion = -1;
     constexpr uint64_t kCloseGraceNs = 1'500'000'000ull;
-    constexpr int kQuietIdleTicks = 2; // ~400ms at the 200ms recv timeout below
+    constexpr uint64_t kQuietAfterCompletionNs = 400'000'000ull;
     bool have_start = false, have_peer = false;
     // Set from the sender's StreamClose: "finished" lets a completed lane
     // exit at once instead of lingering; "aborted" ends the lane now.
     bool peer_finished = false, peer_aborted = false;
     uint64_t peer_nonce = 0; // echoed in every Ack once StreamStart arrives
     PeerAddr peer{};
-    int idle = 0;
-    const int max_idle = static_cast<int>(cfg.timeout_ms / 200) + 5;
+    // No datagram at all for this long means the sender is gone.
+    const uint64_t idle_limit_ns = static_cast<uint64_t>(cfg.timeout_ms) * 1000000ull + 1'000'000'000ull;
+    uint64_t last_rx_ns = now_ns();
 
     // An active MITM/corruption attack fails most blocks' auth check rather
     // than merely dropping some — that pattern is distinguishable from
     // ordinary loss (which NACK/retransmit already resolves) and deserves a
     // status the caller can act on differently from "just incomplete" or
-    // "just timed out". Shared between every exit path below (the natural
-    // completion path used to be the only one that checked this, which made
-    // the classification dead code for the common wrong-key case: that
-    // scenario never reaches natural completion — every block fails auth,
-    // so `rx.on_receive` is never called, `base_seq_no` never advances, and
-    // the lane can only ever leave via the idle-timeout branch instead).
-    // Require a minimum sample size so a couple of early failures during
-    // key/salt setup don't misreport a healthy transfer.
+    // "just timed out". Shared between every exit path below, since a
+    // wrong-key transfer never completes and can only leave via a timeout or
+    // an abort. Require a minimum sample size so a couple of early failures
+    // during key/salt setup don't misreport a healthy transfer.
     const auto classify = [&](TransferStatus fallback) {
         const uint64_t auth_sample = delivered + auth_failures;
         if (auth_sample >= 20 && auth_failures * 2 > auth_sample) {
@@ -215,9 +592,52 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
         res->status.store(static_cast<int>(st));
     };
 
+    // Takes a consumer's verdicts on dispatched blocks. Only here — after
+    // the block is authentic and written — does it enter the window.
+    const auto drain_results = [&](DoneRing &d) {
+        const size_t n = d.readable();
+        for (size_t j = 0; j < n; ++j) {
+            const Completion &c = d.slot_for_read(j);
+            --pending;
+            uint64_t &mark = dispatched[c.seq % kWindow];
+            if (mark == c.seq) mark = UINT64_MAX;
+
+            if (c.result == WriteResult::AuthFailed) {
+                ++auth_failures;
+                continue;
+            }
+            if (c.result == WriteResult::IoFailed) continue; // io_failed ends the lane
+
+            // flags is trustworthy now that the block cleared the auth check
+            // (or in plaintext mode, where nothing claims otherwise).
+            if (c.flags & kFlagLastBlock) final_seq = c.seq;
+
+            // `Accepted` means this block is both authentic (if encrypted)
+            // AND new, not a replay of something already delivered. Only
+            // then is its source trusted as where to send ACKs: that is
+            // what lets a transfer survive the sender's NAT mapping changing
+            // mid-flight, while an attacker resending a captured datagram
+            // from their own address still can't redirect the ACKs.
+            if (rx.on_receive(c.seq, c.send_time, now_ns()) == ReceiveResult::Accepted) {
+                peer = c.src;
+                have_peer = true;
+                // A retransmission arriving after we NACK'd measures one RTT
+                // on the receiver's own clock (no cross-host comparison).
+                if ((c.flags & kFlagRetransmission) && nack_sent_ns != 0) {
+                    const uint64_t sample = now_ns() - nack_sent_ns;
+                    rtt_est_ns = (rtt_est_ns == 0) ? sample : (rtt_est_ns * 7 + sample) / 8;
+                    nack_sent_ns = 0;
+                }
+                written += c.bytes;
+                ++delivered;
+            }
+        }
+        if (n) d.consume(n);
+    };
+
     for (;;) {
-        // Polled once per loop; the 200 ms receive timeout bounds how long a
-        // cancel can go unnoticed.
+        // Polled once per loop; the receive timeout (at most 20 ms) bounds
+        // how long a cancel can go unnoticed.
         if (cancel_requested(cfg)) {
             give_up(TransferStatus::Cancelled);
             stop_all->store(true, std::memory_order_release);
@@ -229,12 +649,18 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
             give_up(classify(TransferStatus::PeerAborted));
             return;
         }
+        if (p->io_failed.load(std::memory_order_acquire)) {
+            give_up(TransferStatus::IoError);
+            stop_all->store(true, std::memory_order_release);
+            return;
+        }
 
+        use_timeout_us(pending > 0 ? 200 : 20000);
         const int got = sock.recv_batch(rx_buf.data(), slot, kRxBatch, lens.data(), srcs.data());
         if (got > 0) {
-            idle = 0;
-            if (res->start_ns.load() == 0) res->start_ns.store(now_ns());
-        } else if (++idle > max_idle) {
+            last_rx_ns = now_ns();
+            if (res->start_ns.load() == 0) res->start_ns.store(last_rx_ns);
+        } else if (now_ns() - last_rx_ns > idle_limit_ns) {
             give_up(classify(TransferStatus::Timeout));
             return;
         }
@@ -249,40 +675,53 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
                 StreamStart ss;
                 if (!decode_stream_start(dg, dlen, &ss)) continue;
                 if (!have_start) {
-                    // ss.total_bytes is an unauthenticated wire value at
-                    // this point (the PSK proof, if any, is checked per
-                    // block, not here) — a hostile or corrupt claim near
-                    // UINT64_MAX must not be able to take the whole process
-                    // down via an uncaught allocation failure escaping this
-                    // thread. Try the allocation before committing any
-                    // state, so a rejected StreamStart leaves this lane
-                    // exactly as if it had never arrived.
-                    try {
-                        shard->assign(ss.total_bytes, 0);
-                    } catch (const std::bad_alloc &) {
+                    // Every size here is the sender's unauthenticated claim.
+                    // Ordered so nothing can overflow: the lane must fit
+                    // inside the transfer.
+                    if (ss.total_bytes > ss.file_total_bytes ||
+                        ss.stream_base_offset > ss.file_total_bytes - ss.total_bytes) {
+                        continue;
+                    }
+                    // The first lane to get here sizes the output; every
+                    // other lane must agree on the total.
+                    uint64_t claimed = UINT64_MAX;
+                    if (p->file_total.compare_exchange_strong(claimed, ss.file_total_bytes,
+                                                              std::memory_order_acq_rel)) {
+                        const bool ok = p->sink->prepare(ss.file_total_bytes);
+                        p->sink_state.store(ok ? RxPipeline::kSinkReady : RxPipeline::kSinkFailed,
+                                            std::memory_order_release);
+                    } else if (claimed != ss.file_total_bytes) {
+                        continue; // disagrees with the transfer the other lanes joined
+                    }
+                    const int sink = p->sink_state.load(std::memory_order_acquire);
+                    if (sink == RxPipeline::kSinkFailed) {
+                        // A hostile or corrupt size claim must fail cleanly.
                         res->status.store(static_cast<int>(TransferStatus::ResourceLimit));
                         return;
-                    } catch (const std::length_error &) {
-                        res->status.store(static_cast<int>(TransferStatus::ResourceLimit));
-                        return;
+                    }
+                    // Another lane is still preparing the output: don't Ack
+                    // yet; the sender retries its StreamStart.
+                    if (sink != RxPipeline::kSinkReady) continue;
+
+                    if (want_crypto) {
+                        LaneKey &k = p->keys[lane];
+                        const std::string &psk = cfg.pre_shared_key;
+                        if (!derive_session_key(reinterpret_cast<const uint8_t *>(psk.data()),
+                                                psk.size(), ss.session_salt, kSessionSaltLen,
+                                                k.key)) {
+                            res->status.store(static_cast<int>(TransferStatus::Unsupported));
+                            return;
+                        }
+                        k.ready.store(true, std::memory_order_release);
                     }
                     have_start = true;
                     peer_nonce = ss.nonce;
                     peer = srcs[i];
                     have_peer = true;
+                    lane_base = ss.stream_base_offset;
                     shard_bytes = ss.total_bytes;
                     res->expected.store(shard_bytes, std::memory_order_relaxed);
                     res->started.store(true, std::memory_order_release);
-                    if (want_crypto) {
-                        uint8_t key[kSessionKeyLen];
-                        if (!derive_session_key(reinterpret_cast<const uint8_t *>(psk.data()),
-                                                psk.size(), ss.session_salt, kSessionSaltLen,
-                                                key) ||
-                            !cipher.init(key)) {
-                            res->status.store(static_cast<int>(TransferStatus::Unsupported));
-                            return;
-                        }
-                    }
                 } else if (ss.nonce == peer_nonce) {
                     // A retried StreamStart (our first Ack was lost) carrying
                     // the same nonce we already accepted — safe to treat as
@@ -311,7 +750,7 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
                     // cancelled before its StreamStart reached us (e.g.
                     // Ctrl+C while it was still loading the file) can only
                     // say "I'm not coming". Accepting that is no weaker than
-                    // today's pre-session state, where any first StreamStart
+                    // the pre-session state, where any first StreamStart
                     // already claims the lane.
                     peer_aborted = true;
                 }
@@ -324,79 +763,38 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
             const uint8_t *payload = nullptr;
             if (!decode_data_datagram(dg, dlen, &hdr, &send_time, &payload)) continue;
 
-            const uint8_t *body = payload;
-            uint16_t body_len = hdr.payload_len;
+            // Hand out only blocks we don't have and aren't already
+            // processing. (Nothing here is trusted yet: authentication
+            // happens in the consumer, and the window only moves on its
+            // verdict.)
+            const uint64_t base = rx.base_seq_no();
+            if (hdr.seq_no < base) continue;
+            const uint64_t rel = hdr.seq_no - base;
+            if (rel >= kWindow || rx.is_received(rel)) continue;
+            uint64_t &mark = dispatched[hdr.seq_no % kWindow];
+            if (mark == hdr.seq_no) continue;
 
-            if (want_crypto) {
-                // Authenticate before admitting the block to the window: a
-                // forged block that advanced `base` would slide the window
-                // past data never written. `flags` rides in the AAD (not
-                // just lane/seq/offset) so LastBlock can't be flipped on an
-                // otherwise-authentic block to end the lane early.
-                uint8_t aad[19];
-                const size_t al = build_aad(aad, lane, hdr.seq_no, hdr.offset, hdr.flags);
-                if (payload == nullptr || hdr.payload_len < kAeadTagLen ||
-                    !cipher.open(lane, hdr.seq_no, aad, al, payload, hdr.payload_len,
-                                 opened.data())) {
-                    ++auth_failures;
-                    continue;
-                }
-                body = opened.data();
-                body_len = static_cast<uint16_t>(hdr.payload_len - kAeadTagLen);
-            }
-
-            // flags is only trustworthy once the block has cleared the auth
-            // check above (or in plaintext mode, where nothing claims
-            // otherwise) — setting this any earlier would let a forged
-            // packet end the lane early even under encryption.
-            if (hdr.flags & kFlagLastBlock) final_seq = hdr.seq_no;
-
-            // Re-anchoring and RTT sampling both wait for on_receive's
-            // verdict now: `Accepted` means this block is both authentic
-            // (if encrypted) AND new, not a replay of something already
-            // delivered. That second part matters even for an
-            // authenticated block — AEAD doesn't add freshness against an
-            // exact-replay, so without this an attacker who captures one
-            // genuine datagram and resends it from their own address could
-            // redirect where this lane's Acks go, no key needed.
-            const ReceiveResult rr = rx.on_receive(hdr.seq_no, send_time, now_ns());
-            if (rr == ReceiveResult::Accepted) {
-                // This block just proved itself and is new — safe to trust
-                // its source as where to send ACKs, even if it differs from
-                // the address we've been using. This is what makes an
-                // in-progress transfer survive the sender's NAT mapping
-                // changing mid-flight (an ISP-forced reconnect, a mobile
-                // handover, a CGNAT re-lease): the next new block the
-                // sender emits re-anchors the receiver's reply address,
-                // with no session drop and no explicit handshake.
-                peer = srcs[i];
-                have_peer = true;
-
-                // A retransmission arriving after we NACK'd measures one
-                // RTT on the receiver's own clock (no cross-host clock
-                // comparison).
-                if ((hdr.flags & kFlagRetransmission) && nack_sent_ns != 0) {
-                    const uint64_t sample = now_ns() - nack_sent_ns;
-                    rtt_est_ns = (rtt_est_ns == 0) ? sample : (rtt_est_ns * 7 + sample) / 8;
-                    nack_sent_ns = 0;
-                }
-
-                if (body != nullptr) {
-                    // Checked this way round so `hdr.offset + body_len`
-                    // (wire fields, attacker-controlled) never gets
-                    // computed: with the addition done first, an offset
-                    // near UINT64_MAX wraps the sum small enough to pass a
-                    // naive "<= size()" check, and the memcpy below then
-                    // writes out of bounds at the unwrapped offset.
-                    if (hdr.offset <= shard->size() && body_len <= shard->size() - hdr.offset) {
-                        std::memcpy(shard->data() + hdr.offset, body, body_len);
-                        written += body_len;
-                        res->bytes.store(written, std::memory_order_relaxed);
-                    }
-                    ++delivered;
-                }
-            }
+            PacketRing &ring = (hdr.flags & kFlagRetransmission)
+                                   ? *p->rtx_rings[lane]
+                                   : p->ring(lane, static_cast<uint16_t>((hdr.seq_no / kRouteRun) %
+                                                                          p->writers));
+            // Consumer behind: drop rather than stall the socket; the block
+            // is NACKed and resent like any other loss.
+            if (ring.writable() == 0) continue;
+            PacketSlot &s = ring.slot_for_write(0);
+            s.src = srcs[i];
+            s.lane_base = lane_base;
+            s.lane_total = shard_bytes;
+            s.len = static_cast<uint32_t>(dlen);
+            std::memcpy(s.dg, dg, dlen);
+            ring.commit(1);
+            mark = hdr.seq_no;
+            ++pending;
         }
+
+        for (uint16_t k = 0; k < p->writers; ++k) drain_results(p->done(lane, k));
+        drain_results(*p->rtx_dones[lane]);
+        res->bytes.store(written, std::memory_order_relaxed);
 
         if (peer_aborted) {
             // The sender already knows it's over; no need to tell it back.
@@ -440,17 +838,15 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
         if (final_seq != UINT64_MAX && rx.base_seq_no() > final_seq) {
             if (completed_at_ns == 0) {
                 completed_at_ns = t;
-                idle_at_completion = idle;
                 // The transfer's own duration ends here, not after the
                 // linger below, so the reported throughput isn't diluted by it.
                 res->end_ns.store(t);
             }
             // The sender's "finished" close means it has every Ack it needs:
-            // leave now. Otherwise linger, as before, in case our Acks were
-            // lost and the sender is still waiting for one.
+            // leave now. Otherwise linger in case our Acks were lost.
             if (peer_finished) break;
             if (t - completed_at_ns > kCloseGraceNs ||
-                idle - idle_at_completion >= kQuietIdleTicks) {
+                t - std::max(completed_at_ns, last_rx_ns) >= kQuietAfterCompletionNs) {
                 break;
             }
         }
@@ -471,9 +867,11 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
 
 // --- Sender lane ---------------------------------------------------------
 
-// `stop_all`: see recv_lane.
+// `stop_all`: see recv_lane. `lane_base`/`file_total` place this lane's
+// shard within the whole transfer, so the receiver can write it in place.
 void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const uint8_t *data,
-               uint64_t shard_bytes, LaneResult *res, std::atomic<bool> *stop_all) {
+               uint64_t shard_bytes, uint64_t lane_base, uint64_t file_total, LaneResult *res,
+               std::atomic<bool> *stop_all) {
     UdpSocket sock;
     if (!sock.open("0.0.0.0", 0)) {
         res->status.store(static_cast<int>(TransferStatus::SocketError));
@@ -510,6 +908,8 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     ss.total_blocks = 0; // unknown up front: block size adapts
     ss.block_size = cfg.block_size;
     ss.total_bytes = shard_bytes;
+    ss.stream_base_offset = lane_base;
+    ss.file_total_bytes = file_total;
     if (keys.enabled) std::memcpy(ss.session_salt, keys.salt, kSessionSaltLen);
     // Fixed for the whole handshake (every retry sends the same nonce) so
     // any one matching Ack confirms it — but unique to this attempt at this
@@ -888,9 +1288,10 @@ int severity(TransferStatus s) {
         case TransferStatus::Cancelled: return 4;
         case TransferStatus::AuthFailed: return 5;
         case TransferStatus::ResourceLimit: return 6;
-        case TransferStatus::SocketError: return 7;
-        case TransferStatus::ConfigError: return 8;
-        case TransferStatus::Unsupported: return 8;
+        case TransferStatus::IoError: return 7;
+        case TransferStatus::SocketError: return 8;
+        case TransferStatus::ConfigError: return 9;
+        case TransferStatus::Unsupported: return 9;
     }
     return 0;
 }
@@ -910,7 +1311,8 @@ TransferStatus worst(const std::vector<LaneResult> &lanes) {
 // sender's known size; the receiver passes nullptr and learns its total
 // from the lanes' StreamStarts.
 void wait_for_lanes(const TransferConfig &cfg, std::vector<std::thread> &threads,
-                    const std::vector<LaneResult> &results, const uint64_t *sender_total) {
+                    const std::vector<LaneResult> &results, const uint64_t *sender_total,
+                    const std::atomic<uint64_t> *receiver_total = nullptr) {
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
 
@@ -929,7 +1331,14 @@ void wait_for_lanes(const TransferConfig &cfg, std::vector<std::thread> &threads
                 all_started = false;
             }
         }
-        p.bytes_total = sender_total ? *sender_total : (all_started ? expected : 0);
+        if (sender_total) {
+            p.bytes_total = *sender_total;
+        } else if (receiver_total &&
+                   receiver_total->load(std::memory_order_acquire) != UINT64_MAX) {
+            p.bytes_total = receiver_total->load(std::memory_order_relaxed);
+        } else {
+            p.bytes_total = all_started ? expected : 0;
+        }
         p.seconds = std::chrono::duration<double>(clock::now() - t0).count();
         return p;
     };
@@ -979,6 +1388,66 @@ void fill_stats(const std::vector<LaneResult> &lanes, uint64_t bytes, TransferSt
     out->seconds = (first != UINT64_MAX && last > first) ? (last - first) / 1e9 : 0.0;
 }
 
+// Runs a whole receive into `sink`: starts the consumers (K writers + the
+// retransmission thread) and one reader per lane, reports progress while
+// they run, then shuts the pipeline down and commits (or discards) the
+// output. Config has already been validated.
+TransferStatus receive_to_sink(const TransferConfig &cfg, Sink *sink, TransferStats *stats) {
+    const uint16_t lanes = cfg.lanes;
+    const uint16_t writers = std::max<uint16_t>(1, cfg.writer_threads);
+    const uint32_t slots = std::clamp<uint32_t>(cfg.ring_slots, 16, 1u << 16);
+    const bool want_crypto = !cfg.pre_shared_key.empty();
+    RxPipeline pipe(lanes, writers, slots, sink);
+
+    std::vector<std::thread> consumers;
+    consumers.reserve(writers + 1u);
+    for (uint16_t k = 0; k < writers; ++k) {
+        std::vector<Channel> channels;
+        for (uint16_t i = 0; i < lanes; ++i) channels.push_back({i, &pipe.ring(i, k), &pipe.done(i, k)});
+        consumers.emplace_back(consumer_main, &pipe, std::move(channels), want_crypto);
+    }
+    {
+        std::vector<Channel> channels;
+        for (uint16_t i = 0; i < lanes; ++i) {
+            channels.push_back({i, pipe.rtx_rings[i].get(), pipe.rtx_dones[i].get()});
+        }
+        consumers.emplace_back(consumer_main, &pipe, std::move(channels), want_crypto);
+    }
+
+    std::vector<LaneResult> results(lanes);
+    std::atomic<bool> stop_all{false};
+    std::vector<std::thread> readers;
+    readers.reserve(lanes);
+    for (uint16_t i = 0; i < lanes; ++i) {
+        readers.emplace_back([&cfg, &pipe, &results, &stop_all, i] {
+            recv_lane(cfg, i, &pipe, &results[i], &stop_all);
+            results[i].finished.store(true, std::memory_order_release);
+        });
+    }
+    wait_for_lanes(cfg, readers, results, nullptr, &pipe.file_total);
+
+    // Every reader has exited, so nobody is waiting on anything still
+    // queued: stop the consumers before the rings they read are destroyed.
+    pipe.stop.store(true, std::memory_order_release);
+    for (auto &c : consumers) c.join();
+
+    TransferStatus status = worst(results);
+    if (!sink->finish(status == TransferStatus::Ok)) status = TransferStatus::IoError;
+
+    uint64_t total = 0;
+    for (const auto &r : results) total += r.bytes.load();
+    fill_stats(results, total, stats);
+    return status;
+}
+
+TransferStatus check_receive_config(const TransferConfig &cfg) {
+    if (cfg.lanes == 0 || cfg.base_port == 0) return TransferStatus::ConfigError;
+    if (!cfg.pre_shared_key.empty() && !session_crypto_available()) {
+        return TransferStatus::Unsupported;
+    }
+    return TransferStatus::Ok;
+}
+
 } // namespace
 
 const char *to_string(TransferStatus s) {
@@ -993,6 +1462,7 @@ const char *to_string(TransferStatus s) {
         case TransferStatus::ResourceLimit: return "peer's claimed size could not be allocated";
         case TransferStatus::Cancelled: return "cancelled";
         case TransferStatus::PeerAborted: return "peer aborted the transfer";
+        case TransferStatus::IoError: return "could not write the output";
     }
     return "unknown";
 }
@@ -1029,8 +1499,9 @@ TransferStatus send_buffer(const TransferConfig &cfg, const uint8_t *data, size_
     for (uint16_t i = 0; i < lanes; ++i) {
         const uint64_t off = std::min<uint64_t>(static_cast<uint64_t>(i) * shard, len);
         const uint64_t n = std::min<uint64_t>(shard, len - off);
-        threads.emplace_back([&cfg, &keys, &results, &stop_all, i, lane_data = data + off, n] {
-            send_lane(cfg, i, keys, lane_data, n, &results[i], &stop_all);
+        threads.emplace_back([&cfg, &keys, &results, &stop_all, i, lane_data = data + off, n, off,
+                              len] {
+            send_lane(cfg, i, keys, lane_data, n, off, len, &results[i], &stop_all);
             results[i].finished.store(true, std::memory_order_release);
         });
     }
@@ -1043,47 +1514,13 @@ TransferStatus send_buffer(const TransferConfig &cfg, const uint8_t *data, size_
 
 TransferStatus receive_buffer(const TransferConfig &cfg, std::vector<uint8_t> *out,
                               TransferStats *stats) {
-    if (out == nullptr || cfg.lanes == 0 || cfg.base_port == 0) {
-        return TransferStatus::ConfigError;
-    }
-    if (!cfg.pre_shared_key.empty() && !session_crypto_available()) {
-        return TransferStatus::Unsupported;
-    }
-
-    const uint16_t lanes = cfg.lanes;
-    std::vector<std::vector<uint8_t>> shards(lanes);
-    std::vector<LaneResult> results(lanes);
-    std::atomic<bool> stop_all{false};
-    std::vector<std::thread> threads;
-    threads.reserve(lanes);
-
-    for (uint16_t i = 0; i < lanes; ++i) {
-        threads.emplace_back([&cfg, &shards, &results, &stop_all, i] {
-            recv_lane(cfg, i, cfg.pre_shared_key, &shards[i], &results[i], &stop_all);
-            results[i].finished.store(true, std::memory_order_release);
-        });
-    }
-    wait_for_lanes(cfg, threads, results, nullptr);
-
-    uint64_t total = 0;
-    for (const auto &s : shards) total += s.size();
-
-    // A failed lane's shard is sized to what the sender claimed but only
-    // partially (or never) written — concatenating it in regardless would
-    // hand the caller a full-length buffer that looks complete but is
-    // zero-filled garbage wherever that lane fell short. Only a fully
-    // successful transfer gets to populate `*out`, matching what
-    // receive_file already does with this same status before writing to
-    // disk.
-    const TransferStatus status = worst(results);
-    out->clear();
-    if (status == TransferStatus::Ok) {
-        out->reserve(total);
-        for (const auto &s : shards) out->insert(out->end(), s.begin(), s.end());
-    }
-
-    fill_stats(results, total, stats);
-    return status;
+    if (out == nullptr) return TransferStatus::ConfigError;
+    const TransferStatus st = check_receive_config(cfg);
+    if (st != TransferStatus::Ok) return st;
+    // Blocks are written straight into *out; it is only left populated if
+    // the whole transfer succeeds.
+    MemorySink sink(out);
+    return receive_to_sink(cfg, &sink, stats);
 }
 
 TransferStatus send_file(const TransferConfig &cfg, const std::string &path,
@@ -1100,14 +1537,13 @@ TransferStatus send_file(const TransferConfig &cfg, const std::string &path,
 
 TransferStatus receive_file(const TransferConfig &cfg, const std::string &path,
                             TransferStats *stats) {
-    std::vector<uint8_t> buf;
-    const TransferStatus st = receive_buffer(cfg, &buf, stats);
+    const TransferStatus st = check_receive_config(cfg);
     if (st != TransferStatus::Ok) return st;
-    std::ofstream out(path, std::ios::binary);
-    if (!out) return TransferStatus::ConfigError;
-    out.write(reinterpret_cast<const char *>(buf.data()),
-              static_cast<std::streamsize>(buf.size()));
-    return out ? TransferStatus::Ok : TransferStatus::ConfigError;
+    // Opened before the transfer starts, so an unwritable destination fails
+    // at once instead of after the whole file has crossed the network.
+    FileSink sink(path);
+    if (!sink.open()) return TransferStatus::ConfigError;
+    return receive_to_sink(cfg, &sink, stats);
 }
 
 } // namespace fuse

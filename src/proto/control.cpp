@@ -53,7 +53,7 @@ bool decode_heartbeat(const uint8_t *in, size_t in_len, Heartbeat *hb) {
 }
 
 size_t encode_stream_start(const StreamStart &ss, uint8_t *out, size_t out_cap) {
-    const size_t total = kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8;
+    const size_t total = kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8 + 8 + 8;
     if (out_cap < total) {
         return 0;
     }
@@ -65,12 +65,14 @@ size_t encode_stream_start(const StreamStart &ss, uint8_t *out, size_t out_cap) 
     std::memcpy(out + off, ss.session_salt, sizeof(ss.session_salt));
     off += sizeof(ss.session_salt);
     off += put_u64(out + off, ss.nonce);
+    off += put_u64(out + off, ss.stream_base_offset);
+    off += put_u64(out + off, ss.file_total_bytes);
     return off;
 }
 
 bool decode_stream_start(const uint8_t *in, size_t in_len, StreamStart *ss) {
     size_t off = check_outer(in, in_len, MsgType::StreamStart);
-    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8) {
+    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8 + 8 + 8) {
         return false;
     }
     off += get_u16(in + off, &ss->stream_id);
@@ -80,6 +82,8 @@ bool decode_stream_start(const uint8_t *in, size_t in_len, StreamStart *ss) {
     std::memcpy(ss->session_salt, in + off, sizeof(ss->session_salt));
     off += sizeof(ss->session_salt);
     off += get_u64(in + off, &ss->nonce);
+    off += get_u64(in + off, &ss->stream_base_offset);
+    off += get_u64(in + off, &ss->file_total_bytes);
     return true;
 }
 

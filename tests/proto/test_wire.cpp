@@ -52,7 +52,9 @@ TEST(Wire, HeaderSizesMatchSpec) {
     EXPECT_EQ(kMaxWindow, 1024u);
     // v4 added a server-chosen salt to HelloAck (sdk.cpp), so the session
     // key depends on randomness the client alone can never determine.
-    EXPECT_EQ(kProtocolVersion, 5u);
+    // v6 added stream_base_offset/file_total_bytes to StreamStart so a
+    // receiver can write each block straight to its place in the output.
+    EXPECT_EQ(kProtocolVersion, 6u);
 
     // The MTU-safe default stays well under a 1500-byte path MTU; the
     // ceiling is only reached by probing a link that proves it can take it.

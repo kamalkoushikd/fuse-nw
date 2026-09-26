@@ -25,6 +25,9 @@ TEST(Aux, StreamStartRoundTrip) {
     ss.total_blocks = 6991;
     ss.block_size = 1200;
     ss.total_bytes = 8388608;
+    ss.nonce = 0xA5A5A5A5A5A5A5A5ULL;
+    ss.stream_base_offset = 3 * 8388608ULL;
+    ss.file_total_bytes = 4 * 8388608ULL + 17;
 
     uint8_t buf[kMaxAuxDatagramSize];
     size_t len = encode_stream_start(ss, buf, sizeof(buf));
@@ -36,6 +39,12 @@ TEST(Aux, StreamStartRoundTrip) {
     EXPECT_EQ(got.total_blocks, ss.total_blocks);
     EXPECT_EQ(got.block_size, ss.block_size);
     EXPECT_EQ(got.total_bytes, ss.total_bytes);
+    EXPECT_EQ(got.nonce, ss.nonce);
+    EXPECT_EQ(got.stream_base_offset, ss.stream_base_offset);
+    EXPECT_EQ(got.file_total_bytes, ss.file_total_bytes);
+
+    // A pre-v6 (shorter) StreamStart must not decode.
+    EXPECT_FALSE(decode_stream_start(buf, len - 16, &got));
 }
 
 TEST(Aux, StreamStartDoesNotDecodeAsOtherTypes) {
