@@ -1,11 +1,17 @@
 #include <gtest/gtest.h>
 
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
 #include <numeric>
 #include <thread>
 #include <vector>
@@ -191,6 +197,7 @@ TEST(Transfer, MaliciousOffsetIsRejectedNotWritten) {
     StreamStart ss;
     ss.stream_id = 0;
     ss.total_bytes = payload.size();
+    ss.file_total_bytes = ss.total_bytes; // single lane: the whole transfer
     ss.nonce = 0x1234;
     uint8_t ssdg[256];
     const size_t ssn = encode_stream_start(ss, ssdg, sizeof(ssdg));
@@ -261,6 +268,7 @@ TEST(Transfer, HugeStreamStartSizeFailsCleanlyInsteadOfCrashing) {
     StreamStart ss;
     ss.stream_id = 0;
     ss.total_bytes = UINT64_MAX - 8; // exceeds any real allocator's max_size()
+    ss.file_total_bytes = ss.total_bytes; // single lane: the whole transfer
     ss.nonce = 0x5;
     uint8_t dg[256];
     const size_t n = encode_stream_start(ss, dg, sizeof(dg));
@@ -485,6 +493,7 @@ TEST(Transfer, ReceiverCancelTellsSenderAndReturnsPromptly) {
     ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", port, &dst));
     StreamStart ss;
     ss.total_bytes = 1 << 20;
+    ss.file_total_bytes = ss.total_bytes; // single lane: the whole transfer
     ss.nonce = 0x77;
     uint8_t buf[kMaxDatagramSize + 64];
     const size_t n = encode_stream_start(ss, buf, sizeof(buf));
@@ -528,6 +537,7 @@ TEST(Transfer, PeerAbortEndsReceiverPromptly) {
     ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", port, &dst));
     StreamStart ss;
     ss.total_bytes = 1 << 20;
+    ss.file_total_bytes = ss.total_bytes; // single lane: the whole transfer
     ss.nonce = 0x99;
     uint8_t buf[kMaxDatagramSize + 64];
     const size_t n = encode_stream_start(ss, buf, sizeof(buf));
@@ -638,6 +648,286 @@ TEST(Transfer, MissingReceiverFailsAfterConnectTimeout) {
     const double ms = fakepeer::ms_since(started);
     EXPECT_GE(ms, 250.0);
     EXPECT_LT(ms, 2000.0) << "waited for timeout_ms instead of connect_timeout_ms";
+}
+
+// --- Receive pipeline: direct-to-disk writes, retransmission thread --------
+
+namespace pipeline_test {
+
+namespace fs = std::filesystem;
+
+fs::path temp_path(const std::string &name) {
+    static std::atomic<int> n{0};
+    return fs::temp_directory_path() /
+           ("fuse_test_" + std::to_string(::getpid()) + "_" + std::to_string(n++) + "_" + name);
+}
+
+std::vector<uint8_t> read_all(const fs::path &p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), {});
+}
+
+// A one-lane UDP relay between a sender and a receiver that drops every
+// `drop_every`-th *first-time* data block. Every retransmission passes, so
+// each drop is repaired by a retransmitted block — the path the receiver's
+// dedicated retransmission thread serves.
+class LossyRelay {
+public:
+    LossyRelay(uint16_t listen_port, uint16_t receiver_port, int drop_every)
+        : drop_every_(drop_every) {
+        using namespace fuse::proto;
+        EXPECT_TRUE(front_.open("127.0.0.1", listen_port));
+        EXPECT_TRUE(back_.open("127.0.0.1", 0));
+        EXPECT_TRUE(UdpSocket::resolve("127.0.0.1", receiver_port, &receiver_));
+        int big = 8 << 20;
+        for (int fd : {front_.fd(), back_.fd()}) {
+            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &big, sizeof(big));
+            setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &big, sizeof(big));
+        }
+        front_.set_nonblocking(true);
+        back_.set_nonblocking(true);
+        thread_ = std::thread([this] { run(); });
+    }
+    ~LossyRelay() {
+        stop_.store(true);
+        thread_.join();
+    }
+    uint64_t dropped() const { return dropped_.load(); }
+
+private:
+    void run() {
+        using namespace fuse::proto;
+        std::vector<uint8_t> buf(kMaxDatagramSize + 64);
+        PeerAddr sender{};
+        bool have_sender = false;
+        uint64_t data_seen = 0;
+        while (!stop_.load()) {
+            pollfd fds[2] = {{front_.fd(), POLLIN, 0}, {back_.fd(), POLLIN, 0}};
+            if (::poll(fds, 2, 5) <= 0) continue;
+            size_t got = 0;
+            PeerAddr from;
+            // Sender -> receiver, with drops.
+            while (front_.recv_from(buf.data(), buf.size(), &got, &from)) {
+                sender = from;
+                have_sender = true;
+                MsgType t;
+                if (peek_msg_type(buf.data(), got, &t) && t == MsgType::Data && got > 20 &&
+                    (buf[12] & kFlagRetransmission) == 0 && ++data_seen % drop_every_ == 0) {
+                    dropped_.fetch_add(1);
+                    continue;
+                }
+                back_.send_to(buf.data(), got, receiver_);
+            }
+            // Receiver -> sender, untouched.
+            while (back_.recv_from(buf.data(), buf.size(), &got, &from)) {
+                if (have_sender) front_.send_to(buf.data(), got, sender);
+            }
+        }
+    }
+
+    fuse::proto::UdpSocket front_, back_;
+    fuse::proto::PeerAddr receiver_;
+    int drop_every_;
+    std::atomic<bool> stop_{false};
+    std::atomic<uint64_t> dropped_{0};
+    std::thread thread_;
+};
+
+} // namespace pipeline_test
+
+// receive_file streams blocks into "<path>.part" as they arrive and renames
+// it over <path> only when complete.
+TEST(Transfer, ReceiveFileWritesInPlaceAndRenamesOnSuccess) {
+    namespace fs = std::filesystem;
+    const auto payload = make_payload(3 * 1024 * 1024 + 7);
+    const uint16_t port = next_port();
+    const fs::path out = pipeline_test::temp_path("ok.bin");
+
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = port;
+    rx.lanes = 4;
+    rx.timeout_ms = 20000;
+    fuse::TransferConfig tx = rx;
+    tx.host = "127.0.0.1";
+
+    fuse::TransferStatus rs = fuse::TransferStatus::Incomplete;
+    std::thread receiver([&] { rs = fuse::receive_file(rx, out.string(), nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const auto ss = fuse::send_buffer(tx, payload.data(), payload.size(), nullptr);
+    receiver.join();
+
+    ASSERT_EQ(ss, fuse::TransferStatus::Ok) << fuse::to_string(ss);
+    ASSERT_EQ(rs, fuse::TransferStatus::Ok) << fuse::to_string(rs);
+    EXPECT_TRUE(fs::exists(out));
+    EXPECT_FALSE(fs::exists(out.string() + ".part")) << "the .part file must be renamed away";
+    EXPECT_EQ(pipeline_test::read_all(out), payload);
+    fs::remove(out);
+}
+
+// A failed receive leaves neither a .part file nor a clobbered <path>.
+TEST(Transfer, ReceiveFileLeavesNothingBehindOnFailure) {
+    namespace fs = std::filesystem;
+    const uint16_t port = next_port();
+    const fs::path out = pipeline_test::temp_path("keep.bin");
+    {
+        std::ofstream prior(out, std::ios::binary);
+        prior << "previous contents";
+    }
+
+    std::atomic<bool> cancel{false};
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = port;
+    rx.lanes = 2;
+    rx.timeout_ms = 20000;
+    rx.cancel = &cancel;
+
+    // A sender that starts, delivers part of a large payload, then is
+    // interrupted from the receiver side.
+    const auto payload = make_payload(64 * 1024 * 1024);
+    fuse::TransferConfig tx = rx;
+    tx.host = "127.0.0.1";
+    tx.cancel = nullptr;
+
+    fuse::TransferStatus rs = fuse::TransferStatus::Ok;
+    std::thread receiver([&] { rs = fuse::receive_file(rx, out.string(), nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    std::thread sender([&] { fuse::send_buffer(tx, payload.data(), payload.size(), nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    cancel.store(true);
+    receiver.join();
+    sender.join();
+
+    if (rs == fuse::TransferStatus::Ok) {
+        GTEST_SKIP() << "the transfer finished before the cancel landed; nothing to check";
+    }
+    EXPECT_EQ(rs, fuse::TransferStatus::Cancelled) << fuse::to_string(rs);
+    EXPECT_FALSE(fs::exists(out.string() + ".part")) << "a failed receive left its .part file";
+    const auto prior = pipeline_test::read_all(out);
+    EXPECT_EQ(std::string(prior.begin(), prior.end()), "previous contents")
+        << "a failed receive must not touch the existing file";
+    fs::remove(out);
+}
+
+// An output that can't be created fails before any network work, not after
+// the whole file has crossed the network.
+TEST(Transfer, ReceiveFileUnwritableDestinationFailsFast) {
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = next_port();
+    rx.lanes = 1;
+    const auto started = fakepeer::Clock::now();
+    EXPECT_EQ(fuse::receive_file(rx, "/nonexistent-dir/for/fuse/out.bin", nullptr),
+              fuse::TransferStatus::ConfigError);
+    EXPECT_LT(fakepeer::ms_since(started), 200.0);
+}
+
+// Loss forces retransmissions, which the receiver routes to its dedicated
+// retransmission thread and writes straight to disk. The result must be
+// byte-exact for any number of writer threads, with and without encryption.
+TEST(Transfer, LossyLinkRecoversThroughRetransmitThread) {
+    namespace fs = std::filesystem;
+    const auto payload = make_payload(6 * 1024 * 1024 + 321);
+
+    std::vector<std::string> keys = {""};
+    if (fuse::encryption_available()) keys.push_back("lossy-link-test-key");
+
+    for (const std::string &psk : keys) {
+        for (uint16_t writers : {1, 2, 4}) {
+            SCOPED_TRACE("writers=" + std::to_string(writers) + (psk.empty() ? " plain" : " psk"));
+            const uint16_t rx_port = next_port();
+            const uint16_t relay_port = next_port();
+            const fs::path out = pipeline_test::temp_path("lossy.bin");
+
+            fuse::TransferConfig rx;
+            rx.bind_address = "127.0.0.1";
+            rx.base_port = rx_port;
+            rx.lanes = 1;
+            rx.timeout_ms = 20000;
+            rx.pre_shared_key = psk;
+            rx.writer_threads = writers;
+
+            fuse::TransferConfig tx = rx;
+            tx.host = "127.0.0.1";
+            tx.base_port = relay_port;
+
+            pipeline_test::LossyRelay relay(relay_port, rx_port, 50);
+            fuse::TransferStatus rs = fuse::TransferStatus::Incomplete;
+            std::thread receiver([&] { rs = fuse::receive_file(rx, out.string(), nullptr); });
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            fuse::TransferStats st;
+            const auto ss = fuse::send_buffer(tx, payload.data(), payload.size(), &st);
+            receiver.join();
+
+            ASSERT_EQ(ss, fuse::TransferStatus::Ok) << fuse::to_string(ss);
+            ASSERT_EQ(rs, fuse::TransferStatus::Ok) << fuse::to_string(rs);
+            EXPECT_GT(relay.dropped(), 0u);
+            EXPECT_GT(st.retransmits, 0u);
+            EXPECT_EQ(pipeline_test::read_all(out), payload);
+            fs::remove(out);
+        }
+    }
+}
+
+// StreamStart sizes are unauthenticated claims: a lane that doesn't fit
+// inside its own transfer, or a lane that disagrees with the others about
+// the transfer's size, must not be accepted (no Ack, no allocation).
+TEST(Transfer, InconsistentStreamStartIsRejected) {
+    using namespace fuse::proto;
+    const uint16_t port = next_port();
+
+    std::atomic<bool> cancel{false};
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = port;
+    rx.lanes = 2;
+    rx.timeout_ms = 20000;
+    rx.cancel = &cancel;
+
+    std::vector<uint8_t> got;
+    fuse::TransferStatus rs = fuse::TransferStatus::Ok;
+    std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    // One socket per fake lane: once lane 0 is accepted it keeps sending
+    // its periodic Acks, which must not be mistaken for an Ack to lane 1.
+    UdpSocket fake0, fake1;
+    ASSERT_TRUE(fake0.open("127.0.0.1", 0));
+    ASSERT_TRUE(fake1.open("127.0.0.1", 0));
+    PeerAddr lane0, lane1;
+    ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", port, &lane0));
+    ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", port + 1, &lane1));
+    uint8_t buf[kMaxDatagramSize + 64];
+    const auto send_start = [&](UdpSocket &from, const PeerAddr &to, uint16_t id, uint64_t base,
+                                uint64_t total, uint64_t file_total) {
+        StreamStart ss;
+        ss.stream_id = id;
+        ss.nonce = 0x4242 + id;
+        ss.stream_base_offset = base;
+        ss.total_bytes = total;
+        ss.file_total_bytes = file_total;
+        const size_t n = encode_stream_start(ss, buf, sizeof(buf));
+        ASSERT_TRUE(from.send_to(buf, n, to));
+    };
+
+    // Lane that would reach past the end of its own transfer (and whose
+    // base + total would overflow if added naively).
+    send_start(fake0, lane0, 0, UINT64_MAX - 10, 100, 200);
+    EXPECT_EQ(fakepeer::wait_for(fake0, MsgType::Ack, buf, sizeof(buf), 300), 0u)
+        << "an out-of-range StreamStart was accepted";
+
+    // A valid lane 0 is accepted...
+    send_start(fake0, lane0, 0, 0, 500, 1000);
+    EXPECT_GT(fakepeer::wait_for(fake0, MsgType::Ack, buf, sizeof(buf), 2000), 0u);
+    // ...and a lane 1 claiming a different transfer size is not.
+    send_start(fake1, lane1, 1, 500, 500, 2000);
+    EXPECT_EQ(fakepeer::wait_for(fake1, MsgType::Ack, buf, sizeof(buf), 300), 0u)
+        << "a lane disagreeing about the transfer size was accepted";
+
+    cancel.store(true);
+    receiver.join();
+    EXPECT_EQ(rs, fuse::TransferStatus::Cancelled) << fuse::to_string(rs);
 }
 
 TEST(Transfer, RejectsBadConfiguration) {
