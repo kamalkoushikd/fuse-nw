@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """QUIC receiver for the fuse-vs-QUIC comparison test.
 
-Accepts exactly one QUIC connection and one stream on it, writes everything
-received to OUT_FILE, sends back a small "OK" once the stream's sender has
-signalled end-of-data, then exits. Mirrors fuse_quickstart_recv's shape
-(bind, wait, write file, report throughput) so the two are comparable.
+Accepts exactly one QUIC connection and one stream on it, reads an 8-byte
+length header the sender sends first (plain QUIC has no analog to fuse's
+StreamStart, so without this the receiver would have no total to show a
+percentage/ETA against), writes everything after that to OUT_FILE, sends
+back a small "OK" once the sender has signalled end-of-data, then exits.
+Mirrors fuse_quickstart_recv's shape (bind, wait, write file, report
+throughput) so the two are comparable.
 
 Requires: pip install aioquic
 
@@ -13,6 +16,7 @@ Usage: quic_receiver.py <bind-address> <port>
 
 import asyncio
 import datetime
+import struct
 import sys
 import time
 
@@ -22,6 +26,8 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
+
+from quic_common import finish_progress_line, make_progress_printer
 
 OUT_FILE = "/tmp/testoutfile_quic"
 ALPN = "fuse-quic-test"
@@ -72,17 +78,24 @@ async def main(bind_address: str, port: int) -> None:
 
     async def handle_stream_async(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         t0 = time.monotonic()
-        total = 0
+        (expected,) = struct.unpack(">Q", await reader.readexactly(8))
+        report = make_progress_printer("received")
+
+        written = 0
         with open(OUT_FILE, "wb") as f:
             while True:
                 chunk = await reader.read(1 << 20)
                 if not chunk:
                     break
                 f.write(chunk)
-                total += len(chunk)
+                written += len(chunk)
+                report(written, expected, time.monotonic() - t0)
         elapsed = time.monotonic() - t0
-        mbps = (total / (1024 * 1024)) / elapsed if elapsed > 0 else 0.0
-        print(f"received {total} bytes in {elapsed:.3f} s ({mbps:.1f} MB/s) -> {OUT_FILE}")
+        report(written, expected, elapsed, force=True)
+        finish_progress_line()
+
+        mbps = (written / (1024 * 1024)) / elapsed if elapsed > 0 else 0.0
+        print(f"received {written} bytes in {elapsed:.3f} s ({mbps:.1f} MB/s) -> {OUT_FILE}")
         writer.write(b"OK")
         writer.write_eof()
         await writer.drain()
