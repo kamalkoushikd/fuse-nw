@@ -14,7 +14,10 @@ set -eu
 HOST="${1:?usage: $0 <receiver-address> <port>}"
 PORT="${2:?usage: $0 <receiver-address> <port>}"
 SIZE_MB=1024
-IN="/tmp/fuse_test_send.bin"
+# A fixed name here would collide with a leftover from an earlier run under
+# sudo (root-owned, unwritable by a later non-sudo run) — mktemp gives this
+# run a name nothing else could already own.
+IN="$(mktemp /tmp/fuse_test_send.XXXXXX)"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 PY="$(command -v python3 || true)"

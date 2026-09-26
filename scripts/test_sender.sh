@@ -19,7 +19,10 @@ PORT="${2:?usage: $0 <receiver-address> <port>}"
 SIZE_MB=1024
 LANES=4
 TEST_PSK="2142edb68d8ce7923d4843c485d3ed5aef5016d6173f63b09920b526b6c6e76c"
-IN="/tmp/fuse_test_send.bin"
+# A fixed name here would collide with a leftover from an earlier run under
+# sudo (root-owned, unwritable by a later non-sudo run) — mktemp gives this
+# run a name nothing else could already own.
+IN="$(mktemp /tmp/fuse_test_send.XXXXXX)"
 
 SEND_BIN="$(command -v fuse_quickstart_send || true)"
 if [ -z "$SEND_BIN" ]; then
