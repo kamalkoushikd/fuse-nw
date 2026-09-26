@@ -124,6 +124,23 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
     // retransmission arriving. Until it has a sample, conservative WAN-safe
     // defaults are used rather than the loopback-tight ones.
     uint64_t rtt_est_ns = 0, nack_sent_ns = 0;
+    // Set once every byte has arrived; the loop keeps running (still
+    // answering with fresh Acks on its normal cadence below) instead of
+    // exiting immediately. Firing a single burst of Acks and abandoning the
+    // socket right away — the previous behavior — means that if that whole
+    // burst is lost together (a real risk: they went out back-to-back with
+    // no spacing, so they're correlated, not independent draws), the sender
+    // can NEVER get confirmation once this socket is gone, and sits
+    // retransmitting into the void until its own timeout_ms (2 minutes, by
+    // default) gives up. Exit as soon as the peer goes quiet for a couple of
+    // idle ticks after completion (it got an Ack and left — the common case,
+    // adding well under a second) rather than always waiting out the full
+    // grace window; kCloseGraceNs is only the upper bound for the lossy case
+    // where every Ack sent so far may have been missed.
+    uint64_t completed_at_ns = 0;
+    int idle_at_completion = -1;
+    constexpr uint64_t kCloseGraceNs = 1'500'000'000ull;
+    constexpr int kQuietIdleTicks = 2; // ~400ms at the 200ms recv timeout below
     bool have_start = false, have_peer = false;
     uint64_t peer_nonce = 0; // echoed in every Ack once StreamStart arrives
     PeerAddr peer{};
@@ -322,8 +339,14 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
         }
 
         if (final_seq != UINT64_MAX && rx.base_seq_no() > final_seq) {
-            res->end_ns.store(now_ns());
-            break;
+            if (completed_at_ns == 0) {
+                completed_at_ns = t;
+                idle_at_completion = idle;
+            } else if (t - completed_at_ns > kCloseGraceNs ||
+                      idle - idle_at_completion >= kQuietIdleTicks) {
+                res->end_ns.store(now_ns());
+                break;
+            }
         }
     }
 
@@ -467,7 +490,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 hdr.payload_len = len;
                 hdr.offset = next_offset;
 
-                reg.store(next_seq, data + next_offset, len, now_ns(), next_offset);
+                reg.store(next_seq, data + next_offset, len, now_ns(), next_offset, hdr.flags);
 
                 const uint8_t *body = data + next_offset;
                 if (keys.enabled) {
@@ -559,7 +582,10 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                     BlockHeader hdr;
                     hdr.stream_id = lane;
                     hdr.seq_no = seq;
-                    hdr.flags = kFlagRetransmission;
+                    // OR, not overwrite: a retransmitted last block is still
+                    // the last block, and the receiver has no other way to
+                    // learn a stream finished if this bit is dropped here.
+                    hdr.flags = sl->flags | kFlagRetransmission;
                     hdr.payload_len = sl->payload_len;
                     hdr.offset = sl->offset;
                     const uint8_t *body = sl->payload;
@@ -604,7 +630,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 BlockHeader hdr;
                 hdr.stream_id = lane;
                 hdr.seq_no = base;
-                hdr.flags = kFlagRetransmission;
+                hdr.flags = sl->flags | kFlagRetransmission; // see the NACK path's comment above
                 hdr.payload_len = sl->payload_len;
                 hdr.offset = sl->offset;
                 const uint8_t *body = sl->payload;

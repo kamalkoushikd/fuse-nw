@@ -29,9 +29,11 @@ target_link_libraries(fuse_quickstart_send PRIVATE fuse::proto)
 # dependency (unlike the libwolfssl case in the top-level CMakeLists.txt
 # comment, RUNPATH does apply here), so without this an install to a
 # non-system prefix — bin/ separate from lib/ — links fine but fails at
-# run time with a missing-library error.
+# run time with a missing-library error. $ORIGIN is Linux's spelling of
+# "relative to me"; macOS's dyld only understands its own @loader_path
+# (see the top-level CMakeLists.txt comment for the same distinction).
 set_target_properties(fuse_quickstart_recv fuse_quickstart_send PROPERTIES
-    INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}"
+    INSTALL_RPATH "$<IF:$<PLATFORM_ID:Darwin>,@loader_path/../${CMAKE_INSTALL_LIBDIR},$ORIGIN/../${CMAKE_INSTALL_LIBDIR}>"
 )
 install(TARGETS fuse_quickstart_recv fuse_quickstart_send
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
