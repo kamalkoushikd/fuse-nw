@@ -34,4 +34,8 @@ echo "==> listening on ${BIND}, UDP ${PORT}-$((PORT + LANES - 1)), writing to $O
 "$RECV_BIN" "$BIND" "$PORT" "$OUT" "$LANES" "$TEST_PSK"
 
 echo "==> sha256:"
-sha256sum "$OUT"
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$OUT"
+else
+    shasum -a 256 "$OUT"  # macOS has no sha256sum, only shasum
+fi
