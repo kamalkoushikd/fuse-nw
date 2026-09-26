@@ -305,7 +305,10 @@ bool MuxSender::try_send_one(SenderStreamState &s) {
             BlockHeader hdr;
             hdr.stream_id = s.stream_id;
             hdr.seq_no = seq;
-            hdr.flags = kFlagRetransmission;
+            // OR, not overwrite: a retransmitted last block is still the
+            // last block, and the receiver has no other way to learn a
+            // stream finished if this bit is dropped here.
+            hdr.flags = slot->flags | kFlagRetransmission;
             hdr.payload_len = slot->payload_len;
             hdr.offset = slot->offset;
             uint8_t dgram[kMaxDatagramSize];
@@ -324,7 +327,7 @@ bool MuxSender::try_send_one(SenderStreamState &s) {
             BlockHeader hdr;
             hdr.stream_id = s.stream_id;
             hdr.seq_no = s.tx_base;
-            hdr.flags = kFlagRetransmission;
+            hdr.flags = slot->flags | kFlagRetransmission; // see the backlog path's comment above
             hdr.payload_len = slot->payload_len;
             hdr.offset = slot->offset;
             uint8_t dgram[kMaxDatagramSize];
@@ -352,7 +355,7 @@ bool MuxSender::try_send_one(SenderStreamState &s) {
         hdr.payload_len = blen;
         hdr.offset = s.next_offset;
 
-        s.reg.store(s.tx_next_seq, s.data + s.next_offset, blen, now_ns(), s.next_offset);
+        s.reg.store(s.tx_next_seq, s.data + s.next_offset, blen, now_ns(), s.next_offset, hdr.flags);
 
         uint8_t dgram[kMaxDatagramSize];
         const size_t n =

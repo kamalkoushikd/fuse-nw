@@ -192,11 +192,16 @@ endif()
 # This matters more than it looks: modern linkers emit RUNPATH rather than
 # RPATH, and the loader consults RUNPATH only for an object's *direct*
 # dependencies. So an executable's rpath does NOT help libfuse_proto.so find
-# libwolfssl.so — without $ORIGIN here, anything installed outside the system
-# library path fails at run time with a missing-library error, even though it
-# linked cleanly.
+# libwolfssl.so — without this token here, anything installed outside the
+# system library path fails at run time with a missing-library error, even
+# though it linked cleanly.
+#
+# The token itself is not portable: Linux's dynamic loader understands
+# $ORIGIN ("relative to me"), but macOS's dyld has never heard of it and
+# treats it as a literal, nonexistent path named "$ORIGIN" — dyld's spelling
+# of the same idea is @loader_path.
 set_target_properties(fuse fuse_proto PROPERTIES
-    INSTALL_RPATH "$ORIGIN"
+    INSTALL_RPATH "$<IF:$<PLATFORM_ID:Darwin>,@loader_path,$ORIGIN>"
 )
 
 install(TARGETS fuse fuse_proto
