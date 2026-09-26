@@ -32,12 +32,36 @@
 // `base_port` — lane i uses base_port + i. Both ends must agree on
 // `base_port` and `lanes`, and the whole range must be open.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
 namespace fuse {
+
+// A snapshot handed to TransferConfig::on_progress.
+struct TransferProgress {
+    // Sender: bytes the receiver has acknowledged. Receiver: bytes written.
+    uint64_t bytes_done = 0;
+    // Total transfer size. Always known on the sender; on the receiver it is
+    // 0 until every lane's opening message has arrived.
+    uint64_t bytes_total = 0;
+    uint64_t retransmits = 0; // sender only
+    double seconds = 0.0;     // since the call started
+    uint16_t lanes_done = 0;  // lanes that have finished (any outcome)
+    uint16_t lanes_total = 0;
+
+    double fraction() const {
+        return bytes_total > 0 ? static_cast<double>(bytes_done) / static_cast<double>(bytes_total)
+                               : 0.0;
+    }
+    double mb_per_s() const {
+        return seconds > 0.0 ? (static_cast<double>(bytes_done) / (1024.0 * 1024.0)) / seconds
+                             : 0.0;
+    }
+};
 
 struct TransferConfig {
     // Sender: where to send. Receiver: which local address to bind.
@@ -68,6 +92,28 @@ struct TransferConfig {
 
     // Give up if the transfer makes no progress for this long.
     uint32_t timeout_ms = 120000;
+
+    // Sender only: how long to keep trying to reach the receiver before any
+    // data flows (like a TCP connect timeout). Kept separate from, and much
+    // shorter than, timeout_ms so that a receiver that isn't running — or was
+    // stopped before the sender reached it, and so couldn't say so — is
+    // reported quickly instead of after the full no-progress timeout.
+    uint32_t connect_timeout_ms = 10000;
+
+    // Optional cancellation flag, polled by every lane. Setting it to true
+    // (from any thread, or a signal handler — std::atomic<bool> is lock-free)
+    // makes the call tell the peer it is aborting and return
+    // TransferStatus::Cancelled within a few hundred milliseconds. The peer
+    // then returns TransferStatus::PeerAborted instead of waiting out its
+    // timeout. Must outlive the call.
+    const std::atomic<bool> *cancel = nullptr;
+
+    // Optional progress callback, invoked every progress_interval_ms and
+    // once more when the call finishes. It runs on the thread that called
+    // send_*/receive_*, never on a lane thread, so it needs no locking of
+    // its own; keep it short and don't throw from it.
+    std::function<void(const TransferProgress &)> on_progress;
+    uint32_t progress_interval_ms = 250;
 };
 
 enum class TransferStatus {
@@ -79,6 +125,8 @@ enum class TransferStatus {
     Incomplete,    // finished without delivering every byte
     Unsupported,   // encryption requested from a build without a crypto backend
     ResourceLimit, // peer's claimed transfer size could not be allocated
+    Cancelled,     // TransferConfig::cancel was set on this side
+    PeerAborted,   // the other side cancelled or gave up and said so
 };
 
 // Human-readable form, for logs and error messages.

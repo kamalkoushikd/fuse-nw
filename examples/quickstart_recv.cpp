@@ -16,6 +16,8 @@
 
 #include <fuse/transfer.hpp>
 
+#include "quickstart_common.hpp"
+
 int main(int argc, char **argv) {
     if (argc < 4) {
         std::fprintf(stderr,
@@ -34,11 +36,15 @@ int main(int argc, char **argv) {
                 cfg.base_port + cfg.lanes - 1, cfg.lanes,
                 cfg.pre_shared_key.empty() ? "" : ", encrypted");
 
+    // Ctrl+C cancels cleanly: the sender is told, and nothing is written.
+    quickstart::attach(cfg, "received");
+
     fuse::TransferStats stats;
     const fuse::TransferStatus st = fuse::receive_file(cfg, argv[3], &stats);
+    quickstart::finish_progress_line();
     if (st != fuse::TransferStatus::Ok) {
         std::fprintf(stderr, "receive failed: %s\n", fuse::to_string(st));
-        return 1;
+        return quickstart::exit_code_for(st);
     }
 
     std::printf("received %llu bytes in %.3f s (%.1f MB/s) -> %s\n",
