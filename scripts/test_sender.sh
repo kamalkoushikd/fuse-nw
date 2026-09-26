@@ -31,7 +31,11 @@ echo "==> generating ${SIZE_MB} MiB test file at $IN"
 dd if=/dev/urandom of="$IN" bs=1M count="$SIZE_MB" status=progress
 
 echo "==> sha256 (before send) — compare this against the receiver's printed hash:"
-sha256sum "$IN"
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$IN"
+else
+    shasum -a 256 "$IN"  # macOS has no sha256sum, only shasum
+fi
 
 echo "==> sending to ${HOST}:${PORT} (${LANES} lanes)"
 "$SEND_BIN" "$HOST" "$PORT" "$IN" "$LANES" "$TEST_PSK"
