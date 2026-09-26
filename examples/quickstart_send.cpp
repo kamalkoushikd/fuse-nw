@@ -13,6 +13,8 @@
 
 #include <fuse/transfer.hpp>
 
+#include "quickstart_common.hpp"
+
 int main(int argc, char **argv) {
     if (argc < 4) {
         std::fprintf(stderr,
@@ -31,11 +33,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // Ctrl+C cancels cleanly: the receiver is told, so it stops too.
+    quickstart::attach(cfg, "sent");
+
     fuse::TransferStats stats;
     const fuse::TransferStatus st = fuse::send_file(cfg, argv[3], &stats);
+    quickstart::finish_progress_line();
     if (st != fuse::TransferStatus::Ok) {
         std::fprintf(stderr, "send failed: %s\n", fuse::to_string(st));
-        return 1;
+        return quickstart::exit_code_for(st);
     }
 
     std::printf("sent %llu bytes in %.3f s (%.1f MB/s), %llu retransmits, block=%u\n",

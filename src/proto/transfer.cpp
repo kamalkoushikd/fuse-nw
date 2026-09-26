@@ -76,6 +76,30 @@ size_t build_aad(uint8_t *out, uint16_t lane, uint64_t seq, uint64_t offset, uin
     return n;
 }
 
+bool cancel_requested(const TransferConfig &cfg) {
+    return cfg.cancel != nullptr && cfg.cancel->load(std::memory_order_acquire);
+}
+
+// Tells the peer this lane is over, so it stops now instead of waiting out
+// its own timeout. Best effort and unacknowledged: sent a few times because
+// one lost datagram would otherwise cost the peer the full timeout, and the
+// peer's timeout still covers the case where all copies are lost.
+void send_stream_close(UdpSocket &sock, const PeerAddr &to, uint16_t lane, uint64_t nonce,
+                       uint8_t reason) {
+    StreamClose sc;
+    sc.stream_id = lane;
+    sc.nonce = nonce;
+    sc.reason = reason;
+    uint8_t buf[32];
+    const size_t n = encode_stream_close(sc, buf, sizeof(buf));
+    for (int i = 0; n != 0 && i < 3; ++i) sock.send_to(buf, n, to);
+}
+
+// Written by one lane thread, read by the calling thread for progress
+// reports (relaxed is enough for the counters: a progress snapshot only
+// needs each value to be one that was really stored, not a consistent cut
+// across all of them). `bytes` is live: acknowledged bytes on the sender,
+// written bytes on the receiver.
 struct LaneResult {
     std::atomic<uint64_t> bytes{0};
     std::atomic<uint64_t> retransmits{0};
@@ -84,6 +108,12 @@ struct LaneResult {
     std::atomic<uint64_t> start_ns{0};
     std::atomic<uint64_t> end_ns{0};
     std::atomic<int> status{static_cast<int>(TransferStatus::Incomplete)};
+    // Receiver only: this lane's size, published (release) once its
+    // StreamStart has been accepted.
+    std::atomic<uint64_t> expected{0};
+    std::atomic<bool> started{false};
+    // Set (release) after the lane function returns, whatever the outcome.
+    std::atomic<bool> finished{false};
 };
 
 struct Keys {
@@ -94,8 +124,11 @@ struct Keys {
 
 // --- Receiver lane -------------------------------------------------------
 
+// `stop_all` is shared by every lane of one call: a lane that is cancelled or
+// told the peer aborted sets it, and its siblings then stop too — so one
+// lane whose abort datagrams were all lost doesn't sit out its full timeout.
 void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
-               std::vector<uint8_t> *shard, LaneResult *res) {
+               std::vector<uint8_t> *shard, LaneResult *res, std::atomic<bool> *stop_all) {
     UdpSocket sock;
     if (!sock.open(cfg.bind_address.c_str(), static_cast<uint16_t>(cfg.base_port + lane))) {
         res->status.store(static_cast<int>(TransferStatus::SocketError));
@@ -142,6 +175,9 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
     constexpr uint64_t kCloseGraceNs = 1'500'000'000ull;
     constexpr int kQuietIdleTicks = 2; // ~400ms at the 200ms recv timeout below
     bool have_start = false, have_peer = false;
+    // Set from the sender's StreamClose: "finished" lets a completed lane
+    // exit at once instead of lingering; "aborted" ends the lane now.
+    bool peer_finished = false, peer_aborted = false;
     uint64_t peer_nonce = 0; // echoed in every Ack once StreamStart arrives
     PeerAddr peer{};
     int idle = 0;
@@ -167,15 +203,39 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
         return fallback;
     };
 
+    // Every early exit below tells the sender (once we know where it is and
+    // which session it is), so it stops at once rather than retransmitting
+    // into a closed port until its own timeout.
+    const auto give_up = [&](TransferStatus st) {
+        if (have_peer && have_start) {
+            send_stream_close(sock, peer, lane, peer_nonce, kStreamCloseAborted);
+        }
+        res->bytes.store(written);
+        res->auth_failures.store(auth_failures);
+        res->status.store(static_cast<int>(st));
+    };
+
     for (;;) {
+        // Polled once per loop; the 200 ms receive timeout bounds how long a
+        // cancel can go unnoticed.
+        if (cancel_requested(cfg)) {
+            give_up(TransferStatus::Cancelled);
+            stop_all->store(true, std::memory_order_release);
+            return;
+        }
+        if (stop_all->load(std::memory_order_acquire)) {
+            // A sibling lane heard the sender abort; this lane's copy of
+            // that message may simply have been lost.
+            give_up(classify(TransferStatus::PeerAborted));
+            return;
+        }
+
         const int got = sock.recv_batch(rx_buf.data(), slot, kRxBatch, lens.data(), srcs.data());
         if (got > 0) {
             idle = 0;
             if (res->start_ns.load() == 0) res->start_ns.store(now_ns());
         } else if (++idle > max_idle) {
-            res->bytes.store(written);
-            res->auth_failures.store(auth_failures);
-            res->status.store(static_cast<int>(classify(TransferStatus::Timeout)));
+            give_up(classify(TransferStatus::Timeout));
             return;
         }
 
@@ -211,6 +271,8 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
                     peer = srcs[i];
                     have_peer = true;
                     shard_bytes = ss.total_bytes;
+                    res->expected.store(shard_bytes, std::memory_order_relaxed);
+                    res->started.store(true, std::memory_order_release);
                     if (want_crypto) {
                         uint8_t key[kSessionKeyLen];
                         if (!derive_session_key(reinterpret_cast<const uint8_t *>(psk.data()),
@@ -228,6 +290,30 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
                     // address (the sender's NAT mapping may have rotated).
                     peer = srcs[i];
                     have_peer = true;
+                }
+                continue;
+            }
+            if (type == MsgType::StreamClose) {
+                StreamClose sc;
+                if (!decode_stream_close(dg, dlen, &sc)) continue;
+                if (have_start) {
+                    // Only this session's nonce counts once a session
+                    // exists: a close left over from an earlier transfer on
+                    // this port must not end this one.
+                    if (sc.nonce != peer_nonce) continue;
+                    if (sc.reason == kStreamCloseAborted) {
+                        peer_aborted = true;
+                    } else {
+                        peer_finished = true;
+                    }
+                } else if (sc.reason == kStreamCloseAborted) {
+                    // No session yet, so no nonce to check: a sender that is
+                    // cancelled before its StreamStart reached us (e.g.
+                    // Ctrl+C while it was still loading the file) can only
+                    // say "I'm not coming". Accepting that is no weaker than
+                    // today's pre-session state, where any first StreamStart
+                    // already claims the lane.
+                    peer_aborted = true;
                 }
                 continue;
             }
@@ -305,10 +391,23 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
                     if (hdr.offset <= shard->size() && body_len <= shard->size() - hdr.offset) {
                         std::memcpy(shard->data() + hdr.offset, body, body_len);
                         written += body_len;
+                        res->bytes.store(written, std::memory_order_relaxed);
                     }
                     ++delivered;
                 }
             }
+        }
+
+        if (peer_aborted) {
+            // The sender already knows it's over; no need to tell it back.
+            // classify() still applies: a sender with the wrong key gives up
+            // (and says so) precisely because every block failed auth here,
+            // and AuthFailed is the diagnosis the caller needs, not "aborted".
+            res->bytes.store(written);
+            res->auth_failures.store(auth_failures);
+            res->status.store(static_cast<int>(classify(TransferStatus::PeerAborted)));
+            stop_all->store(true, std::memory_order_release);
+            return;
         }
 
         if (!have_peer || !have_start) continue;
@@ -342,15 +441,22 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
             if (completed_at_ns == 0) {
                 completed_at_ns = t;
                 idle_at_completion = idle;
-            } else if (t - completed_at_ns > kCloseGraceNs ||
-                      idle - idle_at_completion >= kQuietIdleTicks) {
-                res->end_ns.store(now_ns());
+                // The transfer's own duration ends here, not after the
+                // linger below, so the reported throughput isn't diluted by it.
+                res->end_ns.store(t);
+            }
+            // The sender's "finished" close means it has every Ack it needs:
+            // leave now. Otherwise linger, as before, in case our Acks were
+            // lost and the sender is still waiting for one.
+            if (peer_finished) break;
+            if (t - completed_at_ns > kCloseGraceNs ||
+                idle - idle_at_completion >= kQuietIdleTicks) {
                 break;
             }
         }
     }
 
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; !peer_finished && i < 8; ++i) {
         Ack ack = rx.build_ack();
         ack.nonce = peer_nonce;
         const size_t n = encode_ack(ack, tx.data(), tx.size());
@@ -365,8 +471,9 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, const std::string &psk,
 
 // --- Sender lane ---------------------------------------------------------
 
+// `stop_all`: see recv_lane.
 void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const uint8_t *data,
-               uint64_t shard_bytes, LaneResult *res) {
+               uint64_t shard_bytes, LaneResult *res, std::atomic<bool> *stop_all) {
     UdpSocket sock;
     if (!sock.open("0.0.0.0", 0)) {
         res->status.store(static_cast<int>(TransferStatus::SocketError));
@@ -404,30 +511,55 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     ss.block_size = cfg.block_size;
     ss.total_bytes = shard_bytes;
     if (keys.enabled) std::memcpy(ss.session_salt, keys.salt, kSessionSaltLen);
-    // Fixed for the whole handshake (all 200 retries send the same nonce) so
+    // Fixed for the whole handshake (every retry sends the same nonce) so
     // any one matching Ack confirms it — but unique to this attempt at this
     // lane, so a stale Ack left over from an earlier session on this port
     // can't be mistaken for confirmation of this one.
     ss.nonce = random_nonce();
 
+    // Bounded by time (connect_timeout_ms, capped at timeout_ms), not by a
+    // retry count. This used to be 200 tries x 200 us = 40 ms in total, so
+    // any path with an RTT over 40 ms — or a receiver that took longer than
+    // that to allocate a large shard — failed the handshake with Timeout
+    // before the first Ack could possibly arrive. Retries back off from 1 ms
+    // to 200 ms so a slow path isn't flooded with StreamStarts.
     bool started = false;
-    for (int attempt = 0; attempt < 200 && !started; ++attempt) {
-        const size_t n = encode_stream_start(ss, ctl.data(), ctl.size());
-        sock.send_to(ctl.data(), n, dst);
+    const uint64_t hs_begin = now_ns();
+    const uint64_t hs_limit_ns =
+        static_cast<uint64_t>(std::min(cfg.connect_timeout_ms, cfg.timeout_ms)) * 1000000ull;
+    uint64_t resend_every_ns = 1'000'000, next_send_ns = 0;
+    while (!started) {
+        const uint64_t t = now_ns();
+        const bool cancelled = cancel_requested(cfg);
+        const bool sibling_stopped = stop_all->load(std::memory_order_acquire);
+        if (cancelled || sibling_stopped || t - hs_begin > hs_limit_ns) {
+            // The receiver may already have accepted an earlier StreamStart
+            // whose Ack we just haven't seen yet — or never seen one at all
+            // (it accepts a pre-session abort too): either way, tell it
+            // we're leaving so it doesn't wait out its own timeout.
+            send_stream_close(sock, dst, lane, ss.nonce, kStreamCloseAborted);
+            res->status.store(static_cast<int>(cancelled         ? TransferStatus::Cancelled
+                                               : sibling_stopped ? TransferStatus::PeerAborted
+                                                                 : TransferStatus::Timeout));
+            if (cancelled) stop_all->store(true, std::memory_order_release);
+            return;
+        }
+        if (t >= next_send_ns) {
+            const size_t n = encode_stream_start(ss, ctl.data(), ctl.size());
+            sock.send_to(ctl.data(), n, dst);
+            next_send_ns = t + resend_every_ns;
+            resend_every_ns = std::min<uint64_t>(resend_every_ns * 2, 200'000'000ull);
+        }
         size_t got = 0;
         if (sock.recv_from(ctl.data(), ctl.size(), &got, nullptr)) {
-            MsgType t;
-            if (peek_msg_type(ctl.data(), got, &t) && t == MsgType::Ack) {
+            MsgType mt;
+            if (peek_msg_type(ctl.data(), got, &mt) && mt == MsgType::Ack) {
                 Ack ack;
                 if (decode_ack(ctl.data(), got, &ack) && ack.nonce == ss.nonce) {
                     started = true;
                 }
             }
         }
-    }
-    if (!started) {
-        res->status.store(static_cast<int>(TransferStatus::Timeout));
-        return;
     }
 
     sock.set_nonblocking(true);
@@ -454,10 +586,30 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     const uint64_t t0 = now_ns();
     const uint64_t deadline_ns = static_cast<uint64_t>(cfg.timeout_ms) * 1000000ull;
     bool sent_last = false;
+    uint64_t acked_bytes = 0; // live progress, published through res->bytes
+
+    // Every early exit tells the receiver, so it stops at once instead of
+    // waiting out its own idle timeout.
+    const auto give_up = [&](TransferStatus st, bool tell_peer) {
+        if (tell_peer) send_stream_close(sock, dst, lane, ss.nonce, kStreamCloseAborted);
+        res->retransmits.store(retransmits);
+        res->status.store(static_cast<int>(st));
+    };
 
     res->start_ns.store(t0);
 
     for (;;) {
+        if (cancel_requested(cfg)) {
+            give_up(TransferStatus::Cancelled, true);
+            stop_all->store(true, std::memory_order_release);
+            return;
+        }
+        if (stop_all->load(std::memory_order_acquire)) {
+            // A sibling lane heard the receiver abort; make sure this lane's
+            // receiver end hears it too, in case its own copy was lost.
+            give_up(TransferStatus::PeerAborted, true);
+            return;
+        }
         cc.poll(now_ns());
         const uint64_t window = std::min<uint64_t>(kWindow, std::max<uint32_t>(4, cc.window()));
         bool did_work = false;
@@ -555,8 +707,13 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                     // input: clamp to what has actually been sent, or a
                     // forged huge value spins this loop ~2^64 times.
                     const uint64_t new_base = std::min(ack.base_seq_no, next_seq);
-                    for (uint64_t s = base; s < new_base; ++s) reg.confirm(s);
+                    for (uint64_t s = base; s < new_base; ++s) {
+                        // Count the block before confirm() frees its slot.
+                        if (const RegistrySlot *sl = reg.lookup(s)) acked_bytes += sl->payload_len;
+                        reg.confirm(s);
+                    }
                     base = new_base;
+                    res->bytes.store(acked_bytes, std::memory_order_relaxed);
                 }
                 // The receiver only updates its echoed send-time when a new
                 // highest-seq block arrives (receiver.cpp) — every
@@ -602,6 +759,17 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                     const size_t n =
                         encode_data_datagram(hdr, now_ns(), body, rtx.data(), rtx.size());
                     if (n && sock.send_to(rtx.data(), n, dst)) ++retransmits;
+                }
+            } else if (type == MsgType::StreamClose) {
+                StreamClose sc;
+                if (decode_stream_close(ctl.data(), got, &sc) && sc.nonce == ss.nonce &&
+                    sc.reason == kStreamCloseAborted) {
+                    // The receiver gave up (cancelled or timed out) and said
+                    // so: stop now rather than retransmitting at a closed
+                    // port until our own timeout.
+                    give_up(TransferStatus::PeerAborted, false);
+                    stop_all->store(true, std::memory_order_release);
+                    return;
                 }
             }
         }
@@ -674,6 +842,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             block = static_cast<uint16_t>(std::min<uint32_t>(block_ceiling, block * 2u));
         }
 
+        res->retransmits.store(retransmits, std::memory_order_relaxed);
         if (sent_last && base >= next_seq) break;
         // TransferConfig::timeout_ms is documented as "no progress for this
         // long", not a total deadline — `last_real_progress` (only moves on
@@ -681,7 +850,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
         // contract and the receiver's own idle-based timeout, instead of
         // failing a transfer that is slow but still moving.
         if (t - last_real_progress > deadline_ns) {
-            res->status.store(static_cast<int>(TransferStatus::Timeout));
+            give_up(TransferStatus::Timeout, true);
             return;
         }
         if (!did_work) {
@@ -691,6 +860,9 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     }
 
     res->end_ns.store(now_ns());
+    // Everything is acknowledged: let the receiver leave now instead of
+    // lingering to re-send Acks we no longer need.
+    send_stream_close(sock, dst, lane, ss.nonce, kStreamCloseFinished);
     res->bytes.store(shard_bytes);
     res->retransmits.store(retransmits);
     res->final_block.store(block);
@@ -710,11 +882,15 @@ int severity(TransferStatus s) {
         case TransferStatus::Ok: return 0;
         case TransferStatus::Incomplete: return 1;
         case TransferStatus::Timeout: return 2;
-        case TransferStatus::AuthFailed: return 3;
-        case TransferStatus::ResourceLimit: return 4;
-        case TransferStatus::SocketError: return 5;
-        case TransferStatus::ConfigError: return 6;
-        case TransferStatus::Unsupported: return 6;
+        // A lane that saw the peer's abort, or our own cancel, explains the
+        // others' shortfall better than their Timeout/Incomplete does.
+        case TransferStatus::PeerAborted: return 3;
+        case TransferStatus::Cancelled: return 4;
+        case TransferStatus::AuthFailed: return 5;
+        case TransferStatus::ResourceLimit: return 6;
+        case TransferStatus::SocketError: return 7;
+        case TransferStatus::ConfigError: return 8;
+        case TransferStatus::Unsupported: return 8;
     }
     return 0;
 }
@@ -726,6 +902,62 @@ TransferStatus worst(const std::vector<LaneResult> &lanes) {
         if (severity(s) > severity(st)) st = s;
     }
     return st;
+}
+
+// Joins every lane thread. While they run, and once more at the end, it
+// reports progress through cfg.on_progress from this (the caller's) thread,
+// so the callback never races the lanes or itself. `sender_total` is the
+// sender's known size; the receiver passes nullptr and learns its total
+// from the lanes' StreamStarts.
+void wait_for_lanes(const TransferConfig &cfg, std::vector<std::thread> &threads,
+                    const std::vector<LaneResult> &results, const uint64_t *sender_total) {
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+
+    const auto snapshot = [&] {
+        TransferProgress p;
+        p.lanes_total = static_cast<uint16_t>(results.size());
+        bool all_started = true;
+        uint64_t expected = 0;
+        for (const auto &r : results) {
+            p.bytes_done += r.bytes.load(std::memory_order_relaxed);
+            p.retransmits += r.retransmits.load(std::memory_order_relaxed);
+            if (r.finished.load(std::memory_order_acquire)) ++p.lanes_done;
+            if (r.started.load(std::memory_order_acquire)) {
+                expected += r.expected.load(std::memory_order_relaxed);
+            } else {
+                all_started = false;
+            }
+        }
+        p.bytes_total = sender_total ? *sender_total : (all_started ? expected : 0);
+        p.seconds = std::chrono::duration<double>(clock::now() - t0).count();
+        return p;
+    };
+
+    if (cfg.on_progress) {
+        const auto interval =
+            std::chrono::milliseconds(std::max<uint32_t>(cfg.progress_interval_ms, 10));
+        auto next = t0 + interval;
+        for (;;) {
+            bool all_done = true;
+            for (const auto &r : results) {
+                if (!r.finished.load(std::memory_order_acquire)) {
+                    all_done = false;
+                    break;
+                }
+            }
+            if (all_done) break;
+            // Short naps rather than one interval-long sleep, so returning
+            // to the caller is never delayed by up to a whole interval.
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            if (clock::now() >= next) {
+                cfg.on_progress(snapshot());
+                next = clock::now() + interval;
+            }
+        }
+    }
+    for (auto &t : threads) t.join();
+    if (cfg.on_progress) cfg.on_progress(snapshot());
 }
 
 void fill_stats(const std::vector<LaneResult> &lanes, uint64_t bytes, TransferStats *out) {
@@ -759,6 +991,8 @@ const char *to_string(TransferStatus s) {
         case TransferStatus::Incomplete: return "incomplete transfer";
         case TransferStatus::Unsupported: return "unsupported (built without crypto)";
         case TransferStatus::ResourceLimit: return "peer's claimed size could not be allocated";
+        case TransferStatus::Cancelled: return "cancelled";
+        case TransferStatus::PeerAborted: return "peer aborted the transfer";
     }
     return "unknown";
 }
@@ -788,16 +1022,20 @@ TransferStatus send_buffer(const TransferConfig &cfg, const uint8_t *data, size_
     const uint16_t lanes = cfg.lanes;
     const uint64_t shard = (len + lanes - 1) / (lanes ? lanes : 1);
     std::vector<LaneResult> results(lanes);
+    std::atomic<bool> stop_all{false};
     std::vector<std::thread> threads;
     threads.reserve(lanes);
 
     for (uint16_t i = 0; i < lanes; ++i) {
         const uint64_t off = std::min<uint64_t>(static_cast<uint64_t>(i) * shard, len);
         const uint64_t n = std::min<uint64_t>(shard, len - off);
-        threads.emplace_back(send_lane, std::cref(cfg), i, std::cref(keys), data + off, n,
-                             &results[i]);
+        threads.emplace_back([&cfg, &keys, &results, &stop_all, i, lane_data = data + off, n] {
+            send_lane(cfg, i, keys, lane_data, n, &results[i], &stop_all);
+            results[i].finished.store(true, std::memory_order_release);
+        });
     }
-    for (auto &t : threads) t.join();
+    const uint64_t total = len;
+    wait_for_lanes(cfg, threads, results, &total);
 
     fill_stats(results, len, stats);
     return worst(results);
@@ -815,14 +1053,17 @@ TransferStatus receive_buffer(const TransferConfig &cfg, std::vector<uint8_t> *o
     const uint16_t lanes = cfg.lanes;
     std::vector<std::vector<uint8_t>> shards(lanes);
     std::vector<LaneResult> results(lanes);
+    std::atomic<bool> stop_all{false};
     std::vector<std::thread> threads;
     threads.reserve(lanes);
 
     for (uint16_t i = 0; i < lanes; ++i) {
-        threads.emplace_back(recv_lane, std::cref(cfg), i, std::cref(cfg.pre_shared_key),
-                             &shards[i], &results[i]);
+        threads.emplace_back([&cfg, &shards, &results, &stop_all, i] {
+            recv_lane(cfg, i, cfg.pre_shared_key, &shards[i], &results[i], &stop_all);
+            results[i].finished.store(true, std::memory_order_release);
+        });
     }
-    for (auto &t : threads) t.join();
+    wait_for_lanes(cfg, threads, results, nullptr);
 
     uint64_t total = 0;
     for (const auto &s : shards) total += s.size();

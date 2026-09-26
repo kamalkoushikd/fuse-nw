@@ -150,4 +150,27 @@ bool decode_nack(const uint8_t *in, size_t in_len, Nack *nack) {
     return true;
 }
 
+size_t encode_stream_close(const StreamClose &sc, uint8_t *out, size_t out_cap) {
+    const size_t total = kOuterHeaderSize + 2 + 8 + 1;
+    if (out_cap < total) {
+        return 0;
+    }
+    size_t off = put_outer(out, MsgType::StreamClose);
+    off += put_u16(out + off, sc.stream_id);
+    off += put_u64(out + off, sc.nonce);
+    off += put_u8(out + off, sc.reason);
+    return off;
+}
+
+bool decode_stream_close(const uint8_t *in, size_t in_len, StreamClose *sc) {
+    size_t off = check_outer(in, in_len, MsgType::StreamClose);
+    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8 + 1) {
+        return false;
+    }
+    off += get_u16(in + off, &sc->stream_id);
+    off += get_u64(in + off, &sc->nonce);
+    off += get_u8(in + off, &sc->reason);
+    return true;
+}
+
 } // namespace fuse::proto

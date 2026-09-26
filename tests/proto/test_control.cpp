@@ -132,3 +132,27 @@ TEST(Aux, DecodeRejectsWrongType) {
     Heartbeat hb;
     EXPECT_FALSE(decode_heartbeat(buf, len, &hb));
 }
+
+TEST(Aux, StreamCloseRoundTrip) {
+    for (uint8_t reason : {kStreamCloseFinished, kStreamCloseAborted}) {
+        StreamClose sc;
+        sc.stream_id = 3;
+        sc.nonce = 0x0123456789ABCDEFULL;
+        sc.reason = reason;
+
+        uint8_t buf[64];
+        const size_t len = encode_stream_close(sc, buf, sizeof(buf));
+        ASSERT_GT(len, 0u);
+
+        StreamClose got;
+        ASSERT_TRUE(decode_stream_close(buf, len, &got));
+        EXPECT_EQ(got.stream_id, sc.stream_id);
+        EXPECT_EQ(got.nonce, sc.nonce);
+        EXPECT_EQ(got.reason, reason);
+
+        // Truncated, or a different message type, must not decode.
+        EXPECT_FALSE(decode_stream_close(buf, len - 1, &got));
+        Ack ack;
+        EXPECT_FALSE(decode_ack(buf, len, &ack));
+    }
+}
