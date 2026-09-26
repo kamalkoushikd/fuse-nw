@@ -60,6 +60,10 @@ struct StreamStart {
     // stream_base_offset <= file_total_bytes - total_bytes before using them.
     uint64_t stream_base_offset = 0;
     uint64_t file_total_bytes   = 0;
+    // v7: identifies the file being sent (from its name, size and
+    // modification time), so a receiver holding a partial copy can tell
+    // whether it belongs to this file. 0 = not a file / don't resume.
+    uint64_t file_id = 0;
 };
 
 struct Ack {
@@ -90,6 +94,36 @@ struct StreamClose {
     uint8_t  reason    = kStreamCloseFinished;
 };
 
+// Resume (v7): the receiver's answer to StreamStart, listing the byte
+// ranges of this stream (stream-relative offsets) it still needs. A long
+// list is split into `parts` datagrams; the sender waits for all of them.
+inline constexpr uint8_t  kResumeFlagResumed = 0x01; // continuing an earlier partial transfer
+inline constexpr uint16_t kMaxResumeRangesPerMsg = 64; // keeps one part ~1 KB, under any MTU
+
+struct ResumeRange {
+    uint64_t offset = 0;
+    uint64_t length = 0;
+};
+
+struct ResumeRanges {
+    uint16_t stream_id = 0;
+    uint64_t nonce     = 0; // echoes the StreamStart nonce
+    uint8_t  flags     = 0;
+    uint16_t part      = 0; // 0-based index of this datagram
+    uint16_t parts     = 1; // how many datagrams make up the whole list
+    uint16_t count     = 0; // ranges in this datagram
+    ResumeRange ranges[kMaxResumeRangesPerMsg] = {};
+};
+
+// Resume (v7): whole-file digest at the end of a resumed transfer.
+inline constexpr size_t kDigestLen = 32;
+
+struct DigestMessage {
+    uint16_t stream_id = 0;
+    uint64_t nonce     = 0;
+    uint8_t  digest[kDigestLen] = {};
+};
+
 // Encode helpers return the datagram length written, or 0 if out_cap is
 // too small. Decode helpers return true on success, false on version
 // mismatch, wrong msg_type, or truncation.
@@ -108,6 +142,12 @@ bool   decode_nack(const uint8_t *in, size_t in_len, Nack *nack);
 
 size_t encode_stream_close(const StreamClose &sc, uint8_t *out, size_t out_cap);
 bool   decode_stream_close(const uint8_t *in, size_t in_len, StreamClose *sc);
+
+size_t encode_resume_ranges(const ResumeRanges &rr, uint8_t *out, size_t out_cap);
+bool   decode_resume_ranges(const uint8_t *in, size_t in_len, ResumeRanges *rr);
+
+size_t encode_digest(const DigestMessage &dm, uint8_t *out, size_t out_cap);
+bool   decode_digest(const uint8_t *in, size_t in_len, DigestMessage *dm);
 
 // Largest aux datagram: a full-window NACK. Used to size receive buffers.
 inline constexpr size_t kMaxAuxDatagramSize =

@@ -54,7 +54,8 @@ TEST(Wire, HeaderSizesMatchSpec) {
     // key depends on randomness the client alone can never determine.
     // v6 added stream_base_offset/file_total_bytes to StreamStart so a
     // receiver can write each block straight to its place in the output.
-    EXPECT_EQ(kProtocolVersion, 6u);
+    // v7 added resume: file_id in StreamStart, ResumeRanges and FileDigest.
+    EXPECT_EQ(kProtocolVersion, 7u);
 
     // The MTU-safe default stays well under a 1500-byte path MTU; the
     // ceiling is only reached by probing a link that proves it can take it.

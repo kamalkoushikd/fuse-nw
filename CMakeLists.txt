@@ -132,6 +132,7 @@ add_library(fuse_proto
     src/proto/dtls.cpp
     src/proto/orchestrator.cpp
     src/proto/session_crypto.cpp
+    src/proto/digest.cpp
     src/proto/transfer.cpp
     src/proto/mux_transfer.cpp
     src/proto/sdk.cpp

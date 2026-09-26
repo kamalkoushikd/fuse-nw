@@ -44,6 +44,10 @@ int main(int argc, char **argv) {
         return quickstart::exit_code_for(st);
     }
 
+    if (stats.resumed_bytes > 0) {
+        std::printf("resumed: %.1f MiB were already at the receiver; sent only the rest\n",
+                    static_cast<double>(stats.resumed_bytes) / (1024.0 * 1024.0));
+    }
     std::printf("sent %llu bytes in %.3f s (%.1f MB/s), %llu retransmits, block=%u\n",
                 static_cast<unsigned long long>(stats.bytes), stats.seconds,
                 stats.throughput_mb_per_s(),
