@@ -125,6 +125,12 @@ struct TransferConfig {
     // * 16.6 KB — about 51 MB with the defaults and 4 lanes.
     uint16_t writer_threads = 2;
     uint32_t ring_slots = 256;
+
+    // Receiver only (receive_file): how often to save resume progress into
+    // the .part file, in milliseconds. It is also saved whenever a transfer
+    // ends without completing. 0 = only then. Each save syncs the data
+    // written so far, so on a slow disk a longer interval costs less.
+    uint32_t resume_checkpoint_ms = 1000;
 };
 
 enum class TransferStatus {
@@ -139,6 +145,7 @@ enum class TransferStatus {
     Cancelled,     // TransferConfig::cancel was set on this side
     PeerAborted,   // the other side cancelled or gave up and said so
     IoError,       // receiver: writing the output failed (disk full, permissions, ...)
+    VerifyFailed,  // receiver: a resumed file didn't match the sender's digest
 };
 
 // Human-readable form, for logs and error messages.
@@ -150,6 +157,10 @@ struct TransferStats {
     uint64_t auth_failures = 0;
     double seconds = 0.0;
     uint16_t final_block_size = 0; // what the adaptive sizing settled on
+    // Resume: bytes that didn't need sending because the receiver kept them
+    // from an earlier, interrupted run (0 for a fresh transfer). `bytes` is
+    // what this run actually moved.
+    uint64_t resumed_bytes = 0;
 
     double throughput_mb_per_s() const {
         return seconds > 0.0 ? (static_cast<double>(bytes) / (1024.0 * 1024.0)) / seconds : 0.0;
@@ -170,9 +181,19 @@ TransferStatus receive_buffer(const TransferConfig &config, std::vector<uint8_t>
 // first, so it is not suitable for files larger than available RAM.
 //
 // receive_file writes blocks to disk as they arrive, into "<path>.part",
-// and only renames that to <path> once every byte is in and synced. On any
-// failure (including Cancelled/PeerAborted) the .part file is removed and
-// <path> is left untouched.
+// and only renames that to <path> once every byte is in and synced. <path>
+// itself is never touched by a failed transfer.
+//
+// RESUME. A transfer made with send_file -> receive_file that stops early
+// (Ctrl+C, a dropped connection, a crash) keeps "<path>.part" together with
+// a record of which parts of the file it already holds. Running the same
+// two commands again — same file, same output path — sends only the missing
+// parts, then verifies the whole file against a digest from the sender
+// before renaming it into place (VerifyFailed discards the partial copy, so
+// the next run starts over). If the file changed in between (different
+// name, size or modification time), the transfer simply starts over.
+// Delete the .part file to force a fresh start. send_buffer/receive_buffer
+// never resume.
 TransferStatus send_file(const TransferConfig &config, const std::string &path,
                          TransferStats *stats = nullptr);
 TransferStatus receive_file(const TransferConfig &config, const std::string &path,

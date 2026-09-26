@@ -53,7 +53,7 @@ bool decode_heartbeat(const uint8_t *in, size_t in_len, Heartbeat *hb) {
 }
 
 size_t encode_stream_start(const StreamStart &ss, uint8_t *out, size_t out_cap) {
-    const size_t total = kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8 + 8 + 8;
+    const size_t total = kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8 + 8 + 8 + 8;
     if (out_cap < total) {
         return 0;
     }
@@ -67,12 +67,13 @@ size_t encode_stream_start(const StreamStart &ss, uint8_t *out, size_t out_cap) 
     off += put_u64(out + off, ss.nonce);
     off += put_u64(out + off, ss.stream_base_offset);
     off += put_u64(out + off, ss.file_total_bytes);
+    off += put_u64(out + off, ss.file_id);
     return off;
 }
 
 bool decode_stream_start(const uint8_t *in, size_t in_len, StreamStart *ss) {
     size_t off = check_outer(in, in_len, MsgType::StreamStart);
-    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8 + 8 + 8) {
+    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8 + 8 + 8 + 8) {
         return false;
     }
     off += get_u16(in + off, &ss->stream_id);
@@ -84,6 +85,7 @@ bool decode_stream_start(const uint8_t *in, size_t in_len, StreamStart *ss) {
     off += get_u64(in + off, &ss->nonce);
     off += get_u64(in + off, &ss->stream_base_offset);
     off += get_u64(in + off, &ss->file_total_bytes);
+    off += get_u64(in + off, &ss->file_id);
     return true;
 }
 
@@ -174,6 +176,77 @@ bool decode_stream_close(const uint8_t *in, size_t in_len, StreamClose *sc) {
     off += get_u16(in + off, &sc->stream_id);
     off += get_u64(in + off, &sc->nonce);
     off += get_u8(in + off, &sc->reason);
+    return true;
+}
+
+namespace {
+constexpr size_t kResumeRangesFixed = kOuterHeaderSize + 2 + 8 + 1 + 2 + 2 + 2;
+}
+
+size_t encode_resume_ranges(const ResumeRanges &rr, uint8_t *out, size_t out_cap) {
+    if (rr.count > kMaxResumeRangesPerMsg || rr.parts == 0 || rr.part >= rr.parts) {
+        return 0;
+    }
+    const size_t total = kResumeRangesFixed + static_cast<size_t>(rr.count) * 16;
+    if (out_cap < total) {
+        return 0;
+    }
+    size_t off = put_outer(out, MsgType::ResumeRanges);
+    off += put_u16(out + off, rr.stream_id);
+    off += put_u64(out + off, rr.nonce);
+    off += put_u8(out + off, rr.flags);
+    off += put_u16(out + off, rr.part);
+    off += put_u16(out + off, rr.parts);
+    off += put_u16(out + off, rr.count);
+    for (uint16_t i = 0; i < rr.count; ++i) {
+        off += put_u64(out + off, rr.ranges[i].offset);
+        off += put_u64(out + off, rr.ranges[i].length);
+    }
+    return off;
+}
+
+bool decode_resume_ranges(const uint8_t *in, size_t in_len, ResumeRanges *rr) {
+    size_t off = check_outer(in, in_len, MsgType::ResumeRanges);
+    if (off == 0 || in_len < kResumeRangesFixed) {
+        return false;
+    }
+    off += get_u16(in + off, &rr->stream_id);
+    off += get_u64(in + off, &rr->nonce);
+    off += get_u8(in + off, &rr->flags);
+    off += get_u16(in + off, &rr->part);
+    off += get_u16(in + off, &rr->parts);
+    off += get_u16(in + off, &rr->count);
+    if (rr->count > kMaxResumeRangesPerMsg || rr->parts == 0 || rr->part >= rr->parts ||
+        in_len < kResumeRangesFixed + static_cast<size_t>(rr->count) * 16) {
+        return false;
+    }
+    for (uint16_t i = 0; i < rr->count; ++i) {
+        off += get_u64(in + off, &rr->ranges[i].offset);
+        off += get_u64(in + off, &rr->ranges[i].length);
+    }
+    return true;
+}
+
+size_t encode_digest(const DigestMessage &dm, uint8_t *out, size_t out_cap) {
+    const size_t total = kOuterHeaderSize + 2 + 8 + kDigestLen;
+    if (out_cap < total) {
+        return 0;
+    }
+    size_t off = put_outer(out, MsgType::FileDigest);
+    off += put_u16(out + off, dm.stream_id);
+    off += put_u64(out + off, dm.nonce);
+    std::memcpy(out + off, dm.digest, kDigestLen);
+    return off + kDigestLen;
+}
+
+bool decode_digest(const uint8_t *in, size_t in_len, DigestMessage *dm) {
+    size_t off = check_outer(in, in_len, MsgType::FileDigest);
+    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8 + kDigestLen) {
+        return false;
+    }
+    off += get_u16(in + off, &dm->stream_id);
+    off += get_u64(in + off, &dm->nonce);
+    std::memcpy(dm->digest, in + off, kDigestLen);
     return true;
 }
 

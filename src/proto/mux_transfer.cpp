@@ -69,11 +69,12 @@ int severity(TransferStatus s) {
         case TransferStatus::PeerAborted: return 3;
         case TransferStatus::Cancelled: return 4;
         case TransferStatus::AuthFailed: return 5;
-        case TransferStatus::ResourceLimit: return 6;
-        case TransferStatus::IoError: return 7;
-        case TransferStatus::SocketError: return 8;
-        case TransferStatus::ConfigError: return 9;
-        case TransferStatus::Unsupported: return 9;
+        case TransferStatus::VerifyFailed: return 6;
+        case TransferStatus::ResourceLimit: return 7;
+        case TransferStatus::IoError: return 8;
+        case TransferStatus::SocketError: return 9;
+        case TransferStatus::ConfigError: return 10;
+        case TransferStatus::Unsupported: return 10;
     }
     return 0;
 }
