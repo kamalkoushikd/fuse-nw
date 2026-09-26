@@ -38,7 +38,12 @@ namespace fuse::proto {
 // raise kMaxWindow from 255 to 1024 in-flight blocks per stream. A window
 // that small was the ceiling on throughput over any link with real
 // bandwidth-delay product; the wire field simply couldn't express more.
-inline constexpr uint8_t  kProtocolVersion = 5;
+//
+// v6 added stream_base_offset and file_total_bytes to StreamStart so a
+// receiver can write each block straight to its final place in the output
+// file as it arrives, instead of buffering every stream in memory and
+// stitching them together at the end.
+inline constexpr uint8_t  kProtocolVersion = 6;
 
 // The default block payload (kDefaultPayloadSize) sits under a typical
 // 1500-byte path MTU once the datagram's own headers are accounted for, so

@@ -114,6 +114,17 @@ struct TransferConfig {
     // its own; keep it short and don't throw from it.
     std::function<void(const TransferProgress &)> on_progress;
     uint32_t progress_interval_ms = 250;
+
+    // Receiver only: the write pipeline. Each lane's socket thread hands
+    // arriving blocks to `writer_threads` writer threads (plus one thread
+    // for retransmitted blocks) through lock-free single-producer /
+    // single-consumer rings of `ring_slots` packets each; the writers
+    // decrypt and write each block straight to its place in the output as
+    // it arrives, so receive_file never holds the file in memory.
+    // Ring memory is roughly (lanes * writer_threads + lanes) * ring_slots
+    // * 16.6 KB — about 51 MB with the defaults and 4 lanes.
+    uint16_t writer_threads = 2;
+    uint32_t ring_slots = 256;
 };
 
 enum class TransferStatus {
@@ -127,6 +138,7 @@ enum class TransferStatus {
     ResourceLimit, // peer's claimed transfer size could not be allocated
     Cancelled,     // TransferConfig::cancel was set on this side
     PeerAborted,   // the other side cancelled or gave up and said so
+    IoError,       // receiver: writing the output failed (disk full, permissions, ...)
 };
 
 // Human-readable form, for logs and error messages.
@@ -156,6 +168,11 @@ TransferStatus receive_buffer(const TransferConfig &config, std::vector<uint8_t>
 
 // File convenience wrappers. send_file reads the whole file into memory
 // first, so it is not suitable for files larger than available RAM.
+//
+// receive_file writes blocks to disk as they arrive, into "<path>.part",
+// and only renames that to <path> once every byte is in and synced. On any
+// failure (including Cancelled/PeerAborted) the .part file is removed and
+// <path> is left untouched.
 TransferStatus send_file(const TransferConfig &config, const std::string &path,
                          TransferStats *stats = nullptr);
 TransferStatus receive_file(const TransferConfig &config, const std::string &path,
