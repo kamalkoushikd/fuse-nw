@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <cstring>
+
 #include "fuse/proto/control.hpp"
 
 using namespace fuse::proto;
@@ -164,4 +166,53 @@ TEST(Aux, StreamCloseRoundTrip) {
         Ack ack;
         EXPECT_FALSE(decode_ack(buf, len, &ack));
     }
+}
+
+TEST(Aux, ResumeRangesRoundTrip) {
+    ResumeRanges rr;
+    rr.stream_id = 2;
+    rr.nonce = 0x1122334455667788ULL;
+    rr.flags = kResumeFlagResumed;
+    rr.part = 1;
+    rr.parts = 3;
+    rr.count = kMaxResumeRangesPerMsg;
+    for (uint16_t i = 0; i < rr.count; ++i) rr.ranges[i] = {i * 131072ULL, 65536ULL + i};
+
+    uint8_t buf[2048];
+    const size_t len = encode_resume_ranges(rr, buf, sizeof(buf));
+    ASSERT_GT(len, 0u);
+    EXPECT_LT(len, 1200u) << "a full part must still fit a normal MTU";
+
+    ResumeRanges got;
+    ASSERT_TRUE(decode_resume_ranges(buf, len, &got));
+    EXPECT_EQ(got.stream_id, rr.stream_id);
+    EXPECT_EQ(got.nonce, rr.nonce);
+    EXPECT_EQ(got.flags, rr.flags);
+    EXPECT_EQ(got.part, rr.part);
+    EXPECT_EQ(got.parts, rr.parts);
+    ASSERT_EQ(got.count, rr.count);
+    for (uint16_t i = 0; i < rr.count; ++i) {
+        EXPECT_EQ(got.ranges[i].offset, rr.ranges[i].offset);
+        EXPECT_EQ(got.ranges[i].length, rr.ranges[i].length);
+    }
+    EXPECT_FALSE(decode_resume_ranges(buf, len - 1, &got)) << "truncated";
+
+    // A part index outside the declared count is refused both ways.
+    rr.part = 3;
+    EXPECT_EQ(encode_resume_ranges(rr, buf, sizeof(buf)), 0u);
+}
+
+TEST(Aux, DigestMessageRoundTrip) {
+    DigestMessage dm;
+    dm.stream_id = 0;
+    dm.nonce = 42;
+    for (size_t i = 0; i < kDigestLen; ++i) dm.digest[i] = static_cast<uint8_t>(i * 7);
+    uint8_t buf[128];
+    const size_t len = encode_digest(dm, buf, sizeof(buf));
+    ASSERT_GT(len, 0u);
+    DigestMessage got;
+    ASSERT_TRUE(decode_digest(buf, len, &got));
+    EXPECT_EQ(got.nonce, dm.nonce);
+    EXPECT_EQ(0, std::memcmp(got.digest, dm.digest, kDigestLen));
+    EXPECT_FALSE(decode_digest(buf, len - 1, &got));
 }

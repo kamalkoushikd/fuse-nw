@@ -40,6 +40,7 @@ add_executable(fuse_proto_tests
     proto/test_mux_transfer.cpp
     proto/test_sdk.cpp
     proto/test_spsc_ring.cpp
+    proto/test_digest.cpp
 )
 
 target_link_libraries(fuse_proto_tests PRIVATE fuse::proto GTest::gtest_main)

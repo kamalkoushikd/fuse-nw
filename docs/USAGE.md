@@ -104,6 +104,20 @@ Both calls block until the transfer completes or fails. Everything
 underneath — sharding, batched syscalls, adaptive block sizing,
 retransmission, congestion control — is handled for you.
 
+`receive_file` writes blocks to `<output>.part` as they arrive and renames it
+to `<output>` only once the whole file is in and synced, so `<output>` is
+never left half-written.
+
+**Resuming an interrupted transfer.** If a file transfer stops part-way
+(Ctrl+C, a dropped connection, a crash on either side), the receiver keeps
+`<output>.part` together with a record of what it already has. Run the same
+`send_file` and `receive_file` again — same input file, same output path —
+and only the missing parts are sent; the whole file is then checked against
+a digest from the sender before it is put in place. If the input file
+changed in the meantime (name, size or modification time), the transfer
+starts over automatically. To force a fresh start, delete `<output>.part`.
+`send_buffer`/`receive_buffer` don't resume.
+
 ## 5. Encryption
 
 Set a pre-shared key on **both** ends:
@@ -159,6 +173,11 @@ own hardware rather than trusting a fixed number.
 | `Timeout` | peer never started, went away, or the link stalled |
 | `Incomplete` | finished without delivering every byte |
 | `Unsupported` | encryption requested from a build without crypto |
+| `Cancelled` | `TransferConfig::cancel` was set on this side (e.g. Ctrl+C) |
+| `PeerAborted` | the other side cancelled or gave up, and said so |
+| `IoError` | the receiver couldn't write its output (disk full, permissions) |
+| `VerifyFailed` | a resumed file didn't match the sender's digest; the partial copy was discarded, so running again starts fresh |
+| `ResourceLimit` | the sender claimed a size the receiver couldn't allocate |
 
 `fuse::to_string(status)` gives a printable form.
 

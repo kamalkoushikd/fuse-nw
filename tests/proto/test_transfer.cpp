@@ -320,6 +320,22 @@ void send_ack(UdpSocket &s, const PeerAddr &to, uint64_t nonce) {
     s.send_to(buf, n, to);
 }
 
+// Completes the sender's side of the handshake as a real receiver would:
+// Ack its StreamStart and answer that it needs the whole lane.
+void accept_stream(UdpSocket &s, const PeerAddr &to, const StreamStart &ss) {
+    send_ack(s, to, ss.nonce);
+    ResumeRanges rr;
+    rr.stream_id = ss.stream_id;
+    rr.nonce = ss.nonce;
+    if (ss.total_bytes > 0) {
+        rr.count = 1;
+        rr.ranges[0] = {0, ss.total_bytes};
+    }
+    uint8_t buf[2048];
+    const size_t n = encode_resume_ranges(rr, buf, sizeof(buf));
+    s.send_to(buf, n, to);
+}
+
 void send_close(UdpSocket &s, const PeerAddr &to, uint64_t nonce, uint8_t reason) {
     StreamClose sc;
     sc.nonce = nonce;
@@ -457,7 +473,7 @@ TEST(Transfer, SenderCancelTellsReceiverAndReturnsPromptly) {
     ASSERT_GT(n, 0u);
     StreamStart ss;
     ASSERT_TRUE(decode_stream_start(buf, n, &ss));
-    fakepeer::send_ack(fake_rx, sender_addr, ss.nonce);
+    fakepeer::accept_stream(fake_rx, sender_addr, ss);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     const auto cancelled_at = fakepeer::Clock::now();
@@ -585,7 +601,7 @@ TEST(Transfer, SlowHandshakeSucceedsAndPeerAbortEndsSender) {
     ASSERT_TRUE(decode_stream_start(buf, n, &ss));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    fakepeer::send_ack(fake_rx, sender_addr, ss.nonce);
+    fakepeer::accept_stream(fake_rx, sender_addr, ss);
     // Wait until data is flowing, i.e. the handshake really completed.
     ASSERT_GT(fakepeer::wait_for(fake_rx, MsgType::Data, buf, sizeof(buf), 3000), 0u);
 
@@ -928,6 +944,196 @@ TEST(Transfer, InconsistentStreamStartIsRejected) {
     cancel.store(true);
     receiver.join();
     EXPECT_EQ(rs, fuse::TransferStatus::Cancelled) << fuse::to_string(rs);
+}
+
+// --- Resume ----------------------------------------------------------------
+
+namespace resume_test {
+
+namespace fs = std::filesystem;
+
+void write_file(const fs::path &p, const std::vector<uint8_t> &data) {
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(data.size()));
+}
+
+fuse::TransferConfig receiver_config(uint16_t port) {
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = port;
+    rx.lanes = 4;
+    rx.timeout_ms = 20000;
+    return rx;
+}
+
+struct Run {
+    fuse::TransferStatus send = fuse::TransferStatus::Incomplete;
+    fuse::TransferStatus recv = fuse::TransferStatus::Incomplete;
+    fuse::TransferStats send_stats, recv_stats;
+};
+
+// send_file(in) -> receive_file(out), start to finish.
+Run transfer(const fs::path &in, const fs::path &out) {
+    Run r;
+    const fuse::TransferConfig rx = receiver_config(next_port());
+    fuse::TransferConfig tx = rx;
+    tx.host = "127.0.0.1";
+    std::thread receiver([&] { r.recv = fuse::receive_file(rx, out.string(), &r.recv_stats); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    r.send = fuse::send_file(tx, in.string(), &r.send_stats);
+    receiver.join();
+    return r;
+}
+
+// Starts send_file(in) -> receive_file(out) and stops the receiver once
+// about 30% has arrived, leaving a resumable <out>.part — exactly what a
+// Ctrl+C or a dropped connection mid-transfer leaves. False if the transfer
+// finished before the cancel could land (nothing to resume then).
+bool interrupt_midway(const fs::path &in, const fs::path &out, uint64_t size) {
+    std::atomic<bool> cancel{false};
+    fuse::TransferConfig rx = receiver_config(next_port());
+    rx.cancel = &cancel;
+    rx.progress_interval_ms = 10;
+    rx.on_progress = [&](const fuse::TransferProgress &p) {
+        if (p.bytes_done >= size * 3 / 10) cancel.store(true);
+    };
+    fuse::TransferConfig tx = receiver_config(rx.base_port);
+    tx.host = "127.0.0.1";
+
+    fuse::TransferStatus rs = fuse::TransferStatus::Ok;
+    std::thread receiver([&] { rs = fuse::receive_file(rx, out.string(), nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    fuse::send_file(tx, in.string(), nullptr);
+    receiver.join();
+    return rs == fuse::TransferStatus::Cancelled && fs::exists(out.string() + ".part");
+}
+
+} // namespace resume_test
+
+// The whole point: an interrupted transfer, run again, sends only what's
+// missing and still produces the exact file.
+TEST(Transfer, ResumeSendsOnlyTheMissingPart) {
+    namespace fs = std::filesystem;
+    const auto payload = make_payload(96 * 1024 * 1024 + 4321);
+    const fs::path in = pipeline_test::temp_path("resume_in.bin");
+    const fs::path out = pipeline_test::temp_path("resume_out.bin");
+    resume_test::write_file(in, payload);
+
+    if (!resume_test::interrupt_midway(in, out, payload.size())) {
+        fs::remove(in);
+        GTEST_SKIP() << "the transfer finished before it could be interrupted";
+    }
+    // Interrupted: no result yet, but a .part holding the progress so far
+    // (data plus the resume trailer after it).
+    EXPECT_FALSE(fs::exists(out));
+    EXPECT_GT(fs::file_size(out.string() + ".part"), payload.size());
+
+    const auto r = resume_test::transfer(in, out);
+    ASSERT_EQ(r.send, fuse::TransferStatus::Ok) << fuse::to_string(r.send);
+    ASSERT_EQ(r.recv, fuse::TransferStatus::Ok) << fuse::to_string(r.recv);
+    EXPECT_EQ(pipeline_test::read_all(out), payload);
+    EXPECT_FALSE(fs::exists(out.string() + ".part"));
+    EXPECT_EQ(fs::file_size(out), payload.size()) << "the resume trailer must be cut off";
+
+    // Only the missing part crossed the network the second time.
+    EXPECT_GT(r.recv_stats.resumed_bytes, 0u);
+    EXPECT_EQ(r.send_stats.resumed_bytes, r.recv_stats.resumed_bytes);
+    EXPECT_EQ(r.send_stats.bytes + r.send_stats.resumed_bytes, payload.size());
+    EXPECT_LT(r.send_stats.bytes, payload.size());
+    fs::remove(in);
+    fs::remove(out);
+}
+
+// A partial copy of a *different* file (here: same name and size, new
+// contents and timestamp) must not be reused.
+TEST(Transfer, ResumeIgnoresPartialCopyOfAChangedFile) {
+    namespace fs = std::filesystem;
+    auto payload = make_payload(96 * 1024 * 1024);
+    const fs::path in = pipeline_test::temp_path("changed_in.bin");
+    const fs::path out = pipeline_test::temp_path("changed_out.bin");
+    resume_test::write_file(in, payload);
+    if (!resume_test::interrupt_midway(in, out, payload.size())) {
+        fs::remove(in);
+        GTEST_SKIP() << "the transfer finished before it could be interrupted";
+    }
+
+    for (auto &b : payload) b = static_cast<uint8_t>(b ^ 0x5A);
+    resume_test::write_file(in, payload);
+    fs::last_write_time(in, fs::last_write_time(in) + std::chrono::seconds(5));
+
+    const auto r = resume_test::transfer(in, out);
+    ASSERT_EQ(r.recv, fuse::TransferStatus::Ok) << fuse::to_string(r.recv);
+    EXPECT_EQ(r.recv_stats.resumed_bytes, 0u) << "resumed from another file's partial copy";
+    EXPECT_EQ(pipeline_test::read_all(out), payload);
+    fs::remove(in);
+    fs::remove(out);
+}
+
+// A damaged resume record (torn write, disk error) means starting over,
+// never trusting it.
+TEST(Transfer, ResumeIgnoresCorruptTrailer) {
+    namespace fs = std::filesystem;
+    const auto payload = make_payload(96 * 1024 * 1024);
+    const fs::path in = pipeline_test::temp_path("trailer_in.bin");
+    const fs::path out = pipeline_test::temp_path("trailer_out.bin");
+    resume_test::write_file(in, payload);
+    if (!resume_test::interrupt_midway(in, out, payload.size())) {
+        fs::remove(in);
+        GTEST_SKIP() << "the transfer finished before it could be interrupted";
+    }
+    {
+        // Flip one bit of the resume bitmap (just after the data).
+        std::fstream f(out.string() + ".part", std::ios::in | std::ios::out | std::ios::binary);
+        f.seekg(static_cast<std::streamoff>(payload.size()));
+        char c = 0;
+        f.read(&c, 1);
+        c = static_cast<char>(c ^ 0x01);
+        f.seekp(static_cast<std::streamoff>(payload.size()));
+        f.write(&c, 1);
+    }
+
+    const auto r = resume_test::transfer(in, out);
+    ASSERT_EQ(r.recv, fuse::TransferStatus::Ok) << fuse::to_string(r.recv);
+    EXPECT_EQ(r.recv_stats.resumed_bytes, 0u) << "resumed from a corrupt record";
+    EXPECT_EQ(pipeline_test::read_all(out), payload);
+    fs::remove(in);
+    fs::remove(out);
+}
+
+// If data kept from the earlier session is wrong (say the disk corrupted
+// it), the whole-file digest catches it: the result is refused, the partial
+// copy discarded, and the next run starts clean.
+TEST(Transfer, ResumeVerifiesTheWholeFile) {
+    namespace fs = std::filesystem;
+    const auto payload = make_payload(96 * 1024 * 1024);
+    const fs::path in = pipeline_test::temp_path("verify_in.bin");
+    const fs::path out = pipeline_test::temp_path("verify_out.bin");
+    resume_test::write_file(in, payload);
+    if (!resume_test::interrupt_midway(in, out, payload.size())) {
+        fs::remove(in);
+        GTEST_SKIP() << "the transfer finished before it could be interrupted";
+    }
+    {
+        // Corrupt the first byte of the file: lane 0's first chunk, which is
+        // among the first written, so it is marked complete and kept.
+        std::fstream f(out.string() + ".part", std::ios::in | std::ios::out | std::ios::binary);
+        char c = static_cast<char>(payload[0] ^ 0xFF);
+        f.seekp(0);
+        f.write(&c, 1);
+    }
+
+    const auto bad = resume_test::transfer(in, out);
+    EXPECT_EQ(bad.recv, fuse::TransferStatus::VerifyFailed) << fuse::to_string(bad.recv);
+    EXPECT_GT(bad.recv_stats.resumed_bytes, 0u);
+    EXPECT_FALSE(fs::exists(out)) << "an unverified file must never be put in place";
+    EXPECT_FALSE(fs::exists(out.string() + ".part")) << "a copy that failed verification must go";
+
+    const auto good = resume_test::transfer(in, out);
+    ASSERT_EQ(good.recv, fuse::TransferStatus::Ok) << fuse::to_string(good.recv);
+    EXPECT_EQ(good.recv_stats.resumed_bytes, 0u);
+    EXPECT_EQ(pipeline_test::read_all(out), payload);
+    fs::remove(in);
+    fs::remove(out);
 }
 
 TEST(Transfer, RejectsBadConfiguration) {

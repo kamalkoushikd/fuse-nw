@@ -43,7 +43,11 @@ namespace fuse::proto {
 // receiver can write each block straight to its final place in the output
 // file as it arrives, instead of buffering every stream in memory and
 // stitching them together at the end.
-inline constexpr uint8_t  kProtocolVersion = 6;
+//
+// v7 added resume: StreamStart carries a file_id, the receiver answers with
+// ResumeRanges (what it still needs), and a resumed transfer ends with a
+// whole-file FileDigest.
+inline constexpr uint8_t  kProtocolVersion = 7;
 
 // The default block payload (kDefaultPayloadSize) sits under a typical
 // 1500-byte path MTU once the datagram's own headers are accounted for, so
@@ -87,6 +91,15 @@ enum class MsgType : uint8_t {
     // when a side gives up (cancelled, timed out). Without it the peer can
     // only learn the other end is gone by waiting out its own timeout.
     StreamClose    = 11,
+    // Resume (v7). Receiver -> sender, answering StreamStart: the byte
+    // ranges of this stream it still needs (all of it, for a fresh
+    // transfer). Split across several datagrams when the list is long.
+    ResumeRanges   = 12,
+    // Resume (v7). Sender -> receiver at the end of a resumed transfer: a
+    // digest of the whole file, so the receiver can verify that the bytes it
+    // kept from an earlier session match. The receiver echoes it back as the
+    // acknowledgement.
+    FileDigest     = 13,
 };
 
 // Block header flag bits (Stage 1.1).
