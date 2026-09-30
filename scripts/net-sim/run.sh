@@ -39,6 +39,10 @@ echo "==> bringing up fusenet + rx/tx pods (needs root once)"
 echo "    tail -f $NETSIM/.cache/logs/{rx,tx}.log in another terminal to watch it live"
 pkexec bash -c "
   set -euo pipefail
+  # Always hand the logs back to the invoking user, even if something below
+  # fails under set -e (e.g. a teardown step erroring would otherwise skip
+  # the chown that was the last line here - happened for real once).
+  trap 'chown -R $(id -u):$(id -g) \"$NETSIM/.cache/logs\" 2>/dev/null || true' EXIT
   if [ '$FORCE_BUILD' = 1 ] || ! podman image exists fuse-netsim; then
     podman build -t fuse-netsim '$NETSIM'
   fi
@@ -69,7 +73,6 @@ pkexec bash -c "
 
   podman kube down '$NETSIM/rx-pod.yaml' '$NETSIM/tx-pod.yaml' >/dev/null
   podman network rm fusenet >/dev/null
-  chown -R $(id -u):$(id -g) '$NETSIM/.cache/logs'
 "
 
 echo

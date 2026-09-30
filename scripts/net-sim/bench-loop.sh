@@ -13,6 +13,13 @@ OWNER_UID="$3"
 OWNER_GID="$4"
 CSV="$NETSIM/.cache/logs/benchmark.csv"
 
+# Always hand the logs back to the invoking user, even if something above
+# this point fails under set -e (e.g. `podman network rm` erroring leaves
+# everything root-owned and unreadable-for-write by the real user otherwise
+# - happened once already, chown was the last line with nothing to run it
+# on failure).
+trap 'chown -R "$OWNER_UID:$OWNER_GID" "$NETSIM/.cache/logs" 2>/dev/null || true' EXIT
+
 podman image exists fuse-netsim || podman build -t fuse-netsim "$NETSIM" >/dev/null
 podman image exists fuse-netsim-quic || podman build -t fuse-netsim-quic "$QUIC" >/dev/null
 podman network exists fusenet || podman network create fusenet >/dev/null
@@ -107,4 +114,3 @@ for i in $(seq 1 "$N"); do
 done
 
 podman network rm fusenet >/dev/null
-chown -R "$OWNER_UID:$OWNER_GID" "$NETSIM/.cache/logs"

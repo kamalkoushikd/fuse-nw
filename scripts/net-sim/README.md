@@ -83,6 +83,29 @@ N=100 at SIZE_MB=2048 is realistically 10-30+ minutes depending on the
 machine. `tail -f .cache/logs/benchmark.csv` in another terminal to watch
 rows land as it runs.
 
+`plot-benchmark.py <benchmark.csv> <output-dir>` turns that CSV into
+figures (box plot, histograms, empirical CDF, per-run time series,
+retransmit distribution + correlation, a mean±stdev bar chart - both `.png`
+at 300 DPI and vector `.pdf`) plus `stats.md` (means, 95% CIs, coefficient
+of variation, Pearson r). Needs `matplotlib`/`numpy` (already present here
+via pip; `dnf install python3-matplotlib python3-numpy` otherwise).
+
+### N=100 results (SIZE_MB=2048, LANES=6)
+
+| protocol | mean MB/s | stdev | 95% CI | min | max | median | p95 |
+|---|---|---|---|---|---|---|---|
+| fuse | 2533.3 | 82.9 | [2517.1, 2549.6] | 2366.9 | 2721.7 | 2533.1 | 2672.7 |
+| quic | 760.6 | 15.4 | [757.6, 763.6] | 702.6 | 794.4 | 760.6 | 784.0 |
+
+100/100 sha256-verified successful transfers for both protocols. fuse's mean
+was 3.33x QUIC's, with tighter *relative* variance (CV 3.3% vs 2.0% is close,
+but fuse's absolute spread covers a much larger range in absolute MB/s).
+fuse's retransmit count (mean 8018/run, range 4213-12009) showed essentially
+**no correlation with its own throughput** (Pearson r = -0.07) - the
+congestion control appears to absorb retransmission cost without it showing
+up as a per-run speed penalty in this range, at least on this host-local
+link.
+
 ## How it's built
 
 - **`Containerfile`**: minimal Fedora image with just `glibc`/`libstdc++`/
