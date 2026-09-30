@@ -169,7 +169,7 @@ This harness (the container-bridge rearchitecture, the QUIC comparison, the
 benchmark/plotting tooling) was built interactively with
 [Claude Code](https://claude.com/claude-code), including the debugging that
 shows up on the wiki's
-[Design Decisions](https://github.com/kamalkoushikd/fuse-nw/wiki/Design-Decisions)
+[Net-Sim Design Decisions](https://github.com/kamalkoushikd/fuse-nw/wiki/Net-Sim-Design-Decisions)
 page - the SELinux exec-permission fix, the `inet_pton`-not-DNS peer-resolution
 bug, the Caddy SNI/TLS handshake failure, and the `chown`-after-teardown
 ordering bug were all found and fixed in that session, not pre-existing
