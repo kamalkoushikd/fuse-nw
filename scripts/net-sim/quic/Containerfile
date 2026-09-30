@@ -1,0 +1,9 @@
+# QUIC comparison image: curl (HTTP/3 client, already built with ngtcp2/
+# nghttp3 in Fedora's packaged build) + caddy (HTTP/3 server, zero-config
+# TLS via `tls internal`). Both stock dnf packages - no QUIC stack compiled
+# from source. Role dispatch in entrypoint.sh, same pattern as ../Containerfile.
+FROM registry.fedoraproject.org/fedora-minimal:44
+RUN microdnf install -y curl caddy coreutils && microdnf clean all
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
