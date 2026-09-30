@@ -162,3 +162,19 @@ starting tx, and polls container state for both to reach `exited` before
 reading results - a polling loop, not an event notification. Fine at this
 scale (two containers, one run at a time); would need real synchronization
 if this ever ran many pairs concurrently.
+
+## AI assistance
+
+This harness (the container-bridge rearchitecture, the QUIC comparison, the
+benchmark/plotting tooling) was built interactively with
+[Claude Code](https://claude.com/claude-code), including the debugging that
+shows up on the wiki's
+[Design Decisions](https://github.com/kamalkoushikd/fuse-nw/wiki/Design-Decisions)
+page - the SELinux exec-permission fix, the `inet_pton`-not-DNS peer-resolution
+bug, the Caddy SNI/TLS handshake failure, and the `chown`-after-teardown
+ordering bug were all found and fixed in that session, not pre-existing
+knowledge applied from outside it. The repo owner directed the requirements
+and design tradeoffs, and personally ran every privileged command (the
+assistant's execution environment can't invoke `pkexec`, so every actual
+benchmark run behind the published numbers was executed by hand, not by the
+assistant).
