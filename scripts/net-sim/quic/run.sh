@@ -30,6 +30,7 @@ echo "==> bringing up fusenet + quic-rx/quic-tx pods (needs root once)"
 echo "    tail -f $NETSIM/.cache/logs/quic-{rx,tx}.log in another terminal to watch it live"
 pkexec bash -c "
   set -euo pipefail
+  trap 'chown -R $(id -u):$(id -g) \"$NETSIM/.cache/logs\" 2>/dev/null || true' EXIT
   if [ '$FORCE_BUILD' = 1 ] || ! podman image exists fuse-netsim-quic; then
     podman build -t fuse-netsim-quic '$QUIC'
   fi
@@ -56,7 +57,6 @@ pkexec bash -c "
 
   podman kube down '$QUIC/rx-pod.yaml' '$QUIC/tx-pod.yaml' >/dev/null
   podman network rm fusenet >/dev/null
-  chown -R $(id -u):$(id -g) '$NETSIM/.cache/logs'
 "
 
 echo
