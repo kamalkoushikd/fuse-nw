@@ -6,8 +6,11 @@ Usage: plot-benchmark.py <benchmark.csv> <output-dir>
 Writes fig1..fig7 as both .png (300 DPI, for the wiki/slides) and .pdf
 (vector, for LaTeX/Word) into <output-dir>, plus stats.md with the numbers
 behind them (means, 95% CIs, coefficient of variation, retransmit
-correlation) - the kind of detail a paper's Results section needs beyond
-what's in the figures themselves.
+correlation, Welch's t-test, Mann-Whitney U, Cohen's d) - the kind of detail
+a paper's Results section needs beyond what's in the figures themselves.
+
+Needs matplotlib/numpy/scipy (pip install matplotlib numpy scipy if not
+already present).
 """
 import csv
 import sys
@@ -18,6 +21,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy import stats as sps
 
 # Okabe-Ito colorblind-safe palette.
 COLORS = {"fuse": "#0072B2", "quic": "#D55E00"}
@@ -186,8 +190,28 @@ def write_stats(data, out_dir):
         r = float(np.corrcoef(retx, mbps)[0, 1])
         lines.append(
             f"fuse retransmits vs throughput: Pearson r = {r:.3f} "
-            f"(mean {retx.mean():.0f}, min {retx.min():.0f}, max {retx.max():.0f})\n"
+            f"(mean {retx.mean():.0f}, min {retx.min():.0f}, max {retx.max():.0f})\n\n"
         )
+
+    fuse_mbps = np.array(data["fuse"]["mbps"], dtype=float)
+    quic_mbps = np.array(data["quic"]["mbps"], dtype=float)
+    if len(fuse_mbps) > 1 and len(quic_mbps) > 1:
+        t_res = sps.ttest_ind(fuse_mbps, quic_mbps, equal_var=False)
+        u_res = sps.mannwhitneyu(fuse_mbps, quic_mbps, alternative="two-sided")
+        n1, n2 = len(fuse_mbps), len(quic_mbps)
+        s1, s2 = fuse_mbps.std(ddof=1), quic_mbps.std(ddof=1)
+        pooled_sd = np.sqrt(((n1 - 1) * s1 ** 2 + (n2 - 1) * s2 ** 2) / (n1 + n2 - 2))
+        cohens_d = (fuse_mbps.mean() - quic_mbps.mean()) / pooled_sd
+        lines.append("## Statistical significance (fuse vs QUIC throughput)\n\n")
+        lines.append(
+            f"- Welch's t-test (unequal variance): t={t_res.statistic:.2f}, "
+            f"df={t_res.df:.1f}, p={t_res.pvalue:.3e}\n"
+        )
+        lines.append(
+            f"- Mann-Whitney U (non-parametric, no normality assumption): "
+            f"U={u_res.statistic:.1f}, p={u_res.pvalue:.3e}\n"
+        )
+        lines.append(f"- Cohen's d (effect size, pooled sd): {cohens_d:.2f}\n\n")
 
     text = "".join(lines)
     (out_dir / "stats.md").write_text(text)
