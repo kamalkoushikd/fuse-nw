@@ -1,0 +1,30 @@
+# Sender side. Played with `podman kube play --network fusenet tx-pod.yaml`
+# after rx-pod.yaml (see run.sh). PEER is a literal @RX_IP@ placeholder that
+# run.sh fills in with rx's actual container IP before playing this file -
+# fuse_quickstart_send takes its peer straight into inet_pton
+# (examples/quickstart_send.cpp: `cfg.host = argv[1]`), no DNS resolution,
+# so a hostname like "rx" never works here even though aardvark-dns would
+# happily resolve it for anything else.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tx
+spec:
+  restartPolicy: Never
+  hostname: tx
+  containers:
+  - name: app
+    image: localhost/fuse-netsim:latest
+    env:
+    - {name: ROLE, value: "tx"}
+    - {name: PEER, value: "@RX_IP@"}
+    - {name: SIZE_MB, value: "2048"}
+    - {name: LANES, value: "6"}  # must match rx-pod.yaml's LANES - see its comment
+    volumeMounts:
+    - {name: payload, mountPath: /opt/fuse, readOnly: true}
+    - {name: logs, mountPath: /var/log/fuse-netsim}
+  volumes:
+  - name: payload
+    hostPath: {path: /home/wattwise/CLionProjects/fuse-nw/scripts/net-sim/.cache/payload, type: Directory}
+  - name: logs
+    hostPath: {path: /home/wattwise/CLionProjects/fuse-nw/scripts/net-sim/.cache/logs, type: DirectoryOrCreate}

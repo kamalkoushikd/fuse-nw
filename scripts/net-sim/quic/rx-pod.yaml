@@ -1,0 +1,23 @@
+# QUIC server side. Generates its own payload (HTTP is pull, not push) and
+# serves it over HTTP/3 via caddy. Never exits on its own - run.sh tears
+# this pod down once tx-pod.yaml's client finishes.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: quic-rx
+spec:
+  restartPolicy: Never
+  hostname: quic-rx
+  containers:
+  - name: app
+    image: localhost/fuse-netsim-quic:latest
+    env:
+    - {name: ROLE, value: "rx"}
+    - {name: SIZE_MB, value: "2048"}
+    volumeMounts:
+    - {name: logs, mountPath: /var/log/quic-netsim}
+  volumes:
+  - name: logs
+    # Same host dir as ../.cache/logs, different filenames (quic-rx.log /
+    # quic-tx.log) so the fuse and QUIC runs don't clobber each other.
+    hostPath: {path: /home/wattwise/CLionProjects/fuse-nw/scripts/net-sim/.cache/logs, type: DirectoryOrCreate}

@@ -1,0 +1,9 @@
+# Runner image for the net-sim containers: just enough glibc/libstdc++ to run
+# fuse's own binaries, which are bind-mounted in at /opt/fuse (see stage-bin.sh
+# and rx-pod.yaml/tx-pod.yaml) rather than baked in - so the image doesn't need
+# rebuilding after every `cmake --build`.
+FROM registry.fedoraproject.org/fedora-minimal:44
+RUN microdnf install -y glibc libstdc++ libgcc coreutils && microdnf clean all
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]

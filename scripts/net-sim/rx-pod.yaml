@@ -1,0 +1,39 @@
+# Receiver side. Played with `podman kube play --network fusenet rx-pod.yaml`
+# (see run.sh) - its own pod = its own network namespace, joined to the
+# fusenet bridge, so rx and tx are genuinely separate hosts on a real link.
+# run.sh reads back whatever IP podman assigns this pod on fusenet and
+# templates it into tx-pod.yaml's PEER before playing that one (see there -
+# fuse_quickstart_send needs a literal IP, not a name).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rx
+spec:
+  restartPolicy: Never
+  hostname: rx
+  containers:
+  - name: app
+    image: localhost/fuse-netsim:latest
+    env:
+    - {name: ROLE, value: "rx"}
+    # One std::thread per lane (src/proto/transfer.cpp: send_lane/recv_lane),
+    # no other cap - podman containers already get the full host core count
+    # by default (unlike the old QEMU harness's `-smp 4`, there's no VM to
+    # size). This is the actual throughput lever; must match tx-pod.yaml's
+    # LANES (rx listens on base_port..base_port+LANES-1, tx must send the
+    # same count). This host has 20 cores - 16 leaves headroom for the
+    # digester/checkpointer/runtime threads. Push higher and watch for
+    # diminishing returns once lanes exceed free cores.
+    - {name: LANES, value: "6"}
+    volumeMounts:
+    - {name: payload, mountPath: /opt/fuse, readOnly: true}
+    - {name: logs, mountPath: /var/log/fuse-netsim}
+  volumes:
+  - name: payload
+    # Absolute path: hostPath volumes can't reference the YAML's own
+    # location. Update this if the repo moves. Populated by stage-bin.sh.
+    hostPath: {path: /home/wattwise/CLionProjects/fuse-nw/scripts/net-sim/.cache/payload, type: Directory}
+  - name: logs
+    # Persists across the pod's lifetime - tail -f this file to watch the
+    # transfer live, no root needed even though the pod itself runs rootful.
+    hostPath: {path: /home/wattwise/CLionProjects/fuse-nw/scripts/net-sim/.cache/logs, type: DirectoryOrCreate}
