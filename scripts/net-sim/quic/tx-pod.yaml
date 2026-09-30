@@ -1,0 +1,21 @@
+# QUIC client side. PEER is a literal @RX_IP@ placeholder - same reason as
+# ../tx-pod.yaml: run.sh fills in quic-rx's real container IP before playing
+# this file (curl needs a resolvable target; nothing here relies on DNS).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: quic-tx
+spec:
+  restartPolicy: Never
+  hostname: quic-tx
+  containers:
+  - name: app
+    image: localhost/fuse-netsim-quic:latest
+    env:
+    - {name: ROLE, value: "tx"}
+    - {name: PEER, value: "@RX_IP@"}
+    volumeMounts:
+    - {name: logs, mountPath: /var/log/quic-netsim}
+  volumes:
+  - name: logs
+    hostPath: {path: /home/wattwise/CLionProjects/fuse-nw/scripts/net-sim/.cache/logs, type: DirectoryOrCreate}

@@ -1,0 +1,10 @@
+# Runner image for the net-sim pod: just qemu + iproute2. The guest kernel,
+# initramfs and disk image are bind-mounted in at run time (see pod.yaml),
+# built once on the host by ../build-guest.sh - not baked into this image,
+# so it isn't pinned to one kernel version.
+FROM registry.fedoraproject.org/fedora:44
+RUN dnf -y install --setopt=install_weak_deps=False qemu-kvm-core iproute bash \
+    && dnf clean all
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]

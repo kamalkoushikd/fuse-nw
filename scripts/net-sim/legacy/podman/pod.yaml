@@ -1,0 +1,75 @@
+# Two-VM fuse transfer test as a podman pod. Build the image and guest
+# artifacts once (see README.md), then:
+#
+#   podman kube play --network=none scripts/net-sim/podman/pod.yaml
+#   podman logs -f fuse-netsim-tx      # transfer result, once it finishes
+#   podman logs -f fuse-netsim-rx
+#   podman kube down scripts/net-sim/podman/pod.yaml
+#
+# --network=none: this pod's containers never need to reach anything outside
+# it (rx and tx only ever talk to each other, over the bridge net-setup
+# creates below) and rootless podman's default pasta networking fails to
+# even come up in this environment (unrelated to fuse - a pasta/mount-ns
+# issue) - so there's nothing to gain from the default and something to
+# dodge.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fuse-netsim
+spec:
+  restartPolicy: Never
+  initContainers:
+  - name: net-setup
+    image: localhost/fuse-netsim:latest
+    command: ["bash", "-c", "ip link show fusebr0 &>/dev/null || (ip link add fusebr0 type bridge && ip link set fusebr0 up)"]
+    securityContext:
+      capabilities:
+        add: ["NET_ADMIN"]
+      seLinuxOptions:
+        type: spc_t
+  containers:
+  - name: rx
+    image: localhost/fuse-netsim:latest
+    env:
+    - {name: FUSE_ROLE, value: "rx"}
+    - {name: FUSE_IP, value: "10.77.7.12"}
+    - {name: FUSE_LANES, value: "4"}
+    securityContext:
+      capabilities:
+        add: ["NET_ADMIN"]
+      seLinuxOptions:
+        type: spc_t
+    volumeMounts:
+    - {name: kvm, mountPath: /dev/kvm}
+    - {name: tun, mountPath: /dev/net/tun}
+    - {name: boot, mountPath: /boot}
+    - {name: cache, mountPath: /cache}
+  - name: tx
+    image: localhost/fuse-netsim:latest
+    env:
+    - {name: FUSE_ROLE, value: "tx"}
+    - {name: FUSE_IP, value: "10.77.7.11"}
+    - {name: FUSE_PEER, value: "10.77.7.12"}
+    - {name: FUSE_SIZE_MB, value: "64"}
+    - {name: FUSE_LANES, value: "4"}
+    securityContext:
+      capabilities:
+        add: ["NET_ADMIN"]
+      seLinuxOptions:
+        type: spc_t
+    volumeMounts:
+    - {name: kvm, mountPath: /dev/kvm}
+    - {name: tun, mountPath: /dev/net/tun}
+    - {name: boot, mountPath: /boot}
+    - {name: cache, mountPath: /cache}
+  volumes:
+  - name: kvm
+    hostPath: {path: /dev/kvm, type: CharDevice}
+  - name: tun
+    hostPath: {path: /dev/net/tun, type: CharDevice}
+  - name: boot
+    hostPath: {path: /boot, type: Directory}
+  - name: cache
+    # Absolute path: hostPath volumes can't reference the YAML's own
+    # location. Update this if the repo moves.
+    hostPath: {path: /home/wattwise/CLionProjects/fuse-nw/scripts/net-sim/.cache, type: Directory}
