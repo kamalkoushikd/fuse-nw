@@ -43,6 +43,6 @@ add_executable(fuse_proto_tests
     proto/test_digest.cpp
 )
 
-target_link_libraries(fuse_proto_tests PRIVATE fuse::proto GTest::gtest_main)
+target_link_libraries(fuse_proto_tests PRIVATE fuse::proto fuse::sdk GTest::gtest_main)
 
 gtest_discover_tests(fuse_proto_tests)

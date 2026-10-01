@@ -38,7 +38,7 @@ prompt on.
   and cached. Needed because your host's own initramfs is hostonly-trimmed
   for your bare-metal hardware and doesn't carry the virtio_net module.
 - **Guest rootfs**: `dnf --installroot` with `glibc`/`libstdc++`/`libgcc`/
-  `busybox`, plus fuse's own binaries + `libfuse_proto.so`/`libwolfssl.so`
+  `busybox`, plus fuse's own binaries + `libfuse_sdk.so`/`libfuse_proto.so`/`libwolfssl.so`
   copied in from your build tree. Built straight into an ext4 image via
   `mkfs.ext4 -d` - no loop-mount.
 - **Guest init**: `guest-init.sh` runs as PID 1 (`init=/init` on the kernel

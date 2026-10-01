@@ -1,4 +1,4 @@
-"""ctypes binding to libfuse_proto's C ABI (`fuse/sdk.h`).
+"""ctypes binding to libfuse_sdk's C ABI (`fuse/sdk.h`).
 
 Kept separate from the friendly API in ``__init__`` so that everything
 touching raw pointers lives in one place.
@@ -20,7 +20,7 @@ import ctypes.util
 import os
 from pathlib import Path
 
-_LIB_NAMES = ("libfuse_proto.so.0", "libfuse_proto.so")
+_LIB_NAMES = ("libfuse_sdk.so.0", "libfuse_sdk.so")
 
 _SEARCH_PREFIXES = (
     "/usr/local/lib64",
@@ -45,7 +45,7 @@ def _candidates():
     for name in _LIB_NAMES:
         yield name
 
-    found = ctypes.util.find_library("fuse_proto")
+    found = ctypes.util.find_library("fuse_sdk")
     if found:
         yield found
 
@@ -64,7 +64,7 @@ def _load():
         except OSError as exc:  # keep looking, but remember why
             tried.append(f"  {cand}: {exc}")
     raise ImportError(
-        "could not load the Fuse shared library (libfuse_proto.so).\n"
+        "could not load the Fuse shared library (libfuse_sdk.so).\n"
         "A wheel from PyPI bundles it, so this usually means the package was\n"
         "installed from source without the native build, or the wheel is for\n"
         "a different platform.\n\n"
@@ -73,7 +73,7 @@ def _load():
         "    curl -fsSL https://github.com/kamalkoushikd/fuse-nw/releases/latest/"
         "download/install.sh | sh\n"
         "    # or point at a build tree directly:\n"
-        "    export FUSE_LIBRARY=/path/to/build/libfuse_proto.so\n\n"
+        "    export FUSE_LIBRARY=/path/to/build/libfuse_sdk.so\n\n"
         "Tried:\n" + "\n".join(tried)
     )
 

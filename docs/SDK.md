@@ -148,7 +148,7 @@ or CMake:
 
 ```cmake
 find_package(fuse CONFIG REQUIRED)
-target_link_libraries(app PRIVATE fuse::proto)
+target_link_libraries(app PRIVATE fuse::sdk)
 ```
 
 ### Server
@@ -303,10 +303,10 @@ They interoperate: the Python client talks to the C server and vice versa.
 where the loader looks. Point at it directly:
 
 ```sh
-export FUSE_LIBRARY=/path/to/libfuse_proto.so
+export FUSE_LIBRARY=/path/to/libfuse_sdk.so
 ```
 
-**`cannot find -lfuse_proto`** — pkg-config is not finding a non-standard
+**`cannot find -lfuse_sdk`** — pkg-config is not finding a non-standard
 prefix:
 
 ```sh
