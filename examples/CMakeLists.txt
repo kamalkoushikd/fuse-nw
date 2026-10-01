@@ -12,5 +12,5 @@ add_executable(fuse_stage1_sender stage1_sender.cpp)
 target_link_libraries(fuse_stage1_sender PRIVATE fuse::proto)
 
 # The ergonomic send/recv examples (quickstart, SDK echo) moved to the
-# fuse-sdk repo along with fuse/sdk.h and fuse/transfer.hpp — this repo's
+# fuse-sdk repo along with fuse/sdk.h and fuse/transfer.hpp. This repo's
 # own examples stay protocol-level, matching what it actually installs.

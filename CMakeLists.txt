@@ -183,7 +183,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 # The ergonomic send/recv API (fuse/sdk.h) and the transfer helpers built on
-# it (fuse/transfer.hpp, fuse/mux_transfer.hpp) — kept as a separate target
+# it (fuse/transfer.hpp, fuse/mux_transfer.hpp), kept as a separate target
 # from fuse_proto so the wire protocol and the application-facing API can be
 # consumed (and eventually versioned) independently. Also developed in its
 # own repo, https://github.com/kamalkoushikd/fuse-sdk, which fetches this
@@ -226,7 +226,7 @@ endif()
 # of the same idea is @loader_path.
 # fuse_sdk is built (consumers like fuse-sdk's FetchContent link the
 # in-build-tree target directly) but deliberately not installed/exported
-# here — this release is protocol-only. fuse-sdk ships its own install for
+# here, this release is protocol-only. fuse-sdk ships its own install for
 # fuse/sdk.h, fuse/transfer.hpp, fuse/mux_transfer.hpp and libfuse_sdk.
 set_target_properties(fuse fuse_proto PROPERTIES
     INSTALL_RPATH "$<IF:$<PLATFORM_ID:Darwin>,@loader_path,$ORIGIN>"

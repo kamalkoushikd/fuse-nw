@@ -10,7 +10,7 @@ URL: @PROJECT_HOMEPAGE_URL@
 Requires.private: @FUSE_PC_REQUIRES_PRIVATE@
 # -lfuse_proto is the wire protocol (fuse/proto/*); -lfuse is the older C
 # scaffold. Both are listed so `pkg-config --libs fuse` is enough to link
-# either. This package is protocol-only — the ergonomic API (fuse/sdk.h,
+# either. This package is protocol-only. The ergonomic API (fuse/sdk.h,
 # fuse/transfer.hpp, -lfuse_sdk) ships from the fuse-sdk repo instead.
 # -pthread is public: the worker threads are part of how the library runs,
 # not an implementation detail callers can avoid. The -rpath makes a build

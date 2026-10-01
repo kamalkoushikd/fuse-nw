@@ -82,7 +82,7 @@ the [fuse-sdk](https://github.com/kamalkoushikd/fuse-sdk) repo.
 ## 5. Runnable examples
 
 The Stage 1 demos exercise the protocol directly, with no handshake yet
-(that's a later stage) — a good starting point for seeing the framing and
+(that's a later stage), a good starting point for seeing the framing and
 loss-recovery machinery work without the SDK layer on top:
 
 ```sh
