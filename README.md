@@ -64,7 +64,7 @@ control, handshake, and the worker/registry machinery underneath everything
 else. Most people writing an application want the ergonomic SDK instead,
 which lives in its own repo:
 
-**[kamalkoushikd/fuse-sdk](https://github.com/kamalkoushikd/fuse-sdk)** —
+**[kamalkoushikd/fuse-sdk](https://github.com/kamalkoushikd/fuse-sdk)**,
 socket-style `listen`/`accept`/`connect`/`send`/`recv` in C or Python
 (`pip install fuse-sdk`), a quickstart, and the full SDK guide.
 
@@ -77,7 +77,7 @@ curl -fsSL https://github.com/kamalkoushikd/fuse-nw/releases/latest/download/ins
 
 Installs to `/usr/local` as root, `~/.local` otherwise (`--prefix DIR` for
 anywhere else, `--uninstall` to remove). Gives you `libfuse_proto`, headers,
-and CMake + pkg-config integration — wolfSSL is bundled, so there is nothing
+and CMake + pkg-config integration, wolfSSL is bundled, so there is nothing
 else to fetch.
 
 ```cmake
