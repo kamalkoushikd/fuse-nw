@@ -1,7 +1,7 @@
 """Behavioural tests for the Python bindings.
 
 Run against an installed package:  python3 -m unittest discover -s python/tests
-or against a build tree:           FUSE_LIBRARY=build/default/libfuse_proto.so \
+or against a build tree:           FUSE_LIBRARY=build/default/libfuse_sdk.so \
                                        python3 python/tests/test_sdk.py
 """
 import os

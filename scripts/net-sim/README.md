@@ -117,7 +117,8 @@ the two distributions don't overlap at all.
 - **`Containerfile`**: minimal Fedora image with just `glibc`/`libstdc++`/
   `libgcc` - enough to run fuse's own binaries, which are *not* baked in.
 - **`stage-bin.sh`**: copies the host-built `fuse_quickstart_send`/`recv` +
-  their non-system shared libs (`libfuse_proto.so`, `libwolfssl.so`) into
+  their non-system shared libs (`libfuse_sdk.so`, `libfuse_proto.so`,
+  `libwolfssl.so`) into
   `.cache/payload/{bin,lib}`, then relabels it `container_file_t` so
   Fedora's enforcing SELinux allows `container_t` to *execute* it (kube
   play's automatic hostPath relabel only covers read/write - without this
