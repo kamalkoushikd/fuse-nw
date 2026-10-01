@@ -106,6 +106,12 @@ congestion control appears to absorb retransmission cost without it showing
 up as a per-run speed penalty in this range, at least on this host-local
 link.
 
+Significance, not just a difference in means (`plot-benchmark.py`'s
+`scipy.stats` output): Welch's t-test t=210.20, df=105.8, p=1.6e-140;
+Mann-Whitney U=10000.0 (=100x100, every fuse run beat every QUIC run),
+p=2.6e-34; Cohen's d=29.7. This isn't a borderline result read generously -
+the two distributions don't overlap at all.
+
 ## How it's built
 
 - **`Containerfile`**: minimal Fedora image with just `glibc`/`libstdc++`/
