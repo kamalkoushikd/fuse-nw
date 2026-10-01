@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 #
-# Builds a self-contained, relocatable Fuse SDK tarball for a GitHub release.
+# Builds a self-contained, relocatable Fuse protocol core tarball for a
+# GitHub release.
 #
 #   scripts/make_release.sh [version]
 #
-# Produces  dist/fuse-sdk-<version>-linux-<arch>.tar.gz  plus a .sha256, and
+# Produces  dist/fuse-nw-<version>-linux-<arch>.tar.gz  plus a .sha256, and
 # copies scripts/install.sh next to them so the release page carries both.
 #
-# "Self-contained" means the tarball ships libwolfssl alongside libfuse_sdk
-# and libfuse_proto, and the libraries carry an $ORIGIN rpath, so they find
-# each other wherever the user unpacks them — no system wolfSSL required.
+# "Self-contained" means the tarball ships libwolfssl alongside libfuse_proto
+# and the libraries carry an $ORIGIN rpath, so they find each other wherever
+# the user unpacks them, no system wolfSSL required.
+#
+# This is protocol-only (fuse::proto / fuse::fuse). For the ergonomic SDK
+# (sdk.h, transfer.hpp, Python), see fuse-sdk's own make_release.sh.
 
 set -euo pipefail
 
@@ -18,7 +22,7 @@ cd "$REPO_ROOT"
 
 VERSION="${1:-$(sed -n 's/^ *VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt | head -1)}"
 ARCH="$(uname -m)"
-NAME="fuse-sdk-${VERSION}-linux-${ARCH}"
+NAME="fuse-nw-${VERSION}-linux-${ARCH}"
 BUILD="build/release-pkg"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
@@ -32,7 +36,7 @@ cmake -S . -B "$BUILD" \
     -DCMAKE_INSTALL_PREFIX="" \
     -DCMAKE_INSTALL_LIBDIR=lib \
     -DFUSE_BUILD_TESTS=OFF \
-    -DFUSE_BUILD_EXAMPLES=ON \
+    -DFUSE_BUILD_EXAMPLES=OFF \
     -DFUSE_BUILD_BENCH=OFF >/dev/null
 
 cmake --build "$BUILD" -j"$(nproc)" >/dev/null
@@ -43,35 +47,23 @@ DESTDIR="$STAGE" cmake --install "$BUILD" >/dev/null
 # directory in, so moving it after the fact silently breaks -lfuse_proto and
 # find_package for everyone who installs the tarball.
 
-# Ship the Python package inside the tarball so one download covers both
-# languages.
-mkdir -p "$STAGE/share/fuse/python"
-cp -a python/fuse "$STAGE/share/fuse/python/"
-find "$STAGE/share/fuse/python" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
-
-# A couple of runnable binaries are genuinely useful for smoke-testing an
-# install; drop the rest of the build's examples.
-mkdir -p "$STAGE/bin"
-for tool in fuse_quickstart_send fuse_quickstart_recv; do
-    [ -f "$BUILD/examples/$tool" ] && install -m755 "$BUILD/examples/$tool" "$STAGE/bin/"
-done
-
 # Docs worth carrying with the binaries.
 mkdir -p "$STAGE/share/doc/fuse"
-for f in README.md LICENSE docs/USAGE.md docs/SDK.md bench/RESULTS.md; do
+for f in README.md LICENSE docs/USAGE.md bench/RESULTS.md; do
     [ -f "$f" ] && cp "$f" "$STAGE/share/doc/fuse/$(basename "$f")"
 done
 
 cat > "$STAGE/share/doc/fuse/MANIFEST.txt" <<EOF
-Fuse SDK ${VERSION} (linux-${ARCH})
+Fuse protocol core ${VERSION} (linux-${ARCH})
 built $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-lib/                 shared libraries (libfuse_sdk, libfuse_proto, libfuse, libwolfssl)
+lib/                 shared libraries (libfuse_proto, libfuse, libwolfssl)
 lib/pkgconfig/       fuse.pc for non-CMake builds
 lib/cmake/fuse/      find_package(fuse CONFIG) support
-include/fuse/        C and C++ headers (sdk.h is the socket-style API)
-share/fuse/python/   the 'fuse' Python package (pure ctypes, no build step)
-bin/                 quickstart send/receive tools
+include/fuse/        protocol headers (fuse/proto/*.hpp)
+
+Ergonomic SDK (sdk.h, transfer.hpp, Python): see
+https://github.com/kamalkoushikd/fuse-sdk
 EOF
 
 mkdir -p dist

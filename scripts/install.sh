@@ -1,19 +1,23 @@
 #!/usr/bin/env sh
 #
-# Fuse SDK installer.
+# Fuse protocol core installer.
 #
 #   curl -fsSL https://github.com/OWNER/REPO/releases/latest/download/install.sh | sh
+#
+# This installs fuse::proto (and the older fuse::fuse C scaffold) only. For
+# the ergonomic SDK (sdk.h, transfer.hpp, Python bindings), see
+# https://github.com/kamalkoushikd/fuse-sdk instead, which has its own
+# installer built the same way.
 #
 # Options (as flags, or the matching environment variable):
 #   --prefix DIR     where to install        (FUSE_PREFIX)
 #   --version X.Y.Z  release to fetch        (FUSE_VERSION, default: latest)
 #   --tarball FILE   install a local tarball instead of downloading
 #   --repo OWNER/REPO
-#   --no-python      skip installing the Python package
 #   --uninstall      remove a previous install
 #
 # With no --prefix, this installs to /usr/local when run as root and to
-# ~/.local otherwise — so it never needs sudo to be useful.
+# ~/.local otherwise, so it never needs sudo to be useful.
 
 set -eu
 
@@ -21,7 +25,6 @@ REPO="${FUSE_REPO:-kamalkoushikd/fuse-nw}"
 VERSION="${FUSE_VERSION:-latest}"
 PREFIX="${FUSE_PREFIX:-}"
 TARBALL=""
-WITH_PYTHON=1
 UNINSTALL=0
 
 say()  { printf '%s\n' "$*"; }
@@ -35,7 +38,6 @@ while [ $# -gt 0 ]; do
         --version)   VERSION="${2:?--version needs a value}"; shift 2 ;;
         --tarball)   TARBALL="${2:?--tarball needs a path}"; shift 2 ;;
         --repo)      REPO="${2:?--repo needs OWNER/REPO}"; shift 2 ;;
-        --no-python) WITH_PYTHON=0; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
         -h|--help)   sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)           die "unknown option: $1 (try --help)" ;;
@@ -60,12 +62,11 @@ fi
 
 if [ "$UNINSTALL" = "1" ]; then
     step "removing Fuse from $PREFIX"
-    rm -f  "$PREFIX"/lib/libfuse_sdk.so* "$PREFIX"/lib/libfuse_proto.so* "$PREFIX"/lib/libfuse.so* \
-           "$PREFIX"/lib/libwolfssl.so* "$PREFIX"/lib/pkgconfig/fuse.pc \
-           "$PREFIX"/bin/fuse_quickstart_send "$PREFIX"/bin/fuse_quickstart_recv
+    rm -f  "$PREFIX"/lib/libfuse_proto.so* "$PREFIX"/lib/libfuse.so* \
+           "$PREFIX"/lib/libwolfssl.so* "$PREFIX"/lib/pkgconfig/fuse.pc
     rm -rf "$PREFIX"/include/fuse "$PREFIX"/lib/cmake/fuse \
-           "$PREFIX"/share/fuse "$PREFIX"/share/doc/fuse
-    say "done. (A pip-installed 'fuse' package, if any, needs 'pip uninstall fuse'.)"
+           "$PREFIX"/share/doc/fuse
+    say "done."
     exit 0
 fi
 
@@ -88,7 +89,7 @@ else
     # The asset name embeds the version, which we do not know for "latest".
     # GitHub redirects a versionless name only if one was uploaded, so try the
     # stable alias first and fall back to querying the API.
-    ASSET="fuse-sdk-linux-${ARCH}.tar.gz"
+    ASSET="fuse-nw-linux-${ARCH}.tar.gz"
     URL="$BASE/$ASSET"
 
     fetch() {
@@ -107,7 +108,7 @@ else
         API="https://api.github.com/repos/$REPO/releases/${VERSION:+tags/v${VERSION#v}}"
         [ "$VERSION" = "latest" ] && API="https://api.github.com/repos/$REPO/releases/latest"
         fetch "$API" "$TMP/rel.json" || die "cannot reach GitHub for $REPO"
-        URL="$(grep -o '"browser_download_url": *"[^"]*fuse-sdk[^"]*linux-'"$ARCH"'\.tar\.gz"' \
+        URL="$(grep -o '"browser_download_url": *"[^"]*fuse-nw[^"]*linux-'"$ARCH"'\.tar\.gz"' \
                "$TMP/rel.json" | head -1 | cut -d'"' -f4)"
         [ -n "$URL" ] || die "no linux-$ARCH asset in release '$VERSION' of $REPO"
         fetch "$URL" "$TMP/fuse.tar.gz" || die "download failed: $URL"
@@ -148,39 +149,17 @@ if [ "$(id -u)" = "0" ] && command -v ldconfig >/dev/null 2>&1; then
     ldconfig 2>/dev/null || true
 fi
 
-# --- python ----------------------------------------------------------------
-
-PY_NOTE=""
-if [ "$WITH_PYTHON" = "1" ] && [ -d "$PREFIX/share/fuse/python/fuse" ]; then
-    if command -v python3 >/dev/null 2>&1; then
-        SITE="$(python3 -c 'import site,sys; print((site.getusersitepackages() if hasattr(site,"getusersitepackages") else ""))' 2>/dev/null || true)"
-        if [ "$(id -u)" = "0" ]; then
-            SITE="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null || true)"
-        fi
-        if [ -n "$SITE" ]; then
-            mkdir -p "$SITE"
-            rm -rf "$SITE/fuse"
-            cp -a "$PREFIX/share/fuse/python/fuse" "$SITE/fuse"
-            PY_NOTE="python: import fuse   (installed to $SITE)"
-        fi
-    fi
-    [ -n "$PY_NOTE" ] || PY_NOTE="python: add $PREFIX/share/fuse/python to PYTHONPATH"
-fi
-
 # --- report ----------------------------------------------------------------
 
 say ""
-say "Fuse SDK installed."
+say "Fuse protocol core installed."
 say ""
-say "  C / C++ :  #include <fuse/sdk.h>"
-say "             cc app.c \$(pkg-config --cflags --libs fuse)"
 say "  CMake   :  find_package(fuse CONFIG REQUIRED)"
-say "             target_link_libraries(app PRIVATE fuse::sdk)"
-[ -n "$PY_NOTE" ] && say "  $PY_NOTE"
+say "             target_link_libraries(app PRIVATE fuse::proto)"
+say "  pkg-config:  cc app.c \$(pkg-config --cflags --libs fuse)"
 say ""
-say "  smoke test:"
-say "    $PREFIX/bin/fuse_quickstart_recv 0.0.0.0 4433 /tmp/out.bin &"
-say "    $PREFIX/bin/fuse_quickstart_send 127.0.0.1 4433 /etc/hostname"
+say "  Want the ergonomic send/recv API (C or Python) instead?"
+say "    curl -fsSL https://github.com/kamalkoushikd/fuse-sdk/releases/latest/download/install.sh | sh"
 say ""
 
 if [ "$PREFIX" != "/usr" ] && [ "$PREFIX" != "/usr/local" ]; then
