@@ -224,11 +224,15 @@ endif()
 # $ORIGIN ("relative to me"), but macOS's dyld has never heard of it and
 # treats it as a literal, nonexistent path named "$ORIGIN" — dyld's spelling
 # of the same idea is @loader_path.
-set_target_properties(fuse fuse_proto fuse_sdk PROPERTIES
+# fuse_sdk is built (consumers like fuse-sdk's FetchContent link the
+# in-build-tree target directly) but deliberately not installed/exported
+# here — this release is protocol-only. fuse-sdk ships its own install for
+# fuse/sdk.h, fuse/transfer.hpp, fuse/mux_transfer.hpp and libfuse_sdk.
+set_target_properties(fuse fuse_proto PROPERTIES
     INSTALL_RPATH "$<IF:$<PLATFORM_ID:Darwin>,@loader_path,$ORIGIN>"
 )
 
-install(TARGETS fuse fuse_proto fuse_sdk
+install(TARGETS fuse fuse_proto
     EXPORT fuse-targets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -238,6 +242,9 @@ install(TARGETS fuse fuse_proto fuse_sdk
 install(DIRECTORY include/fuse
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp"
+    PATTERN "sdk.h" EXCLUDE
+    PATTERN "transfer.hpp" EXCLUDE
+    PATTERN "mux_transfer.hpp" EXCLUDE
 )
 install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/include/fuse/version.h"
