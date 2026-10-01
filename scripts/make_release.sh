@@ -7,9 +7,9 @@
 # Produces  dist/fuse-sdk-<version>-linux-<arch>.tar.gz  plus a .sha256, and
 # copies scripts/install.sh next to them so the release page carries both.
 #
-# "Self-contained" means the tarball ships libwolfssl alongside libfuse_proto
-# and the libraries carry an $ORIGIN rpath, so they find each other wherever
-# the user unpacks them — no system wolfSSL required.
+# "Self-contained" means the tarball ships libwolfssl alongside libfuse_sdk
+# and libfuse_proto, and the libraries carry an $ORIGIN rpath, so they find
+# each other wherever the user unpacks them — no system wolfSSL required.
 
 set -euo pipefail
 
@@ -66,7 +66,7 @@ cat > "$STAGE/share/doc/fuse/MANIFEST.txt" <<EOF
 Fuse SDK ${VERSION} (linux-${ARCH})
 built $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-lib/                 shared libraries (libfuse_proto, libfuse, libwolfssl)
+lib/                 shared libraries (libfuse_sdk, libfuse_proto, libfuse, libwolfssl)
 lib/pkgconfig/       fuse.pc for non-CMake builds
 lib/cmake/fuse/      find_package(fuse CONFIG) support
 include/fuse/        C and C++ headers (sdk.h is the socket-style API)

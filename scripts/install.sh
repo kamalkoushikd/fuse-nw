@@ -60,7 +60,7 @@ fi
 
 if [ "$UNINSTALL" = "1" ]; then
     step "removing Fuse from $PREFIX"
-    rm -f  "$PREFIX"/lib/libfuse_proto.so* "$PREFIX"/lib/libfuse.so* \
+    rm -f  "$PREFIX"/lib/libfuse_sdk.so* "$PREFIX"/lib/libfuse_proto.so* "$PREFIX"/lib/libfuse.so* \
            "$PREFIX"/lib/libwolfssl.so* "$PREFIX"/lib/pkgconfig/fuse.pc \
            "$PREFIX"/bin/fuse_quickstart_send "$PREFIX"/bin/fuse_quickstart_recv
     rm -rf "$PREFIX"/include/fuse "$PREFIX"/lib/cmake/fuse \
@@ -175,7 +175,7 @@ say ""
 say "  C / C++ :  #include <fuse/sdk.h>"
 say "             cc app.c \$(pkg-config --cflags --libs fuse)"
 say "  CMake   :  find_package(fuse CONFIG REQUIRED)"
-say "             target_link_libraries(app PRIVATE fuse::proto)"
+say "             target_link_libraries(app PRIVATE fuse::sdk)"
 [ -n "$PY_NOTE" ] && say "  $PY_NOTE"
 say ""
 say "  smoke test:"

@@ -133,9 +133,6 @@ add_library(fuse_proto
     src/proto/orchestrator.cpp
     src/proto/session_crypto.cpp
     src/proto/digest.cpp
-    src/proto/transfer.cpp
-    src/proto/mux_transfer.cpp
-    src/proto/sdk.cpp
 )
 add_library(fuse::proto ALIAS fuse_proto)
 
@@ -185,6 +182,32 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     endif()
 endif()
 
+# The ergonomic send/recv API (fuse/sdk.h) and the transfer helpers built on
+# it (fuse/transfer.hpp, fuse/mux_transfer.hpp) — kept as a separate target
+# from fuse_proto so the wire protocol and the application-facing API can be
+# consumed (and eventually versioned) independently. Also developed in its
+# own repo, https://github.com/kamalkoushikd/fuse-sdk, which fetches this
+# repo for fuse::proto; this target is what that split is modeled on, and
+# what fuse-nw's own `fuse-transport` Python package still builds from.
+add_library(fuse_sdk
+    src/proto/transfer.cpp
+    src/proto/mux_transfer.cpp
+    src/proto/sdk.cpp
+)
+add_library(fuse::sdk ALIAS fuse_sdk)
+target_link_libraries(fuse_sdk PUBLIC fuse_proto)
+set_target_properties(fuse_sdk PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR}
+    EXPORT_NAME sdk
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(fuse_sdk PRIVATE -Wall -Wextra)
+    if(FUSE_WARNINGS_AS_ERRORS)
+        target_compile_options(fuse_sdk PRIVATE -Werror)
+    endif()
+endif()
+
 # --- Installation ---------------------------------------------------------
 
 # Let the installed libraries find their siblings (notably libwolfssl, which
@@ -201,11 +224,11 @@ endif()
 # $ORIGIN ("relative to me"), but macOS's dyld has never heard of it and
 # treats it as a literal, nonexistent path named "$ORIGIN" — dyld's spelling
 # of the same idea is @loader_path.
-set_target_properties(fuse fuse_proto PROPERTIES
+set_target_properties(fuse fuse_proto fuse_sdk PROPERTIES
     INSTALL_RPATH "$<IF:$<PLATFORM_ID:Darwin>,@loader_path,$ORIGIN>"
 )
 
-install(TARGETS fuse fuse_proto
+install(TARGETS fuse fuse_proto fuse_sdk
     EXPORT fuse-targets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

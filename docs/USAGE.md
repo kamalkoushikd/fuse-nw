@@ -38,7 +38,7 @@ libraries' rpath is baked at build time.
 find_package(fuse CONFIG REQUIRED)
 
 add_executable(my_app main.cpp)
-target_link_libraries(my_app PRIVATE fuse::proto)
+target_link_libraries(my_app PRIVATE fuse::sdk)
 ```
 
 If you installed to a non-standard prefix, point CMake at it:
