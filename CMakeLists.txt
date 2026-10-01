@@ -185,10 +185,10 @@ endif()
 # The ergonomic send/recv API (fuse/sdk.h) and the transfer helpers built on
 # it (fuse/transfer.hpp, fuse/mux_transfer.hpp), kept as a separate target
 # from fuse_proto so the wire protocol and the application-facing API can be
-# consumed (and eventually versioned) independently. Also developed in its
-# own repo, https://github.com/kamalkoushikd/fuse-sdk, which fetches this
-# repo for fuse::proto; this target is what that split is modeled on, and
-# what fuse-nw's own `fuse-transport` Python package still builds from.
+# consumed (and eventually versioned) independently. Developed and released
+# from its own repo, https://github.com/kamalkoushikd/fuse-sdk, which
+# fetches this repo for fuse::proto and links this target directly rather
+# than duplicating its sources.
 add_library(fuse_sdk
     src/proto/transfer.cpp
     src/proto/mux_transfer.cpp
@@ -224,11 +224,13 @@ endif()
 # $ORIGIN ("relative to me"), but macOS's dyld has never heard of it and
 # treats it as a literal, nonexistent path named "$ORIGIN" — dyld's spelling
 # of the same idea is @loader_path.
-# fuse_sdk is built (consumers like fuse-sdk's FetchContent link the
-# in-build-tree target directly) but deliberately not installed/exported
-# here, this release is protocol-only. fuse-sdk ships its own install for
-# fuse/sdk.h, fuse/transfer.hpp, fuse/mux_transfer.hpp and libfuse_sdk.
-set_target_properties(fuse fuse_proto PROPERTIES
+# fuse_sdk gets this property too even though fuse-nw's own install(TARGETS)
+# below excludes it (this release is protocol-only, fuse-sdk ships its own
+# install for fuse/sdk.h, fuse/transfer.hpp, fuse/mux_transfer.hpp and
+# libfuse_sdk) — fuse-sdk's own install(TARGETS fuse_sdk ...) still needs
+# this RPATH to find libfuse_proto.so.0 at runtime, and it is a property of
+# the target itself, not of whichever repo's install() call installs it.
+set_target_properties(fuse fuse_proto fuse_sdk PROPERTIES
     INSTALL_RPATH "$<IF:$<PLATFORM_ID:Darwin>,@loader_path,$ORIGIN>"
 )
 
@@ -325,6 +327,7 @@ endif()
 
 if(FUSE_BUILD_BENCH)
     add_subdirectory(bench)
+    add_subdirectory(scripts/net-sim/src)
 endif()
 
 # --- Packaging (CPack) ------------------------------------------------------
