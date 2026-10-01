@@ -21,6 +21,11 @@ _deps/
 .vscode/
 .idea/
 
+# Internal design discussion/proposals - never meant for the public repo.
+# Decided/shipped design decisions belong in BUILD.md, docs/ROADMAP.md, and
+# the wiki once they're actually decided; this is where they live before that.
+internal-design/
+
 # Rust benchmark baseline build artifacts
 bench/quic/target/
 dist/
