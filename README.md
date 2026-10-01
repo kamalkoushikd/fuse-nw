@@ -59,82 +59,31 @@ and a userspace network-emulator test harness.
 
 ## Install
 
-**Python**
+This repo is the protocol core (`fuse::proto`): the wire format, congestion
+control, handshake, and the worker/registry machinery underneath everything
+else. Most people writing an application want the ergonomic SDK instead,
+which lives in its own repo:
 
-```sh
-pip install fuse-transport      # or: uv add fuse-transport
-```
+**[kamalkoushikd/fuse-sdk](https://github.com/kamalkoushikd/fuse-sdk)** —
+socket-style `listen`/`accept`/`connect`/`send`/`recv` in C or Python
+(`pip install fuse-sdk`), a quickstart, and the full SDK guide.
 
-The PyPI package name is `fuse-transport`, but the module you import is
-`fuse` — see the Quickstart below.
-
-Wheels bundle the compiled transport and its wolfSSL, so there is no
-compiler, no CMake, and nothing else to install. Check it with
-`python -m fuse selftest`.
-
-**C / C++**
+To link the protocol core directly instead (building your own SDK, or
+research/benchmarking use):
 
 ```sh
 curl -fsSL https://github.com/kamalkoushikd/fuse-nw/releases/latest/download/install.sh | sh
 ```
 
 Installs to `/usr/local` as root, `~/.local` otherwise (`--prefix DIR` for
-anywhere else, `--uninstall` to remove). One download gives you the
-libraries and headers, CMake + pkg-config integration, and the Python
-package — wolfSSL is bundled, so there is nothing else to fetch.
+anywhere else, `--uninstall` to remove). Gives you `libfuse_proto`, headers,
+and CMake + pkg-config integration — wolfSSL is bundled, so there is nothing
+else to fetch.
 
-## Quickstart — write a networked program
-
-Fuse gives you a socket-style API: **listen, accept, connect, send, recv**.
-Messages keep their boundaries (one `send` = one `recv`), delivery is
-reliable, and `send` returns only once the peer has the data.
-
-**Python**
-
-```python
-import fuse
-
-# server
-with fuse.listen(port=4433) as server:
-    conn = server.accept()
-    print(conn.recv())
-    conn.send(b"pong")
-
-# client
-with fuse.connect("192.0.2.10", 4433) as conn:
-    conn.send(b"ping")
-    print(conn.recv())
+```cmake
+find_package(fuse CONFIG REQUIRED)
+target_link_libraries(your_target PRIVATE fuse::proto)
 ```
-
-**C**
-
-```c
-#include <fuse/sdk.h>
-
-fuse_config cfg;
-fuse_config_init(&cfg);
-cfg.host = "192.0.2.10";
-cfg.port = 4433;
-
-fuse_conn *c = fuse_connect(&cfg, NULL);
-fuse_send(c, "ping", 4);
-
-char buf[4096]; size_t n;
-fuse_recv(c, buf, sizeof buf, &n, 5000);
-fuse_close(c);
-```
-
-```sh
-cc app.c -o app $(pkg-config --cflags --libs fuse)   # or find_package(fuse CONFIG)
-```
-
-Add `key="shared-secret"` (Python) or `cfg.pre_shared_key` (C) on both ends
-for AES-256-GCM encryption.
-
-**Full SDK guide — API reference, encryption, ports, threading,
-troubleshooting: [docs/SDK.md](docs/SDK.md).**
-Moving whole files or large buffers instead? That is a separate, faster
-API: [docs/USAGE.md](docs/USAGE.md).
 
 ## Building
 
