@@ -208,6 +208,26 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     endif()
 endif()
 
+# HTTP-over-Fuse (fuse/http.h): one request, one response, one Fuse
+# message each way, built on fuse::sdk's send/recv rather than fuse::proto
+# directly, same "developed and released from fuse-sdk" split as above.
+add_library(fuse_http
+    src/proto/http.cpp
+)
+add_library(fuse::http ALIAS fuse_http)
+target_link_libraries(fuse_http PUBLIC fuse_sdk)
+set_target_properties(fuse_http PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR}
+    EXPORT_NAME http
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(fuse_http PRIVATE -Wall -Wextra)
+    if(FUSE_WARNINGS_AS_ERRORS)
+        target_compile_options(fuse_http PRIVATE -Werror)
+    endif()
+endif()
+
 # --- Installation ---------------------------------------------------------
 
 # Let the installed libraries find their siblings (notably libwolfssl, which
@@ -222,15 +242,16 @@ endif()
 #
 # The token itself is not portable: Linux's dynamic loader understands
 # $ORIGIN ("relative to me"), but macOS's dyld has never heard of it and
-# treats it as a literal, nonexistent path named "$ORIGIN" — dyld's spelling
+# treats it as a literal, nonexistent path named "$ORIGIN", dyld's spelling
 # of the same idea is @loader_path.
-# fuse_sdk gets this property too even though fuse-nw's own install(TARGETS)
-# below excludes it (this release is protocol-only, fuse-sdk ships its own
-# install for fuse/sdk.h, fuse/transfer.hpp, fuse/mux_transfer.hpp and
-# libfuse_sdk) — fuse-sdk's own install(TARGETS fuse_sdk ...) still needs
-# this RPATH to find libfuse_proto.so.0 at runtime, and it is a property of
+# fuse_sdk and fuse_http get this property too even though fuse-nw's own
+# install(TARGETS) below excludes them (this release is protocol-only,
+# fuse-sdk ships its own install for fuse/sdk.h, fuse/transfer.hpp,
+# fuse/mux_transfer.hpp, fuse/http.h, libfuse_sdk and libfuse_http).
+# fuse-sdk's own install(TARGETS ...) still needs this RPATH to find
+# libfuse_proto.so.0 / libfuse_sdk.so.0 at runtime, and it is a property of
 # the target itself, not of whichever repo's install() call installs it.
-set_target_properties(fuse fuse_proto fuse_sdk PROPERTIES
+set_target_properties(fuse fuse_proto fuse_sdk fuse_http PROPERTIES
     INSTALL_RPATH "$<IF:$<PLATFORM_ID:Darwin>,@loader_path,$ORIGIN>"
 )
 
