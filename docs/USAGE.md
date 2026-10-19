@@ -14,7 +14,7 @@ research or benchmarking against it, keep reading.
 ### From a package
 
 ```sh
-cmake --preset default
+cmake --preset default -DFUSE_BUILD_BENCH=OFF   # see note below
 cmake --build --preset default
 cd build/default && cpack          # produces .deb / .rpm / .tar.gz
 sudo dpkg -i fuse-0.1.0-Linux.deb  # or: sudo rpm -i fuse-0.1.0-1.x86_64.rpm
@@ -23,7 +23,7 @@ sudo dpkg -i fuse-0.1.0-Linux.deb  # or: sudo rpm -i fuse-0.1.0-1.x86_64.rpm
 ### From source
 
 ```sh
-cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local -DFUSE_BUILD_BENCH=OFF
 cmake --build build -j
 sudo cmake --install build
 sudo ldconfig                      # only needed for a system prefix
@@ -33,9 +33,14 @@ Set `CMAKE_INSTALL_PREFIX` at **configure** time, not on `cmake --install`:
 the pkg-config file's `prefix=` is resolved when the install runs, and the
 libraries' rpath is baked at build time.
 
-> Requires CMake 3.16+, a C++17 compiler, and Linux (the transport uses
-> `sendmmsg`/`recvmmsg` and UDP GSO). wolfSSL is fetched and built
+> Requires CMake 3.16+, a C++17 compiler, and Linux or macOS. On Linux the
+> transport batches with `recvmmsg` and UDP GSO. macOS builds and runs, but
+> sends and receives one datagram per syscall. wolfSSL is fetched and built
 > automatically unless you already have one installed.
+>
+> `-DFUSE_BUILD_BENCH=OFF` is currently required: the bench build refers to
+> a `scripts/net-sim/src` directory that isn't in the repo (see
+> [ROADMAP.md](ROADMAP.md#gaps--not-yet-done)).
 
 ## 2. Use it, CMake
 
@@ -70,14 +75,25 @@ the [fuse-sdk](https://github.com/kamalkoushikd/fuse-sdk) repo.
 
 | header | what it gives you |
 |---|---|
-| `fuse/proto/udp.hpp` | UDP socket with GSO batching and `recvmmsg` |
-| `fuse/proto/block.hpp` | block header encode/decode |
+| `fuse/proto/wire.hpp` | protocol version, message types, size limits, big-endian helpers |
+| `fuse/proto/udp.hpp` | UDP socket (IPv4/IPv6) with GSO batching and `recvmmsg` on Linux |
+| `fuse/proto/block.hpp` | DATA block header encode/decode |
+| `fuse/proto/control.hpp` | ACK / NACK / StreamStart / StreamClose / ResumeRanges / FileDigest |
 | `fuse/proto/registry.hpp` | sender-side retransmit registry |
 | `fuse/proto/receiver.hpp` | receive window, O(1) loss detection |
+| `fuse/proto/reassembly.hpp` | ORDERED / unordered delivery into a sink |
+| `fuse/proto/send_queue.hpp` | COALESCE / backpressure send queue |
 | `fuse/proto/congestion.hpp` | per-stream AIMD controller |
-| `fuse/proto/session_crypto.hpp` | session keys + per-lane AEAD |
+| `fuse/proto/session_crypto.hpp` | PSK session keys + per-lane AES-256-GCM |
+| `fuse/proto/dtls.hpp` | DTLS 1.2 ECDHE-PSK session (standalone; no transport uses it yet) |
+| `fuse/proto/digest.hpp` | whole-file / segmented SHA-256 digest |
+| `fuse/proto/spsc_ring.hpp` | lock-free single-producer/single-consumer ring |
 | `fuse/proto/orchestrator.hpp` | autoscaling worker pool |
 | `fuse/proto/setup.hpp` | SETUP handshake |
+
+The byte-level format of every message, and which transport uses which,
+is in [PROTOCOL.md](PROTOCOL.md). Before relying on the encryption, read
+[Known protocol issues](ROADMAP.md#known-protocol-issues).
 
 ## 5. Runnable examples
 
