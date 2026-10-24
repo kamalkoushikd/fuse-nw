@@ -1346,6 +1346,32 @@ TEST(Transfer, PortRangePastTopIsAConfigError) {
     EXPECT_NE(fuse::send_buffer(cfg, &byte, 1), fuse::TransferStatus::ConfigError);
 }
 
+// Senders used to always open an IPv4 socket, so an IPv6 destination
+// failed even though receivers can bind "::". Skipped without IPv6.
+TEST(Transfer, WorksOverIpv6) {
+    {
+        fuse::proto::UdpSocket probe;
+        if (!probe.open("::1", 0)) GTEST_SKIP() << "no IPv6 loopback on this host";
+    }
+    const auto payload = make_payload(2 * 1024 * 1024);
+    const uint16_t port = next_port();
+    fuse::TransferConfig rx;
+    rx.bind_address = "::1";
+    rx.base_port = port;
+    rx.lanes = 2;
+    rx.timeout_ms = 20000;
+    fuse::TransferConfig tx = rx;
+    tx.host = "::1";
+    std::vector<uint8_t> got;
+    fuse::TransferStatus rs = fuse::TransferStatus::Incomplete;
+    std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(fuse::send_buffer(tx, payload.data(), payload.size()), fuse::TransferStatus::Ok);
+    receiver.join();
+    EXPECT_EQ(rs, fuse::TransferStatus::Ok);
+    EXPECT_EQ(got, payload);
+}
+
 // Return routability (ROADMAP #18, #5): a StreamStart from an address that
 // hasn't proved it can receive there (no valid token) is answered only with
 // a Retry no larger than itself, and claims nothing — so a spoofed source

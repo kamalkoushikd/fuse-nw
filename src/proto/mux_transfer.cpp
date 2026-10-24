@@ -477,8 +477,9 @@ TransferStatus MuxSender::run() {
         cfg_.block_size == 0 || cfg_.window_size == 0 || (data_ == nullptr && len_ > 0)) {
         return TransferStatus::ConfigError;
     }
-    if (!sock_.open("0.0.0.0", 0)) return TransferStatus::SocketError;
     if (!UdpSocket::resolve(cfg_.host.c_str(), cfg_.port, &dst_)) return TransferStatus::ConfigError;
+    // Same family as the destination, so IPv6 hosts are reachable.
+    if (!sock_.open(wildcard_for(dst_), 0)) return TransferStatus::SocketError;
     set_bufs(sock_.fd(), 32 << 20);
     set_timeout_us(sock_.fd(), 50000);
 
