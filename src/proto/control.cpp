@@ -52,8 +52,15 @@ bool decode_heartbeat(const uint8_t *in, size_t in_len, Heartbeat *hb) {
     return true;
 }
 
+namespace {
+constexpr size_t kStreamStartFixed = kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8 + 8 + 8 + 8 + 8;
+}
+
 size_t encode_stream_start(const StreamStart &ss, uint8_t *out, size_t out_cap) {
-    const size_t total = kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8 + 8 + 8 + 8 + 8;
+    if (ss.ext_len > kMaxExtensionBytes) {
+        return 0;
+    }
+    const size_t total = kStreamStartFixed + 2 + ss.ext_len;
     if (out_cap < total) {
         return 0;
     }
@@ -69,12 +76,14 @@ size_t encode_stream_start(const StreamStart &ss, uint8_t *out, size_t out_cap) 
     off += put_u64(out + off, ss.file_total_bytes);
     off += put_u64(out + off, ss.file_id);
     off += put_u64(out + off, ss.token);
-    return off;
+    off += put_u16(out + off, ss.ext_len);
+    std::memcpy(out + off, ss.ext, ss.ext_len);
+    return off + ss.ext_len;
 }
 
 bool decode_stream_start(const uint8_t *in, size_t in_len, StreamStart *ss) {
     size_t off = check_outer(in, in_len, MsgType::StreamStart);
-    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8 + 8 + 8 + 8 + 8) {
+    if (off == 0 || in_len < kStreamStartFixed + 2) {
         return false;
     }
     off += get_u16(in + off, &ss->stream_id);
@@ -88,6 +97,12 @@ bool decode_stream_start(const uint8_t *in, size_t in_len, StreamStart *ss) {
     off += get_u64(in + off, &ss->file_total_bytes);
     off += get_u64(in + off, &ss->file_id);
     off += get_u64(in + off, &ss->token);
+    off += get_u16(in + off, &ss->ext_len);
+    if (ss->ext_len > kMaxExtensionBytes || ss->ext_len > in_len - off ||
+        !extensions_acceptable(in + off, ss->ext_len)) {
+        return false;
+    }
+    std::memcpy(ss->ext, in + off, ss->ext_len);
     return true;
 }
 
