@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <poll.h>
+#include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -1640,6 +1642,39 @@ TEST(Transfer, ResumeIgnoresPartialCopyOfAChangedFile) {
     const auto r = resume_test::transfer(in, out);
     ASSERT_EQ(r.recv, fuse::TransferStatus::Ok) << fuse::to_string(r.recv);
     EXPECT_EQ(r.recv_stats.resumed_bytes, 0u) << "resumed from another file's partial copy";
+    EXPECT_EQ(pipeline_test::read_all(out), payload);
+    fs::remove(in);
+    fs::remove(out);
+}
+
+// ROADMAP #15: a file rewritten in place with the same size *and its mtime
+// restored* must not be resumed against: the partial copy holds the old
+// bytes.
+TEST(Transfer, ResumeIgnoresInPlaceRewriteWithRestoredMtime) {
+    namespace fs = std::filesystem;
+    auto payload = make_payload(96 * 1024 * 1024);
+    const fs::path in = pipeline_test::temp_path("rewrite_in.bin");
+    const fs::path out = pipeline_test::temp_path("rewrite_out.bin");
+    resume_test::write_file(in, payload);
+    struct stat before {};
+    ASSERT_EQ(::stat(in.c_str(), &before), 0);
+    if (!resume_test::interrupt_midway(in, out, payload.size())) {
+        fs::remove(in);
+        GTEST_SKIP() << "the transfer finished before it could be interrupted";
+    }
+    // Rewrite every byte in place, then put the old mtime back.
+    for (auto &b : payload) b = static_cast<uint8_t>(b ^ 0x5A);
+    {
+        std::fstream f(in, std::ios::in | std::ios::out | std::ios::binary);
+        f.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
+    }
+    const timespec times[2] = {before.st_atim, before.st_mtim};
+    ASSERT_EQ(::utimensat(AT_FDCWD, in.c_str(), times, 0), 0);
+
+    const auto r = resume_test::transfer(in, out);
+    EXPECT_EQ(r.send, fuse::TransferStatus::Ok) << fuse::to_string(r.send);
+    EXPECT_EQ(r.recv, fuse::TransferStatus::Ok) << fuse::to_string(r.recv);
+    EXPECT_EQ(r.recv_stats.resumed_bytes, 0u) << "resumed a rewritten file's stale partial copy";
     EXPECT_EQ(pipeline_test::read_all(out), payload);
     fs::remove(in);
     fs::remove(out);
