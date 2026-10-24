@@ -178,6 +178,13 @@ inline size_t put_u16(uint8_t *p, uint16_t v) {
     return 2;
 }
 
+inline size_t put_u32(uint8_t *p, uint32_t v) {
+    for (int i = 0; i < 4; ++i) {
+        p[i] = static_cast<uint8_t>(v >> (24 - 8 * i));
+    }
+    return 4;
+}
+
 inline size_t put_u64(uint8_t *p, uint64_t v) {
     for (int i = 0; i < 8; ++i) {
         p[i] = static_cast<uint8_t>(v >> (56 - 8 * i));
@@ -193,6 +200,15 @@ inline size_t get_u8(const uint8_t *p, uint8_t *v) {
 inline size_t get_u16(const uint8_t *p, uint16_t *v) {
     *v = static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
     return 2;
+}
+
+inline size_t get_u32(const uint8_t *p, uint32_t *v) {
+    uint32_t out = 0;
+    for (int i = 0; i < 4; ++i) {
+        out = (out << 8) | p[i];
+    }
+    *v = out;
+    return 4;
 }
 
 inline size_t get_u64(const uint8_t *p, uint64_t *v) {

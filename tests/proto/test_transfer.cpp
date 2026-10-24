@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -1241,6 +1242,35 @@ TEST(Transfer, VersionMismatchIsReported) {
         stop.store(true);
         fake.join();
     }
+}
+
+// ROADMAP #9: a receiver whose pipeline is the bottleneck (tiny rings, one
+// writer) advertises how much it can take, so the sender doesn't overrun
+// it -- overruns used to be silent drops, repaired by retransmission.
+TEST(Transfer, SmallReceiverRingsAreNotOverrun) {
+    const auto payload = make_payload(16 * 1024 * 1024);
+    const uint16_t port = next_port();
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = port;
+    rx.lanes = 1;
+    rx.timeout_ms = 20000;
+    rx.writer_threads = 1;
+    rx.ring_slots = 16;
+    fuse::TransferConfig tx = rx;
+    tx.host = "127.0.0.1";
+    std::vector<uint8_t> got;
+    fuse::TransferStatus rs = fuse::TransferStatus::Incomplete;
+    std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    fuse::TransferStats st;
+    EXPECT_EQ(fuse::send_buffer(tx, payload.data(), payload.size(), &st), fuse::TransferStatus::Ok);
+    receiver.join();
+    EXPECT_EQ(rs, fuse::TransferStatus::Ok);
+    EXPECT_EQ(got, payload);
+    std::printf("[ info ] retransmits with 16-slot rings: %llu\n",
+                static_cast<unsigned long long>(st.retransmits));
+    EXPECT_LT(st.retransmits, 400u) << "the receiver's rings were overrun";
 }
 
 // Return routability (ROADMAP #18, #5): a StreamStart from an address that

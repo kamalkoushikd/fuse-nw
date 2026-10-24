@@ -978,6 +978,18 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
     unsigned quiet_acks = 0;
     uint64_t last_version_reply_ns = 0;
     constexpr unsigned kMaxQuietAcks = 3;
+    // Flow control (ROADMAP #9): what this lane can still absorb -- free
+    // space in its rings (the tightest writer's, times the writers, since
+    // runs of blocks rotate between them) plus the blocks already handed
+    // over and not yet written. Advertised in every Ack as rwnd.
+    const auto receive_window = [&]() -> uint32_t {
+        size_t tightest = SIZE_MAX;
+        for (uint16_t k = 0; k < p->writers; ++k) {
+            tightest = std::min(tightest, p->ring(lane, k).writable());
+        }
+        const uint64_t w = static_cast<uint64_t>(tightest) * p->writers + pending;
+        return static_cast<uint32_t>(std::min<uint64_t>(w, kWindow));
+    };
     const auto send_resume_answer = [&] {
         for (const auto &m : resume_answer) sock.send_to(m.data(), m.size(), peer);
     };
@@ -1344,6 +1356,7 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
             last_ack_ns = t;
             Ack ack = rx.build_ack();
             ack.nonce = peer_nonce;
+            ack.rwnd = receive_window();
             const size_t n = seal_ctl(auth.get(), tx.data(), encode_ack(ack, tx.data(), tx.size()),
                                       tx.size());
             if (n) sock.send_to(tx.data(), n, peer);
@@ -1393,6 +1406,7 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
     for (int i = 0; !peer_finished && i < 8; ++i) {
         Ack ack = rx.build_ack();
         ack.nonce = peer_nonce;
+        ack.rwnd = receive_window();
         const size_t n = seal_ctl(auth.get(), tx.data(), encode_ack(ack, tx.data(), tx.size()),
                                   tx.size());
         if (n) sock.send_to(tx.data(), n, peer);
@@ -1643,6 +1657,8 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     uint64_t sent_bytes = 0; // new payload bytes sent (not retransmissions)
     // Pacing (ROADMAP #22): earliest time the next batch of new data may go.
     uint64_t next_batch_ns = 0;
+    // The receiver's advertised window in blocks (ROADMAP #9).
+    uint32_t peer_rwnd = kRwndUnlimited;
 
     uint32_t clean_batches = 0;
     uint64_t base = 0, next_seq = 0, retransmits = 0;
@@ -1716,7 +1732,12 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
         }
         cc.poll(now_ns());
         const uint64_t window = std::min<uint64_t>(kWindow, std::max<uint32_t>(4, cc.window()));
-        const uint64_t window_bytes = window * base_block;
+        // Never more in flight than the receiver said it can hold either (at
+        // least 4 blocks, so the flow can never wedge on a zero window).
+        const uint64_t rwnd_bytes = peer_rwnd == kRwndUnlimited
+                                        ? UINT64_MAX
+                                        : static_cast<uint64_t>(std::max<uint32_t>(peer_rwnd, 4)) * block;
+        const uint64_t window_bytes = std::min<uint64_t>(window * base_block, rwnd_bytes);
         const uint64_t inflight = sent_bytes - acked_bytes;
         bool did_work = false;
 
@@ -1833,6 +1854,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 }
                 // Cumulative base plus the selective bitmask (see apply_ack).
                 acked_bytes += apply_ack(reg, ack, &base, next_seq);
+                peer_rwnd = ack.rwnd;
                 res->bytes.store(acked_bytes, std::memory_order_relaxed);
                 // The receiver only updates its echoed send-time when a new
                 // highest-seq block arrives (receiver.cpp) — every

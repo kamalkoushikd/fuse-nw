@@ -10,7 +10,7 @@
 // create or open a file by that name.)
 //
 //   Heartbeat : [outer][stream_id:2][highest_seq_no:8]
-//   Ack       : [outer][stream_id:2][base_seq_no:8][received_bitmask:8*kMaskWords][echoed_send_time:8][nonce:8]
+//   Ack       : [outer][stream_id:2][base_seq_no:8][received_bitmask:8*kMaskWords][echoed_send_time:8][nonce:8][rwnd:4]
 //   Nack      : [outer][stream_id:2][count:2][missing_seq_no:8]*count
 //
 // StreamStart's nonce and Ack's echoed nonce (v3) exist purely for handshake
@@ -90,12 +90,21 @@ struct PathProbe {
     uint64_t challenge = 0;
 };
 
+// Ack::rwnd value meaning "no receive-window limit".
+inline constexpr uint32_t kRwndUnlimited = UINT32_MAX;
+
 struct Ack {
     uint16_t stream_id        = 0;
     uint64_t base_seq_no      = 0;
     uint64_t received_bitmask[kMaskWords] = {};
     uint64_t echoed_send_time = 0;
     uint64_t nonce            = 0; // echoes the StreamStart nonce (v3)
+    // Flow control (v8, ROADMAP #9): how many unacknowledged blocks the
+    // receiver can hold right now. A sender keeps its blocks in flight within
+    // it, so a slow disk or a slow application is not mistaken for network
+    // congestion (overrunning the receiver used to cost dropped blocks, NACKs
+    // and a halved window).
+    uint32_t rwnd             = kRwndUnlimited;
 };
 
 // A NACK names up to kMaxWindow missing sequence numbers for one stream —
