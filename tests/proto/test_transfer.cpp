@@ -1328,6 +1328,22 @@ TEST(Transfer, BlockGrowthSettlesOnAPathThatLosesLargeDatagrams) {
     EXPECT_LT(large, 0.10) << "the sender kept growing into a size the path loses";
 }
 
+// ROADMAP #25: lanes past port 65535 used to wrap to ports near 0 (failing
+// to bind below 1024 with a misleading SocketError); now a ConfigError.
+TEST(Transfer, PortRangePastTopIsAConfigError) {
+    fuse::TransferConfig cfg;
+    cfg.base_port = 65530;
+    cfg.lanes = 8; // 65530..65537
+    const uint8_t byte = 0;
+    EXPECT_EQ(fuse::send_buffer(cfg, &byte, 1), fuse::TransferStatus::ConfigError);
+    std::vector<uint8_t> out;
+    EXPECT_EQ(fuse::receive_buffer(cfg, &out), fuse::TransferStatus::ConfigError);
+    cfg.lanes = 6; // 65530..65535 is fine as far as configuration goes
+    cfg.timeout_ms = 1;
+    cfg.connect_timeout_ms = 1;
+    EXPECT_NE(fuse::send_buffer(cfg, &byte, 1), fuse::TransferStatus::ConfigError);
+}
+
 // Return routability (ROADMAP #18, #5): a StreamStart from an address that
 // hasn't proved it can receive there (no valid token) is answered only with
 // a Retry no larger than itself, and claims nothing — so a spoofed source
