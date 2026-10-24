@@ -1,5 +1,7 @@
 #include "fuse/proto/session_crypto.hpp"
 
+#include "fuse/proto/wire.hpp"
+
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -68,6 +70,7 @@ bool LaneCipher::open(uint16_t, uint64_t, const uint8_t *, size_t, const uint8_t
                       uint8_t *) const {
     return false;
 }
+bool derive_lane_epoch_key(const uint8_t *, uint16_t, uint64_t, uint8_t *) { return false; }
 
 #else
 
@@ -197,6 +200,57 @@ bool LaneCipher::open(uint16_t lane, uint64_t seq, const uint8_t *aad, size_t aa
                             static_cast<word32>(aad_len)) == 0;
 }
 
+bool derive_lane_epoch_key(const uint8_t session_key[kSessionKeyLen], uint16_t lane,
+                           uint64_t epoch, uint8_t out_key[kSessionKeyLen]) {
+    if (session_key == nullptr || out_key == nullptr) {
+        return false;
+    }
+    uint8_t context[10];
+    put_u16(context, lane);
+    put_u64(context + 2, epoch);
+    static const char kProtocol[] = "fuse2 ";
+    static const char kLabel[] = "lane key";
+    return wc_Tls13_HKDF_Expand_Label(out_key, static_cast<word32>(kSessionKeyLen), session_key,
+                                      kSessionKeyLen, reinterpret_cast<const byte *>(kProtocol),
+                                      sizeof(kProtocol) - 1,
+                                      reinterpret_cast<const byte *>(kLabel), sizeof(kLabel) - 1,
+                                      context, sizeof(context), WC_SHA256) == 0;
+}
+
 #endif // FUSE_PROTO_WITH_DTLS
+
+bool LaneKeySchedule::init(const uint8_t session_key[kSessionKeyLen], uint16_t lane) {
+    if (ready_ || session_key == nullptr || !session_crypto_available()) {
+        return false;
+    }
+    std::memcpy(key_, session_key, kSessionKeyLen);
+    lane_ = lane;
+    ready_ = true;
+    return true;
+}
+
+const LaneCipher *LaneKeySchedule::cipher_for(uint64_t seq) {
+    if (!ready_) {
+        return nullptr;
+    }
+    const uint64_t epoch = seq >> kKeyEpochShift;
+    for (const Slot &s : slots_) {
+        if (s.cipher && s.epoch == epoch) {
+            return s.cipher.get();
+        }
+    }
+    uint8_t k[kSessionKeyLen];
+    auto c = std::make_unique<LaneCipher>();
+    const bool ok = derive_lane_epoch_key(key_, lane_, epoch, k) && c->init(k);
+    std::memset(k, 0, sizeof(k));
+    if (!ok) {
+        return nullptr;
+    }
+    Slot &slot = slots_[next_];
+    next_ = (next_ + 1) % 2;
+    slot.epoch = epoch;
+    slot.cipher = std::move(c);
+    return slot.cipher.get();
+}
 
 } // namespace fuse::proto

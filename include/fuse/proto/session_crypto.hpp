@@ -30,6 +30,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 namespace fuse::proto {
 
@@ -94,6 +95,46 @@ public:
 private:
     void *aes_ = nullptr; // wolfSSL Aes, kept opaque to avoid leaking the dep
     bool  initialized_ = false;
+};
+
+// Key usage limit (ROADMAP #21). One AES-GCM key must not protect an
+// unbounded number of records: the commonly applied confidentiality limit
+// is about 2^23 packets (RFC 9001 §6.6). Rather than rekey with extra
+// messages, each lane's key is a deterministic function of the session key,
+// the lane and the *epoch* (seq >> kKeyEpochShift), so both ends switch
+// keys at the same sequence number with nothing on the wire. Nonces stay
+// (lane, seq), unique across epochs anyway.
+inline constexpr unsigned kKeyEpochShift = 22; // 4,194,304 blocks per key
+
+bool derive_lane_epoch_key(const uint8_t session_key[kSessionKeyLen], uint16_t lane,
+                           uint64_t epoch, uint8_t out_key[kSessionKeyLen]);
+
+// The ciphers of one lane across key epochs. Thread-confined like
+// LaneCipher. It keeps the two most recently used epochs, so a
+// retransmission of a block from just before an epoch boundary does not
+// force a re-derive on every resend.
+class LaneKeySchedule {
+public:
+    LaneKeySchedule() = default;
+    LaneKeySchedule(const LaneKeySchedule &) = delete;
+    LaneKeySchedule &operator=(const LaneKeySchedule &) = delete;
+
+    bool init(const uint8_t session_key[kSessionKeyLen], uint16_t lane);
+
+    // The cipher for the epoch `seq` belongs to; nullptr if it could not be
+    // derived (which callers must treat as an authentication failure).
+    const LaneCipher *cipher_for(uint64_t seq);
+
+private:
+    struct Slot {
+        uint64_t epoch = UINT64_MAX;
+        std::unique_ptr<LaneCipher> cipher;
+    };
+    uint8_t key_[kSessionKeyLen] = {};
+    uint16_t lane_ = 0;
+    bool ready_ = false;
+    Slot slots_[2];
+    unsigned next_ = 0;
 };
 
 } // namespace fuse::proto
