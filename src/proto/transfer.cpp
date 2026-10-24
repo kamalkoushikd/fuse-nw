@@ -979,17 +979,17 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
     uint64_t last_version_reply_ns = 0;
     constexpr unsigned kMaxQuietAcks = 3;
     // Flow control (ROADMAP #9): what this lane can still absorb -- free
-    // space in its rings (the tightest writer's, times the writers, since
-    // runs of blocks rotate between them) plus the blocks already handed
-    // over and not yet written. Advertised in every Ack as rwnd.
+    // space in its writer rings plus the blocks already handed over and not
+    // yet written. Advertised in every Ack as rwnd.
     const auto receive_window = [&]() -> uint32_t {
-        size_t tightest = SIZE_MAX;
-        for (uint16_t k = 0; k < p->writers; ++k) {
-            tightest = std::min(tightest, p->ring(lane, k).writable());
-        }
-        const uint64_t w = static_cast<uint64_t>(tightest) * p->writers + pending;
+        uint64_t w = pending;
+        for (uint16_t k = 0; k < p->writers; ++k) w += p->ring(lane, k).writable();
         return static_cast<uint32_t>(std::min<uint64_t>(w, kWindow));
     };
+    // The last rwnd sent. When it was low and the writers have since caught
+    // up, an Ack goes out at once (a window update) rather than at the next
+    // 8-block / 200 us cadence, or a sender that paused for us would sit idle.
+    uint32_t advertised_rwnd = kRwndUnlimited;
     const auto send_resume_answer = [&] {
         for (const auto &m : resume_answer) sock.send_to(m.data(), m.size(), peer);
     };
@@ -1349,14 +1349,17 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
 
         const uint64_t t = now_ns();
         const bool heard_since_ack = last_rx_ns > last_ack_ns;
-        if (delivered - last_ack_blocks >= 8 ||
+        const uint32_t rwnd_now = receive_window();
+        const bool window_update = advertised_rwnd < kWindow / 4 && rwnd_now >= 2 * advertised_rwnd + 8;
+        if (delivered - last_ack_blocks >= 8 || window_update ||
             (t - last_ack_ns > 200000 && (heard_since_ack || quiet_acks < kMaxQuietAcks))) {
             quiet_acks = heard_since_ack ? 0 : quiet_acks + 1;
             last_ack_blocks = delivered;
             last_ack_ns = t;
             Ack ack = rx.build_ack();
             ack.nonce = peer_nonce;
-            ack.rwnd = receive_window();
+            ack.rwnd = rwnd_now;
+            advertised_rwnd = rwnd_now;
             const size_t n = seal_ctl(auth.get(), tx.data(), encode_ack(ack, tx.data(), tx.size()),
                                       tx.size());
             if (n) sock.send_to(tx.data(), n, peer);
