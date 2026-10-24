@@ -92,6 +92,14 @@ uint16_t peer_port(const PeerAddr &p) {
     return 0;
 }
 
+const char *wildcard_for(const PeerAddr &dst) {
+    return dst.addr.ss_family == AF_INET6 ? "::" : "0.0.0.0";
+}
+
+size_t ip_udp_overhead(const PeerAddr &dst) {
+    return dst.addr.ss_family == AF_INET6 ? 40 + 8 : 20 + 8;
+}
+
 bool peer_to_string(const PeerAddr &p, char *buf, size_t buf_cap) {
     if (p.addr.ss_family == AF_INET) {
         return inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in &>(p.addr).sin_addr, buf,

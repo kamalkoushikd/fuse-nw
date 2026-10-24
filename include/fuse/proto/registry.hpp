@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "fuse/proto/control.hpp"
 #include "fuse/proto/wire.hpp"
 
 namespace fuse::proto {
@@ -39,9 +40,9 @@ struct RegistrySlot {
 
 class SenderRegistry {
 public:
-    // window_size is clamped to [1, kMaxWindow]; the storage is always
-    // kMaxWindow slots, but only the first window_size are used, matching
-    // the per-stream window negotiated at SETUP (Stage 2).
+    // window_size is clamped to [1, kMaxWindow], and exactly that many slots
+    // are allocated, matching the per-stream window negotiated at SETUP
+    // (Stage 2).
     explicit SenderRegistry(uint16_t stream_id, uint16_t window_size);
 
     uint16_t stream_id() const { return stream_id_; }
@@ -85,6 +86,20 @@ private:
     uint16_t window_size_;
     std::vector<RegistrySlot> slots_;
 };
+
+// Applies one ACK to a sender's registry (ROADMAP #10): advances *base to
+// min(ack.base_seq_no, next_seq) -- the clamp matters, since an ACK is
+// untrusted input in plaintext mode -- confirming every slot below it, and
+// also confirms every slot the ACK's selective bitmask reports received
+// above the base. Returns the payload bytes newly confirmed. A block
+// confirmed this way is never resent by a NACK or the RTO, which used to
+// happen because senders ignored the bitmask and recovered burst losses
+// by NACKs alone.
+// If `received_end` is non-null it is raised to one past the highest seq the
+// ACK shows as received (cumulatively or selectively): blocks below it that
+// are still unacknowledged are genuinely missing, not merely in flight.
+uint64_t apply_ack(SenderRegistry &reg, const Ack &ack, uint64_t *base, uint64_t next_seq,
+                   uint64_t *received_end = nullptr);
 
 } // namespace fuse::proto
 

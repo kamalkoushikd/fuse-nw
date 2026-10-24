@@ -1,7 +1,17 @@
 #include "fuse/proto/session_crypto.hpp"
 
+#include "fuse/proto/wire.hpp"
+
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <new>
+#include <vector>
+
+#include <unistd.h>
+#if defined(__linux__)
+#include <sys/random.h>
+#endif
 
 #if FUSE_PROTO_WITH_DTLS
 #include <wolfssl/options.h>
@@ -15,6 +25,32 @@ namespace fuse::proto {
 
 bool session_crypto_available() {
     return FUSE_PROTO_WITH_DTLS != 0;
+}
+
+uint64_t secure_random_u64() {
+    uint8_t b[8] = {};
+    bool ok = random_bytes(b, sizeof(b));
+#if defined(__linux__)
+    for (size_t got = 0; !ok && got < sizeof(b);) {
+        const ssize_t n = ::getrandom(b + got, sizeof(b) - got, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        got += static_cast<size_t>(n);
+        ok = got == sizeof(b);
+    }
+#endif
+    if (!ok) {
+        // getentropy is available on Linux and macOS alike.
+        ok = ::getentropy(b, sizeof(b)) == 0;
+    }
+    if (!ok) {
+        // No secure source at all is not something a caller can recover
+        // from; a predictable nonce would silently weaken every session.
+        std::abort();
+    }
+    uint64_t v = 0;
+    for (uint8_t x : b) v = (v << 8) | x;
+    return v;
 }
 
 #if !FUSE_PROTO_WITH_DTLS
@@ -34,6 +70,10 @@ bool LaneCipher::open(uint16_t, uint64_t, const uint8_t *, size_t, const uint8_t
                       uint8_t *) const {
     return false;
 }
+bool derive_lane_epoch_key(const uint8_t *, uint16_t, uint64_t, uint8_t *) { return false; }
+bool ControlAuth::init(const uint8_t *, uint16_t, uint8_t) { return false; }
+size_t ControlAuth::seal(uint8_t *, size_t, size_t) { return 0; }
+bool ControlAuth::open(const uint8_t *, size_t, size_t *) const { return false; }
 
 #else
 
@@ -73,16 +113,19 @@ bool derive_session_key(const uint8_t *psk, size_t psk_len, const uint8_t *salt,
         return false;
     }
     // wc_Tls13_HKDF_Extract wants a mutable ikm; copy rather than cast away
-    // the caller's const.
-    uint8_t ikm[256];
-    if (psk_len > sizeof(ikm)) {
+    // the caller's const. Sized to the key, so a PSK of any length works (a
+    // fixed 256-byte buffer used to reject longer keys as "Unsupported").
+    if (psk_len > UINT32_MAX || salt_len > UINT32_MAX) {
         return false;
     }
-    std::memcpy(ikm, psk, psk_len);
+    std::vector<uint8_t> ikm(psk, psk + psk_len);
 
     uint8_t prk[WC_SHA256_DIGEST_SIZE];
-    if (wc_Tls13_HKDF_Extract(prk, salt, static_cast<word32>(salt_len), ikm,
-                              static_cast<word32>(psk_len), WC_SHA256) != 0) {
+    const bool extracted = wc_Tls13_HKDF_Extract(prk, salt, static_cast<word32>(salt_len),
+                                                 ikm.data(), static_cast<word32>(psk_len),
+                                                 WC_SHA256) == 0;
+    wc_ForceZero(ikm.data(), ikm.size());
+    if (!extracted) {
         return false;
     }
 
@@ -160,6 +203,129 @@ bool LaneCipher::open(uint16_t lane, uint64_t seq, const uint8_t *aad, size_t aa
                             static_cast<word32>(aad_len)) == 0;
 }
 
+bool derive_lane_epoch_key(const uint8_t session_key[kSessionKeyLen], uint16_t lane,
+                           uint64_t epoch, uint8_t out_key[kSessionKeyLen]) {
+    if (session_key == nullptr || out_key == nullptr) {
+        return false;
+    }
+    uint8_t context[10];
+    put_u16(context, lane);
+    put_u64(context + 2, epoch);
+    static const char kProtocol[] = "fuse2 ";
+    static const char kLabel[] = "lane key";
+    return wc_Tls13_HKDF_Expand_Label(out_key, static_cast<word32>(kSessionKeyLen), session_key,
+                                      kSessionKeyLen, reinterpret_cast<const byte *>(kProtocol),
+                                      sizeof(kProtocol) - 1,
+                                      reinterpret_cast<const byte *>(kLabel), sizeof(kLabel) - 1,
+                                      context, sizeof(context), WC_SHA256) == 0;
+}
+
+namespace {
+
+void control_nonce(uint16_t lane, uint64_t ctr, uint8_t dir, uint8_t out[kAeadNonceLen]) {
+    put_u16(out, lane);
+    put_u64(out + 2, ctr);
+    out[10] = dir;
+    out[11] = 0x01; // data nonces end in 0x0000
+}
+
+} // namespace
+
+bool ControlAuth::init(const uint8_t session_key[kSessionKeyLen], uint16_t lane,
+                       uint8_t local_dir) {
+    if (cipher_ || session_key == nullptr || local_dir > 1) {
+        return false;
+    }
+    uint8_t k[kSessionKeyLen];
+    static const char kProtocol[] = "fuse2 ";
+    static const char kLabel[] = "control key";
+    bool ok = wc_Tls13_HKDF_Expand_Label(k, static_cast<word32>(kSessionKeyLen), session_key,
+                                         kSessionKeyLen, reinterpret_cast<const byte *>(kProtocol),
+                                         sizeof(kProtocol) - 1,
+                                         reinterpret_cast<const byte *>(kLabel),
+                                         sizeof(kLabel) - 1, nullptr, 0, WC_SHA256) == 0;
+    auto c = std::make_unique<LaneCipher>();
+    ok = ok && c->init(k);
+    wc_ForceZero(k, sizeof(k));
+    if (!ok) {
+        return false;
+    }
+    cipher_ = std::move(c);
+    lane_ = lane;
+    dir_ = local_dir;
+    return true;
+}
+
+size_t ControlAuth::seal(uint8_t *dg, size_t len, size_t cap) {
+    if (!cipher_ || dg == nullptr || cap < len || cap - len < kControlTrailerLen ||
+        len > UINT32_MAX) {
+        return 0;
+    }
+    const uint64_t ctr = next_ctr_++;
+    put_u64(dg + len, ctr);
+    uint8_t nonce[kAeadNonceLen];
+    control_nonce(lane_, ctr, dir_, nonce);
+    // GMAC: empty plaintext, the whole datagram (with the counter) as AAD.
+    if (wc_AesGcmEncrypt(static_cast<Aes *>(cipher_->aes_), nullptr, nullptr, 0, nonce,
+                         kAeadNonceLen, dg + len + 8, kAeadTagLen, dg,
+                         static_cast<word32>(len + 8)) != 0) {
+        return 0;
+    }
+    return len + kControlTrailerLen;
+}
+
+bool ControlAuth::open(const uint8_t *dg, size_t len, size_t *body_len) const {
+    if (!cipher_ || dg == nullptr || len < kControlTrailerLen || len > UINT32_MAX) {
+        return false;
+    }
+    const size_t body = len - kControlTrailerLen;
+    uint64_t ctr = 0;
+    get_u64(dg + body, &ctr);
+    uint8_t nonce[kAeadNonceLen];
+    control_nonce(lane_, ctr, static_cast<uint8_t>(dir_ ^ 1), nonce);
+    if (wc_AesGcmDecrypt(static_cast<Aes *>(cipher_->aes_), nullptr, nullptr, 0, nonce,
+                         kAeadNonceLen, dg + body + 8, kAeadTagLen, dg,
+                         static_cast<word32>(body + 8)) != 0) {
+        return false;
+    }
+    if (body_len) *body_len = body;
+    return true;
+}
+
 #endif // FUSE_PROTO_WITH_DTLS
+
+bool LaneKeySchedule::init(const uint8_t session_key[kSessionKeyLen], uint16_t lane) {
+    if (ready_ || session_key == nullptr || !session_crypto_available()) {
+        return false;
+    }
+    std::memcpy(key_, session_key, kSessionKeyLen);
+    lane_ = lane;
+    ready_ = true;
+    return true;
+}
+
+const LaneCipher *LaneKeySchedule::cipher_for(uint64_t seq) {
+    if (!ready_) {
+        return nullptr;
+    }
+    const uint64_t epoch = seq >> kKeyEpochShift;
+    for (const Slot &s : slots_) {
+        if (s.cipher && s.epoch == epoch) {
+            return s.cipher.get();
+        }
+    }
+    uint8_t k[kSessionKeyLen];
+    auto c = std::make_unique<LaneCipher>();
+    const bool ok = derive_lane_epoch_key(key_, lane_, epoch, k) && c->init(k);
+    std::memset(k, 0, sizeof(k));
+    if (!ok) {
+        return nullptr;
+    }
+    Slot &slot = slots_[next_];
+    next_ = (next_ + 1) % 2;
+    slot.epoch = epoch;
+    slot.cipher = std::move(c);
+    return slot.cipher.get();
+}
 
 } // namespace fuse::proto

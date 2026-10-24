@@ -7,15 +7,18 @@
 extern "C" {
 #endif
 
-typedef enum fuse_status {
-    FUSE_OK                   = 0,
-    FUSE_ERR_INVALID_ARGUMENT = -1,
-    FUSE_ERR_BUFFER_TOO_SMALL = -2,
-    FUSE_ERR_MALFORMED_PACKET = -3,
-    FUSE_ERR_CRYPTO           = -4,
-    FUSE_ERR_SOCKET           = -5,
-    FUSE_ERR_NOT_SUPPORTED    = -6
-} fuse_status;
+/* Result codes of this C scaffold. Named fuse_result (not fuse_status) so
+ * this header can be included in the same translation unit as fuse/sdk.h,
+ * whose fuse_status has different values. */
+typedef enum fuse_result {
+    FUSE_RESULT_OK               = 0,
+    FUSE_RESULT_INVALID_ARGUMENT = -1,
+    FUSE_RESULT_BUFFER_TOO_SMALL = -2,
+    FUSE_RESULT_MALFORMED_PACKET = -3,
+    FUSE_RESULT_CRYPTO           = -4,
+    FUSE_RESULT_SOCKET           = -5,
+    FUSE_RESULT_NOT_SUPPORTED    = -6
+} fuse_result;
 
 /* Connection IDs are opaque, variable-length (0-20 byte) identifiers
  * chosen by each endpoint, mirroring the role they play in QUIC: they

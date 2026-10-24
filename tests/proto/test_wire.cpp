@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "fuse/proto/hash.hpp"
 #include "fuse/proto/wire.hpp"
 
 using namespace fuse::proto;
@@ -55,10 +56,22 @@ TEST(Wire, HeaderSizesMatchSpec) {
     // v6 added stream_base_offset/file_total_bytes to StreamStart so a
     // receiver can write each block straight to its place in the output.
     // v7 added resume: file_id in StreamStart, ResumeRanges and FileDigest.
-    EXPECT_EQ(kProtocolVersion, 7u);
+    EXPECT_EQ(kProtocolVersion, 8u);
 
     // The MTU-safe default stays well under a 1500-byte path MTU; the
     // ceiling is only reached by probing a link that proves it can take it.
     EXPECT_EQ(kDefaultPayloadSize, 1200u);
     EXPECT_GT(kMaxPayloadSize, kDefaultPayloadSize);
+}
+
+// Reference vectors from the SipHash paper (Aumasson & Bernstein, appendix
+// A): key 00..0f, message 00..(n-1).
+TEST(Wire, SipHashMatchesReferenceVectors) {
+    uint8_t key[16], msg[64];
+    for (int i = 0; i < 16; ++i) key[i] = static_cast<uint8_t>(i);
+    for (int i = 0; i < 64; ++i) msg[i] = static_cast<uint8_t>(i);
+    EXPECT_EQ(fuse::proto::siphash24(key, msg, 0), 0x726fdb47dd0e0e31ull);
+    EXPECT_EQ(fuse::proto::siphash24(key, msg, 1), 0x74f839c593dc67fdull);
+    EXPECT_EQ(fuse::proto::siphash24(key, msg, 8), 0x93f5f5799a932462ull);
+    EXPECT_EQ(fuse::proto::siphash24(key, msg, 15), 0xa129ca6149be45e5ull);
 }

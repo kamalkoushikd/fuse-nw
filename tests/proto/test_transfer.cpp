@@ -1,16 +1,21 @@
 #include <gtest/gtest.h>
 
 #include <poll.h>
+#include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
+#include <mutex>
 #include <string>
 #include <numeric>
 #include <thread>
@@ -20,14 +25,38 @@
 #include "fuse/proto/control.hpp"
 #include "fuse/proto/udp.hpp"
 #include "fuse/transfer.hpp"
+#include "test_ports.hpp"
 
 namespace {
 
 // Ports are picked per-test to avoid collisions between concurrently
 // running cases; the range must be free for `lanes` consecutive ports.
-uint16_t next_port() {
-    static std::atomic<uint16_t> p{41000};
-    return p.fetch_add(64);
+// Up to 16 lanes per test; see test_ports.hpp for why ports are probed.
+uint16_t next_port() { return fuse_test::free_port_block(16); }
+
+// Opens a lane on a real receiver the way a v8 sender does: a first
+// StreamStart, then the same StreamStart echoing the token from the
+// receiver's Retry (address validation). False if no Retry arrived.
+bool send_stream_start_v8(fuse::proto::UdpSocket &s, const fuse::proto::PeerAddr &to,
+                          fuse::proto::StreamStart ss) {
+    using namespace fuse::proto;
+    uint8_t buf[kMaxDatagramSize + 64];
+    ss.token = 0;
+    size_t n = encode_stream_start(ss, buf, sizeof(buf));
+    if (n == 0 || !s.send_to(buf, n, to)) return false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        pollfd pfd{s.fd(), POLLIN, 0};
+        if (::poll(&pfd, 1, 20) <= 0) continue;
+        size_t got = 0;
+        if (!s.recv_from(buf, sizeof(buf), &got, nullptr)) continue;
+        Retry r;
+        if (!decode_retry(buf, got, &r) || r.nonce != ss.nonce) continue;
+        ss.token = r.token;
+        n = encode_stream_start(ss, buf, sizeof(buf));
+        return n != 0 && s.send_to(buf, n, to);
+    }
+    return false;
 }
 
 std::vector<uint8_t> make_payload(size_t n) {
@@ -144,14 +173,22 @@ TEST(Transfer, WrongKeyDoesNotYieldData) {
 
     fuse::TransferConfig tx = rx;
     tx.host = "127.0.0.1";
-    tx.pre_shared_key = "sender-key";
+    tx.pre_shared_key = "sender-key-that-differs";
 
     std::vector<uint8_t> got;
     fuse::TransferStatus rs = fuse::TransferStatus::Ok;
     std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    fuse::send_buffer(tx, payload.data(), payload.size(), nullptr);
+    const auto t0 = std::chrono::steady_clock::now();
+    const fuse::TransferStatus ss = fuse::send_buffer(tx, payload.data(), payload.size(), nullptr);
+    const double send_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     receiver.join();
+
+    // v8 key confirmation: the mismatch is found at the handshake, so the
+    // sender learns it promptly instead of after its connect timeout.
+    EXPECT_EQ(ss, fuse::TransferStatus::AuthFailed) << fuse::to_string(ss);
+    EXPECT_LT(send_ms, 2000.0);
 
     // Specifically AuthFailed, not just "not Ok": the idle-timeout exit path
     // used to skip the auth-failure classification entirely (it lived only
@@ -162,6 +199,47 @@ TEST(Transfer, WrongKeyDoesNotYieldData) {
     // AuthFailed.
     EXPECT_EQ(rs, fuse::TransferStatus::AuthFailed) << fuse::to_string(rs);
     EXPECT_NE(got, payload) << "no plaintext may be recovered with the wrong key";
+}
+
+// A short pre-shared key is almost certainly a password, which this key
+// schedule cannot protect; it is refused up front on both ends (#19).
+TEST(Transfer, ShortPreSharedKeyIsRefused) {
+    fuse::TransferConfig cfg;
+    cfg.base_port = next_port();
+    cfg.lanes = 1;
+    cfg.pre_shared_key = "hunter2";
+    const uint8_t byte = 0;
+    EXPECT_EQ(fuse::send_buffer(cfg, &byte, 1), fuse::TransferStatus::ConfigError);
+    std::vector<uint8_t> out;
+    EXPECT_EQ(fuse::receive_buffer(cfg, &out), fuse::TransferStatus::ConfigError);
+}
+
+// Mismatched encryption settings fail closed at the handshake, in both
+// directions: neither end may fall back to plaintext.
+TEST(Transfer, EncryptionMismatchFailsAtHandshake) {
+    const auto payload = make_payload(64 * 1024);
+    for (bool sender_has_key : {true, false}) {
+        SCOPED_TRACE(sender_has_key ? "only sender keyed" : "only receiver keyed");
+        const uint16_t port = next_port();
+        fuse::TransferConfig rx;
+        rx.bind_address = "127.0.0.1";
+        rx.base_port = port;
+        rx.lanes = 1;
+        rx.timeout_ms = 1500;
+        fuse::TransferConfig tx = rx;
+        tx.host = "127.0.0.1";
+        (sender_has_key ? tx : rx).pre_shared_key = "a-long-enough-pre-shared-key";
+
+        std::vector<uint8_t> got;
+        fuse::TransferStatus rs = fuse::TransferStatus::Ok;
+        std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const fuse::TransferStatus ss = fuse::send_buffer(tx, payload.data(), payload.size(), nullptr);
+        receiver.join();
+        EXPECT_EQ(ss, fuse::TransferStatus::AuthFailed) << fuse::to_string(ss);
+        EXPECT_EQ(rs, fuse::TransferStatus::AuthFailed) << fuse::to_string(rs);
+        EXPECT_TRUE(got.empty());
+    }
 }
 
 #endif // FUSE_PROTO_WITH_DTLS
@@ -199,10 +277,7 @@ TEST(Transfer, MaliciousOffsetIsRejectedNotWritten) {
     ss.total_bytes = payload.size();
     ss.file_total_bytes = ss.total_bytes; // single lane: the whole transfer
     ss.nonce = 0x1234;
-    uint8_t ssdg[256];
-    const size_t ssn = encode_stream_start(ss, ssdg, sizeof(ssdg));
-    ASSERT_GT(ssn, 0u);
-    ASSERT_TRUE(atk.send_to(ssdg, ssn, dst));
+    ASSERT_TRUE(send_stream_start_v8(atk, dst, ss));
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // The malicious block: in-window seq_no (so the receiver's window logic
@@ -270,10 +345,7 @@ TEST(Transfer, HugeStreamStartSizeFailsCleanlyInsteadOfCrashing) {
     ss.total_bytes = UINT64_MAX - 8; // exceeds any real allocator's max_size()
     ss.file_total_bytes = ss.total_bytes; // single lane: the whole transfer
     ss.nonce = 0x5;
-    uint8_t dg[256];
-    const size_t n = encode_stream_start(ss, dg, sizeof(dg));
-    ASSERT_GT(n, 0u);
-    ASSERT_TRUE(atk.send_to(dg, n, dst));
+    ASSERT_TRUE(send_stream_start_v8(atk, dst, ss));
 
     receiver.join(); // must return promptly, not crash the whole test binary
     EXPECT_EQ(rs, fuse::TransferStatus::ResourceLimit) << fuse::to_string(rs);
@@ -285,6 +357,14 @@ namespace fakepeer {
 
 using namespace fuse::proto;
 using Clock = std::chrono::steady_clock;
+
+// A fake peer that only reads now and then must not lose the one message a
+// test is waiting for because a burst of data blocks filled its socket
+// buffer first (the sender's abort is sent three times, unacknowledged).
+void big_buffers(UdpSocket &s) {
+    int bytes = 16 << 20;
+    setsockopt(s.fd(), SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes));
+}
 
 void set_rcv_timeout_ms(UdpSocket &s, int ms) {
     timeval tv{};
@@ -452,6 +532,7 @@ TEST(Transfer, SenderCancelTellsReceiverAndReturnsPromptly) {
 
     UdpSocket fake_rx;
     ASSERT_TRUE(fake_rx.open("127.0.0.1", port));
+    fakepeer::big_buffers(fake_rx);
 
     std::atomic<bool> cancel{false};
     fuse::TransferConfig tx;
@@ -512,8 +593,7 @@ TEST(Transfer, ReceiverCancelTellsSenderAndReturnsPromptly) {
     ss.file_total_bytes = ss.total_bytes; // single lane: the whole transfer
     ss.nonce = 0x77;
     uint8_t buf[kMaxDatagramSize + 64];
-    const size_t n = encode_stream_start(ss, buf, sizeof(buf));
-    ASSERT_TRUE(fake_tx.send_to(buf, n, dst));
+    ASSERT_TRUE(send_stream_start_v8(fake_tx, dst, ss));
     ASSERT_GT(fakepeer::wait_for(fake_tx, MsgType::Ack, buf, sizeof(buf), 2000), 0u);
 
     const auto cancelled_at = fakepeer::Clock::now();
@@ -556,8 +636,7 @@ TEST(Transfer, PeerAbortEndsReceiverPromptly) {
     ss.file_total_bytes = ss.total_bytes; // single lane: the whole transfer
     ss.nonce = 0x99;
     uint8_t buf[kMaxDatagramSize + 64];
-    const size_t n = encode_stream_start(ss, buf, sizeof(buf));
-    ASSERT_TRUE(fake_tx.send_to(buf, n, dst));
+    ASSERT_TRUE(send_stream_start_v8(fake_tx, dst, ss));
     ASSERT_GT(fakepeer::wait_for(fake_tx, MsgType::Ack, buf, sizeof(buf), 2000), 0u);
 
     fakepeer::send_close(fake_tx, dst, 0x98, kStreamCloseAborted); // wrong session
@@ -582,6 +661,7 @@ TEST(Transfer, SlowHandshakeSucceedsAndPeerAbortEndsSender) {
 
     UdpSocket fake_rx;
     ASSERT_TRUE(fake_rx.open("127.0.0.1", port));
+    fakepeer::big_buffers(fake_rx);
 
     fuse::TransferConfig tx;
     tx.host = "127.0.0.1";
@@ -689,8 +769,12 @@ std::vector<uint8_t> read_all(const fs::path &p) {
 // dedicated retransmission thread serves.
 class LossyRelay {
 public:
-    LossyRelay(uint16_t listen_port, uint16_t receiver_port, int drop_every)
-        : drop_every_(drop_every) {
+    // `rebind_after` > 0: after that many forwarded data blocks, the relay
+    // switches to a fresh source port toward the receiver, which is what a
+    // NAT rebinding looks like from the receiver's side.
+    LossyRelay(uint16_t listen_port, uint16_t receiver_port, int drop_every,
+               uint64_t rebind_after = 0)
+        : drop_every_(drop_every), rebind_after_(rebind_after) {
         using namespace fuse::proto;
         EXPECT_TRUE(front_.open("127.0.0.1", listen_port));
         EXPECT_TRUE(back_.open("127.0.0.1", 0));
@@ -709,6 +793,30 @@ public:
         thread_.join();
     }
     uint64_t dropped() const { return dropped_.load(); }
+    // Drops one in `one_in` data datagrams longer than `threshold` bytes,
+    // the way a 1500-byte path loses fragmented datagrams when a fragment
+    // is lost. Set before traffic starts.
+    void lose_large_datagrams(size_t threshold, int one_in) {
+        large_threshold_ = threshold;
+        large_one_in_ = one_in;
+    }
+    uint64_t data_datagrams() const { return data_total_.load(); }
+    uint64_t large_datagrams() const { return data_large_.load(); }
+    // Blocks seen more than once (a retransmission of an earlier seq), and
+    // how many of those carried different payload bytes than the first copy.
+    // Under encryption a resend must be the identical ciphertext and tag: a
+    // second, different tag under the same nonce is the GCM nonce-reuse flaw.
+    // What an on-path observer learns: the sender's address and the lane
+    // nonce from its (plaintext-framed) StreamStart.
+    bool observed(fuse::proto::PeerAddr *sender, uint64_t *nonce) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!seen_start_) return false;
+        *sender = sender_seen_;
+        *nonce = nonce_seen_;
+        return true;
+    }
+    uint64_t resends() const { return resends_.load(); }
+    uint64_t changed_resends() const { return changed_resends_.load(); }
 
 private:
     void run() {
@@ -727,10 +835,50 @@ private:
                 sender = from;
                 have_sender = true;
                 MsgType t;
+                StreamStart start;
+                if (decode_stream_start(buf.data(), got, &start)) {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    seen_start_ = true;
+                    sender_seen_ = from;
+                    nonce_seen_ = start.nonce;
+                }
+                BlockHeader h;
+                uint64_t st = 0;
+                const uint8_t *pl = nullptr;
+                if (peek_msg_type(buf.data(), got, &t) && t == MsgType::Data &&
+                    decode_data_datagram(buf.data(), got, &h, &st, &pl)) {
+                    std::vector<uint8_t> body(pl, pl + h.payload_len);
+                    auto it = first_copy_.find(h.seq_no);
+                    if (it == first_copy_.end()) {
+                        first_copy_.emplace(h.seq_no, std::move(body));
+                    } else {
+                        resends_.fetch_add(1);
+                        if (it->second != body) changed_resends_.fetch_add(1);
+                    }
+                }
+                if (peek_msg_type(buf.data(), got, &t) && t == MsgType::Data) {
+                    data_total_.fetch_add(1);
+                    if (large_one_in_ > 0 && got > large_threshold_) {
+                        data_large_.fetch_add(1);
+                        if (++large_seen_ % static_cast<uint64_t>(large_one_in_) == 0) {
+                            dropped_.fetch_add(1);
+                            continue;
+                        }
+                    }
+                }
                 if (peek_msg_type(buf.data(), got, &t) && t == MsgType::Data && got > 20 &&
                     (buf[12] & kFlagRetransmission) == 0 && ++data_seen % drop_every_ == 0) {
                     dropped_.fetch_add(1);
                     continue;
+                }
+                if (rebind_after_ != 0 && data_seen == rebind_after_ && !rebound_) {
+                    fuse::proto::UdpSocket fresh;
+                    EXPECT_TRUE(fresh.open("127.0.0.1", 0));
+                    int big = 8 << 20;
+                    setsockopt(fresh.fd(), SOL_SOCKET, SO_RCVBUF, &big, sizeof(big));
+                    fresh.set_nonblocking(true);
+                    back_ = std::move(fresh);
+                    rebound_ = true;
                 }
                 back_.send_to(buf.data(), got, receiver_);
             }
@@ -744,8 +892,20 @@ private:
     fuse::proto::UdpSocket front_, back_;
     fuse::proto::PeerAddr receiver_;
     int drop_every_;
+    uint64_t rebind_after_ = 0;
+    size_t large_threshold_ = 0;
+    int large_one_in_ = 0;
+    uint64_t large_seen_ = 0;
+    std::atomic<uint64_t> data_total_{0}, data_large_{0};
+    bool rebound_ = false;
     std::atomic<bool> stop_{false};
     std::atomic<uint64_t> dropped_{0};
+    std::atomic<uint64_t> resends_{0}, changed_resends_{0};
+    std::map<uint64_t, std::vector<uint8_t>> first_copy_;
+    std::mutex mu_;
+    bool seen_start_ = false;
+    fuse::proto::PeerAddr sender_seen_{};
+    uint64_t nonce_seen_ = 0;
     std::thread thread_;
 };
 
@@ -880,10 +1040,439 @@ TEST(Transfer, LossyLinkRecoversThroughRetransmitThread) {
             ASSERT_EQ(rs, fuse::TransferStatus::Ok) << fuse::to_string(rs);
             EXPECT_GT(relay.dropped(), 0u);
             EXPECT_GT(st.retransmits, 0u);
+            EXPECT_GT(relay.resends(), 0u);
+            EXPECT_EQ(relay.changed_resends(), 0u)
+                << "a retransmit must resend the identical (cipher)text";
             EXPECT_EQ(pipeline_test::read_all(out), payload);
             fs::remove(out);
         }
     }
+}
+
+#if FUSE_PROTO_WITH_DTLS
+// Under a pre-shared key the control plane is authenticated (v8): an
+// attacker who has seen the lane nonce can no longer abort the transfer
+// with a forged StreamClose, nor make the sender believe undelivered data
+// arrived with a forged Ack.
+TEST(Transfer, ForgedControlMessagesAreIgnoredUnderPsk) {
+    using namespace fuse::proto;
+    namespace fs = std::filesystem;
+    const auto payload = make_payload(8 * 1024 * 1024);
+    const uint16_t rx_port = next_port();
+    const uint16_t relay_port = next_port();
+
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = rx_port;
+    rx.lanes = 1;
+    rx.timeout_ms = 20000;
+    rx.pre_shared_key = "control-plane-test-key";
+    fuse::TransferConfig tx = rx;
+    tx.host = "127.0.0.1";
+    tx.base_port = relay_port;
+
+    pipeline_test::LossyRelay relay(relay_port, rx_port, 40);
+    std::vector<uint8_t> got;
+    fuse::TransferStatus rs = fuse::TransferStatus::Incomplete, ss = rs;
+    std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    std::atomic<bool> done{false};
+    std::thread sender([&] {
+        ss = fuse::send_buffer(tx, payload.data(), payload.size(), nullptr);
+        done.store(true);
+    });
+
+    UdpSocket atk;
+    ASSERT_TRUE(atk.open("127.0.0.1", 0));
+    PeerAddr victim{};
+    uint64_t nonce = 0;
+    while (!relay.observed(&victim, &nonce) && !done.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    uint64_t forged = 0;
+    while (!done.load()) {
+        uint8_t buf[256];
+        StreamClose sc;
+        sc.nonce = nonce;
+        sc.reason = kStreamCloseAborted;
+        size_t n = encode_stream_close(sc, buf, sizeof(buf));
+        atk.send_to(buf, n, victim);
+        Ack ack;
+        ack.nonce = nonce;
+        ack.base_seq_no = UINT64_MAX;
+        n = encode_ack(ack, buf, sizeof(buf));
+        atk.send_to(buf, n, victim);
+        forged += 2;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    sender.join();
+    receiver.join();
+    EXPECT_GT(forged, 0u);
+    EXPECT_EQ(ss, fuse::TransferStatus::Ok) << fuse::to_string(ss);
+    EXPECT_EQ(rs, fuse::TransferStatus::Ok) << fuse::to_string(rs);
+    EXPECT_EQ(got, payload);
+}
+
+#endif // FUSE_PROTO_WITH_DTLS
+
+// The sender's address changing mid-transfer (a NAT rebinding) must not
+// break the transfer: the receiver validates the new source with a path
+// challenge and then moves its ACKs there (v8, ROADMAP #3).
+TEST(Transfer, SurvivesSenderAddressChangeViaPathValidation) {
+    const auto payload = make_payload(4 * 1024 * 1024);
+    std::vector<std::string> keys = {""};
+    if (fuse::encryption_available()) keys.push_back("path-validation-test-key");
+    for (const std::string &psk : keys) {
+        SCOPED_TRACE(psk.empty() ? "plain" : "psk");
+        const uint16_t rx_port = next_port();
+        const uint16_t relay_port = next_port();
+        fuse::TransferConfig rx;
+        rx.bind_address = "127.0.0.1";
+        rx.base_port = rx_port;
+        rx.lanes = 1;
+        rx.timeout_ms = 20000;
+        rx.pre_shared_key = psk;
+        fuse::TransferConfig tx = rx;
+        tx.host = "127.0.0.1";
+        tx.base_port = relay_port;
+
+        pipeline_test::LossyRelay relay(relay_port, rx_port, 1 << 30, /*rebind_after=*/200);
+        std::vector<uint8_t> got;
+        fuse::TransferStatus rs = fuse::TransferStatus::Incomplete;
+        std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const auto ss = fuse::send_buffer(tx, payload.data(), payload.size());
+        receiver.join();
+        EXPECT_EQ(ss, fuse::TransferStatus::Ok) << fuse::to_string(ss);
+        EXPECT_EQ(rs, fuse::TransferStatus::Ok) << fuse::to_string(rs);
+        EXPECT_EQ(got, payload);
+    }
+}
+
+// A data block from some other address -- here a correct-looking forgery in
+// plaintext mode -- must not redirect the receiver's ACKs there. The other
+// address only ever gets a path challenge, which it cannot answer for the
+// real sender.
+TEST(Transfer, ForeignSourceCannotRedirectAcks) {
+    using namespace fuse::proto;
+    const uint16_t port = next_port();
+    std::atomic<bool> cancel{false};
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = port;
+    rx.lanes = 1;
+    rx.timeout_ms = 20000;
+    rx.cancel = &cancel;
+    std::vector<uint8_t> got;
+    std::thread receiver([&] { fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    UdpSocket real, other;
+    ASSERT_TRUE(real.open("127.0.0.1", 0));
+    ASSERT_TRUE(other.open("127.0.0.1", 0));
+    fakepeer::set_rcv_timeout_ms(other, 50);
+    PeerAddr dst;
+    ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", port, &dst));
+    StreamStart ss;
+    ss.total_bytes = 1 << 20;
+    ss.file_total_bytes = ss.total_bytes;
+    ss.nonce = 0x77;
+    ASSERT_TRUE(send_stream_start_v8(real, dst, ss));
+
+    // Block 0 from the foreign address. It is new, so it is Accepted, which
+    // used to be enough to re-anchor the peer.
+    uint8_t buf[kMaxDatagramSize + 64], payload[1200] = {};
+    BlockHeader hdr;
+    hdr.payload_len = sizeof(payload);
+    const size_t n = encode_data_datagram(hdr, 1, payload, buf, sizeof(buf));
+    ASSERT_TRUE(other.send_to(buf, n, dst));
+
+    uint64_t acks = 0, challenges = 0;
+    const auto until = fakepeer::Clock::now() + std::chrono::milliseconds(500);
+    while (fakepeer::Clock::now() < until) {
+        size_t got_n = 0;
+        MsgType t;
+        if (other.recv_from(buf, sizeof(buf), &got_n, nullptr) && peek_msg_type(buf, got_n, &t)) {
+            if (t == MsgType::Ack) ++acks;
+            if (t == MsgType::PathChallenge) ++challenges;
+        }
+    }
+    cancel.store(true);
+    receiver.join();
+    EXPECT_EQ(acks, 0u) << "ACKs were redirected to an unvalidated address";
+    EXPECT_GE(challenges, 1u);
+}
+
+// ROADMAP #11: a version mismatch is reported as such on both ends instead
+// of as a silent Timeout.
+TEST(Transfer, VersionMismatchIsReported) {
+    using namespace fuse::proto;
+    // Receiver side: a datagram from an older peer gets the mismatch reply.
+    {
+        const uint16_t port = next_port();
+        std::atomic<bool> cancel{false};
+        fuse::TransferConfig rx;
+        rx.bind_address = "127.0.0.1";
+        rx.base_port = port;
+        rx.lanes = 1;
+        rx.timeout_ms = 20000;
+        rx.cancel = &cancel;
+        std::vector<uint8_t> got;
+        std::thread receiver([&] { fuse::receive_buffer(rx, &got, nullptr); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        UdpSocket old_peer;
+        ASSERT_TRUE(old_peer.open("127.0.0.1", 0));
+        fakepeer::set_rcv_timeout_ms(old_peer, 1000);
+        PeerAddr dst;
+        ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", port, &dst));
+        uint8_t v7[70] = {7, static_cast<uint8_t>(MsgType::StreamStart)};
+        ASSERT_TRUE(old_peer.send_to(v7, sizeof(v7), dst));
+        uint8_t in[64];
+        size_t n = 0;
+        ASSERT_TRUE(old_peer.recv_from(in, sizeof(in), &n, nullptr));
+        uint8_t peer_version = 0;
+        EXPECT_EQ(n, kVersionMismatchSize);
+        EXPECT_EQ(in[0], kProtocolVersion);
+        EXPECT_EQ(in[1], kVersionMismatchMarker);
+        EXPECT_FALSE(decode_version_mismatch(in, n, &peer_version)); // it's ours
+        cancel.store(true);
+        receiver.join();
+    }
+    // Sender side: a receiver that answers with a mismatch ends the call.
+    {
+        const uint16_t port = next_port();
+        UdpSocket other_version;
+        ASSERT_TRUE(other_version.open("127.0.0.1", port));
+        std::atomic<bool> stop{false};
+        std::thread fake([&] {
+            fakepeer::set_rcv_timeout_ms(other_version, 20);
+            while (!stop.load()) {
+                uint8_t in[kMaxDatagramSize + 64];
+                size_t n = 0;
+                PeerAddr from;
+                if (other_version.recv_from(in, sizeof(in), &n, &from)) {
+                    const uint8_t reply[3] = {9, kVersionMismatchMarker, 9};
+                    other_version.send_to(reply, sizeof(reply), from);
+                }
+            }
+        });
+        fuse::TransferConfig tx;
+        tx.host = "127.0.0.1";
+        tx.base_port = port;
+        tx.lanes = 1;
+        const uint8_t byte = 1;
+        const auto t0 = fakepeer::Clock::now();
+        EXPECT_EQ(fuse::send_buffer(tx, &byte, 1), fuse::TransferStatus::VersionMismatch);
+        EXPECT_LT(fakepeer::ms_since(t0), 1000.0);
+        stop.store(true);
+        fake.join();
+    }
+}
+
+// ROADMAP #9: a receiver whose pipeline is the bottleneck (tiny rings, one
+// writer) advertises how much it can take, so the sender doesn't overrun
+// it -- overruns used to be silent drops, repaired by retransmission.
+TEST(Transfer, SmallReceiverRingsAreNotOverrun) {
+    const auto payload = make_payload(16 * 1024 * 1024);
+    const uint16_t port = next_port();
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = port;
+    rx.lanes = 1;
+    rx.timeout_ms = 20000;
+    rx.writer_threads = 1;
+    rx.ring_slots = 16;
+    fuse::TransferConfig tx = rx;
+    tx.host = "127.0.0.1";
+    std::vector<uint8_t> got;
+    fuse::TransferStatus rs = fuse::TransferStatus::Incomplete;
+    std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    fuse::TransferStats st;
+    EXPECT_EQ(fuse::send_buffer(tx, payload.data(), payload.size(), &st), fuse::TransferStatus::Ok);
+    receiver.join();
+    EXPECT_EQ(rs, fuse::TransferStatus::Ok);
+    EXPECT_EQ(got, payload);
+    std::printf("[ info ] retransmits with 16-slot rings: %llu\n",
+                static_cast<unsigned long long>(st.retransmits));
+    EXPECT_LT(st.retransmits, 400u) << "the receiver's rings were overrun";
+}
+
+// ROADMAP #7: on a path that loses large (fragmented) datagrams, block-size
+// growth must settle below the failing size instead of sawtoothing into it.
+TEST(Transfer, BlockGrowthSettlesOnAPathThatLosesLargeDatagrams) {
+    const auto payload = make_payload(24 * 1024 * 1024);
+    const uint16_t rx_port = next_port();
+    const uint16_t relay_port = next_port();
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = rx_port;
+    rx.lanes = 1;
+    rx.timeout_ms = 30000;
+    fuse::TransferConfig tx = rx;
+    tx.host = "127.0.0.1";
+    tx.base_port = relay_port;
+
+    pipeline_test::LossyRelay relay(relay_port, rx_port, 1 << 30);
+    relay.lose_large_datagrams(1500, 3); // a third of anything bigger than an Ethernet MTU
+    std::vector<uint8_t> got;
+    fuse::TransferStatus rs = fuse::TransferStatus::Incomplete;
+    std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(fuse::send_buffer(tx, payload.data(), payload.size()), fuse::TransferStatus::Ok);
+    receiver.join();
+    EXPECT_EQ(rs, fuse::TransferStatus::Ok);
+    EXPECT_EQ(got, payload);
+    const double large = static_cast<double>(relay.large_datagrams()) /
+                         static_cast<double>(std::max<uint64_t>(1, relay.data_datagrams()));
+    std::printf("[ info ] %.1f%% of %llu data datagrams were > 1500 bytes\n", 100 * large,
+                static_cast<unsigned long long>(relay.data_datagrams()));
+    EXPECT_LT(large, 0.10) << "the sender kept growing into a size the path loses";
+}
+
+// ROADMAP #25: lanes past port 65535 used to wrap to ports near 0 (failing
+// to bind below 1024 with a misleading SocketError); now a ConfigError.
+TEST(Transfer, PortRangePastTopIsAConfigError) {
+    fuse::TransferConfig cfg;
+    cfg.base_port = 65530;
+    cfg.lanes = 8; // 65530..65537
+    const uint8_t byte = 0;
+    EXPECT_EQ(fuse::send_buffer(cfg, &byte, 1), fuse::TransferStatus::ConfigError);
+    std::vector<uint8_t> out;
+    EXPECT_EQ(fuse::receive_buffer(cfg, &out), fuse::TransferStatus::ConfigError);
+    cfg.lanes = 6; // 65530..65535 is fine as far as configuration goes
+    cfg.timeout_ms = 1;
+    cfg.connect_timeout_ms = 1;
+    EXPECT_NE(fuse::send_buffer(cfg, &byte, 1), fuse::TransferStatus::ConfigError);
+}
+
+// Senders used to always open an IPv4 socket, so an IPv6 destination
+// failed even though receivers can bind "::". Skipped without IPv6.
+TEST(Transfer, WorksOverIpv6) {
+    {
+        fuse::proto::UdpSocket probe;
+        if (!probe.open("::1", 0)) GTEST_SKIP() << "no IPv6 loopback on this host";
+    }
+    const auto payload = make_payload(2 * 1024 * 1024);
+    const uint16_t port = next_port();
+    fuse::TransferConfig rx;
+    rx.bind_address = "::1";
+    rx.base_port = port;
+    rx.lanes = 2;
+    rx.timeout_ms = 20000;
+    fuse::TransferConfig tx = rx;
+    tx.host = "::1";
+    std::vector<uint8_t> got;
+    fuse::TransferStatus rs = fuse::TransferStatus::Incomplete;
+    std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(fuse::send_buffer(tx, payload.data(), payload.size()), fuse::TransferStatus::Ok);
+    receiver.join();
+    EXPECT_EQ(rs, fuse::TransferStatus::Ok);
+    EXPECT_EQ(got, payload);
+}
+
+// Return routability (ROADMAP #18, #5): a StreamStart from an address that
+// hasn't proved it can receive there (no valid token) is answered only with
+// a Retry no larger than itself, and claims nothing — so a spoofed source
+// neither hijacks the lane nor turns the receiver into an amplifier.
+TEST(Transfer, UnvalidatedStreamStartGetsOnlyARetry) {
+    using namespace fuse::proto;
+    const uint16_t port = next_port();
+    std::atomic<bool> cancel{false};
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = port;
+    rx.lanes = 1;
+    rx.timeout_ms = 20000;
+    rx.cancel = &cancel;
+    std::vector<uint8_t> got;
+    fuse::TransferStatus rs = fuse::TransferStatus::Ok;
+    std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    UdpSocket spoofer;
+    ASSERT_TRUE(spoofer.open("127.0.0.1", 0));
+    fakepeer::set_rcv_timeout_ms(spoofer, 50);
+    PeerAddr dst;
+    ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", port, &dst));
+    StreamStart ss;
+    ss.total_bytes = 1 << 20;
+    ss.file_total_bytes = ss.total_bytes;
+    ss.nonce = 0xBAD;
+    ss.token = 0x1234; // a guess
+    uint8_t buf[kMaxDatagramSize + 64];
+    const size_t req = encode_stream_start(ss, buf, sizeof(buf));
+    uint64_t replies = 0, reply_bytes = 0, non_retry = 0;
+    for (int i = 0; i < 20; ++i) {
+        ASSERT_TRUE(spoofer.send_to(buf, req, dst));
+        uint8_t in[kMaxDatagramSize + 64];
+        size_t n = 0;
+        while (spoofer.recv_from(in, sizeof(in), &n, nullptr)) {
+            ++replies;
+            reply_bytes += n;
+            MsgType t;
+            if (!peek_msg_type(in, n, &t) || t != MsgType::Retry) ++non_retry;
+        }
+    }
+    EXPECT_EQ(replies, 20u);
+    EXPECT_EQ(non_retry, 0u) << "nothing but a Retry before the address is validated";
+    EXPECT_LE(reply_bytes, 20 * req) << "the receiver must not amplify";
+
+    // The lane is still free: a real sender completes normally.
+    const auto payload = make_payload(256 * 1024);
+    fuse::TransferConfig tx = rx;
+    tx.host = "127.0.0.1";
+    tx.cancel = nullptr;
+    EXPECT_EQ(fuse::send_buffer(tx, payload.data(), payload.size()), fuse::TransferStatus::Ok);
+    receiver.join();
+    EXPECT_EQ(rs, fuse::TransferStatus::Ok) << fuse::to_string(rs);
+    EXPECT_EQ(got, payload);
+}
+
+// Once a sender goes silent, the receiver stops acknowledging after a few
+// timer-driven Acks instead of sending ~50 a second until its idle timeout.
+TEST(Transfer, ReceiverStopsAckingASilentPeer) {
+    using namespace fuse::proto;
+    const uint16_t port = next_port();
+    std::atomic<bool> cancel{false};
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = port;
+    rx.lanes = 1;
+    rx.timeout_ms = 20000;
+    rx.cancel = &cancel;
+    std::vector<uint8_t> got;
+    std::thread receiver([&] { fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    UdpSocket fake_tx;
+    ASSERT_TRUE(fake_tx.open("127.0.0.1", 0));
+    PeerAddr dst;
+    ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", port, &dst));
+    StreamStart ss;
+    ss.total_bytes = 1 << 20;
+    ss.file_total_bytes = ss.total_bytes;
+    ss.nonce = 0x51;
+    ASSERT_TRUE(send_stream_start_v8(fake_tx, dst, ss));
+
+    // Count everything the receiver sends us over one second of silence.
+    fakepeer::set_rcv_timeout_ms(fake_tx, 50);
+    uint64_t acks = 0;
+    const auto until = fakepeer::Clock::now() + std::chrono::seconds(1);
+    while (fakepeer::Clock::now() < until) {
+        uint8_t in[kMaxDatagramSize + 64];
+        size_t n = 0;
+        MsgType t;
+        if (fake_tx.recv_from(in, sizeof(in), &n, nullptr) && peek_msg_type(in, n, &t) &&
+            t == MsgType::Ack) {
+            ++acks;
+        }
+    }
+    cancel.store(true);
+    receiver.join();
+    EXPECT_GE(acks, 1u);
+    EXPECT_LE(acks, 5u) << "the receiver kept acknowledging a silent peer";
 }
 
 // StreamStart sizes are unauthenticated claims: a lane that doesn't fit
@@ -923,8 +1512,7 @@ TEST(Transfer, InconsistentStreamStartIsRejected) {
         ss.stream_base_offset = base;
         ss.total_bytes = total;
         ss.file_total_bytes = file_total;
-        const size_t n = encode_stream_start(ss, buf, sizeof(buf));
-        ASSERT_TRUE(from.send_to(buf, n, to));
+        ASSERT_TRUE(send_stream_start_v8(from, to, ss));
     };
 
     // Lane that would reach past the end of its own transfer (and whose
@@ -989,13 +1577,29 @@ Run transfer(const fs::path &in, const fs::path &out) {
 // about 30% has arrived, leaving a resumable <out>.part — exactly what a
 // Ctrl+C or a dropped connection mid-transfer leaves. False if the transfer
 // finished before the cancel could land (nothing to resume then).
+bool interrupt_once(const fs::path &in, const fs::path &out, uint64_t size, uint64_t at_bytes);
+
+// On a fast host a whole transfer can complete between two progress
+// callbacks, so retry with an ever earlier cancel point before giving up:
+// skipping a resume test should be the rare exception, not the norm.
 bool interrupt_midway(const fs::path &in, const fs::path &out, uint64_t size) {
+    uint64_t at = size * 3 / 10;
+    for (int attempt = 0; attempt < 5; ++attempt, at /= 4) {
+        std::error_code ec;
+        fs::remove(out.string() + ".part", ec);
+        if (interrupt_once(in, out, size, at == 0 ? 1 : at)) return true;
+    }
+    return false;
+}
+
+bool interrupt_once(const fs::path &in, const fs::path &out, uint64_t size, uint64_t at_bytes) {
+    (void)size;
     std::atomic<bool> cancel{false};
     fuse::TransferConfig rx = receiver_config(next_port());
     rx.cancel = &cancel;
     rx.progress_interval_ms = 10;
     rx.on_progress = [&](const fuse::TransferProgress &p) {
-        if (p.bytes_done >= size * 3 / 10) cancel.store(true);
+        if (p.bytes_done >= at_bytes) cancel.store(true);
     };
     fuse::TransferConfig tx = receiver_config(rx.base_port);
     tx.host = "127.0.0.1";
@@ -1064,6 +1668,39 @@ TEST(Transfer, ResumeIgnoresPartialCopyOfAChangedFile) {
     const auto r = resume_test::transfer(in, out);
     ASSERT_EQ(r.recv, fuse::TransferStatus::Ok) << fuse::to_string(r.recv);
     EXPECT_EQ(r.recv_stats.resumed_bytes, 0u) << "resumed from another file's partial copy";
+    EXPECT_EQ(pipeline_test::read_all(out), payload);
+    fs::remove(in);
+    fs::remove(out);
+}
+
+// ROADMAP #15: a file rewritten in place with the same size *and its mtime
+// restored* must not be resumed against: the partial copy holds the old
+// bytes.
+TEST(Transfer, ResumeIgnoresInPlaceRewriteWithRestoredMtime) {
+    namespace fs = std::filesystem;
+    auto payload = make_payload(96 * 1024 * 1024);
+    const fs::path in = pipeline_test::temp_path("rewrite_in.bin");
+    const fs::path out = pipeline_test::temp_path("rewrite_out.bin");
+    resume_test::write_file(in, payload);
+    struct stat before {};
+    ASSERT_EQ(::stat(in.c_str(), &before), 0);
+    if (!resume_test::interrupt_midway(in, out, payload.size())) {
+        fs::remove(in);
+        GTEST_SKIP() << "the transfer finished before it could be interrupted";
+    }
+    // Rewrite every byte in place, then put the old mtime back.
+    for (auto &b : payload) b = static_cast<uint8_t>(b ^ 0x5A);
+    {
+        std::fstream f(in, std::ios::in | std::ios::out | std::ios::binary);
+        f.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
+    }
+    const timespec times[2] = {before.st_atim, before.st_mtim};
+    ASSERT_EQ(::utimensat(AT_FDCWD, in.c_str(), times, 0), 0);
+
+    const auto r = resume_test::transfer(in, out);
+    EXPECT_EQ(r.send, fuse::TransferStatus::Ok) << fuse::to_string(r.send);
+    EXPECT_EQ(r.recv, fuse::TransferStatus::Ok) << fuse::to_string(r.recv);
+    EXPECT_EQ(r.recv_stats.resumed_bytes, 0u) << "resumed a rewritten file's stale partial copy";
     EXPECT_EQ(pipeline_test::read_all(out), payload);
     fs::remove(in);
     fs::remove(out);

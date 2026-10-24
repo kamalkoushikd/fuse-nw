@@ -14,16 +14,16 @@ research or benchmarking against it, keep reading.
 ### From a package
 
 ```sh
-cmake --preset default -DFUSE_BUILD_BENCH=OFF   # see note below
+cmake --preset default
 cmake --build --preset default
 cd build/default && cpack          # produces .deb / .rpm / .tar.gz
-sudo dpkg -i fuse-0.1.0-Linux.deb  # or: sudo rpm -i fuse-0.1.0-1.x86_64.rpm
+sudo dpkg -i fuse-0.2.0-Linux.deb  # or: sudo rpm -i fuse-0.2.0-1.x86_64.rpm
 ```
 
 ### From source
 
 ```sh
-cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local -DFUSE_BUILD_BENCH=OFF
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local
 cmake --build build -j
 sudo cmake --install build
 sudo ldconfig                      # only needed for a system prefix
@@ -37,10 +37,6 @@ libraries' rpath is baked at build time.
 > transport batches with `recvmmsg` and UDP GSO. macOS builds and runs, but
 > sends and receives one datagram per syscall. wolfSSL is fetched and built
 > automatically unless you already have one installed.
->
-> `-DFUSE_BUILD_BENCH=OFF` is currently required: the bench build refers to
-> a `scripts/net-sim/src` directory that isn't in the repo (see
-> [ROADMAP.md](ROADMAP.md#gaps--not-yet-done)).
 
 ## 2. Use it, CMake
 

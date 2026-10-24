@@ -12,7 +12,9 @@ historical. The wire format as it exists today is documented in
 [PROTOCOL.md](PROTOCOL.md). Status below reflects what is actually built and
 verified by the test suite, not what is planned.
 
-*Last reviewed: 2026-10-19, at protocol version 7, project version 0.1.0.*
+*Last reviewed: 2026-10-24, at protocol version 8, project version 0.2.0. The
+protocol-core fixes made since the 2026-10-19 review are summarised under
+[Known protocol issues](#known-protocol-issues).*
 
 ## Implemented
 
@@ -44,15 +46,15 @@ The SDK, mux transfer and HTTP layers are built from this repo (targets
 `fuse::sdk`, `fuse::http`) but are not installed by it. They are released
 from [fuse-sdk](https://github.com/kamalkoushikd/fuse-sdk).
 
-The test suite has 174 tests with the crypto backend, all passing when run
-serially (`ctest` without `-j`, see the testing gaps below).
+The test suite has 206 tests with the crypto backend (184 without), all
+passing, including under `ctest -j`.
 
 ### Key design points
 
 - **Gap detection is bitwise.** `expected & ~received` over a multi-word
   bitmask, with set bits enumerated via `__builtin_ctzll`, and no hashing.
-  (Per-block receive bookkeeping is O(window), not O(1). See the
-  performance issues below.)
+  The received bits and gap timers are rings indexed by `seq % 1024`, so
+  per-block receive bookkeeping is O(1) amortised.
 - **Zero heap allocation in the Stage 1 primitives** (registry + receiver)
   after startup. A test that replaces global `operator new` enforces this
   for that loop. The higher-level transports allocate at setup and on a few
@@ -91,249 +93,100 @@ jumbo-frame paths (see the IP fragmentation issue below).
 
 ## Known protocol issues
 
-Found in a full code review on 2026-10-19. Ordered by severity.
+Found in a full code review on 2026-10-19 (numbers kept for reference). The
+protocol-core pass that followed fixed everything outside the socket-style
+SDK (`sdk.cpp`) and the HTTP mapping (`http.cpp`), which were deliberately
+left for their own pass. Each fix has its own commit, and tests next to it.
 
-### Security
+### Fixed in the protocol core (v8)
 
-1. **AES-GCM nonce reuse on every retransmission (critical).** The
-   retransmit paths (`transfer.cpp`, `sdk.cpp`) re-seal the same
-   `(stream_id, seq_no)` nonce with `kFlagRetransmission` OR'd into the
-   flags. Those flags are part of the AAD. Two tags under one key/nonce
-   with known-different AAD and identical ciphertext let a passive observer
-   solve for the GHASH key *H*. With *H*, any observed block can be forged.
-   This happens on every ordinary loss. Fix: leave the retransmission bit
-   out of the AAD (or out of the flags byte entirely), or retransmit the
-   stored ciphertext instead of re-sealing.
-2. **The control plane is unauthenticated even under PSK.** Ack, Nack,
-   StreamStart, StreamClose, ResumeRanges, FileDigest, Hello and Close are
-   all plaintext with no MAC. An on-path attacker can do all of these:
-   - Forge `Ack`s. The sender then believes undelivered data arrived. In
-     the SDK, `fuse_send()` returns `FUSE_OK` for a message the peer never
-     got, which breaks its documented guarantee.
-   - Abort transfers with `StreamClose`.
-   - Make a resumed transfer fail verification with a bad `FileDigest`.
-   - Tell the sender "nothing needed" via `ResumeRanges`.
+| # | Issue | Fix |
+|---|---|---|
+| 1 | AES-GCM nonce reuse on every retransmission (transfer) | The retransmission bit is masked out of the AAD, so a resend is the identical ciphertext and tag |
+| 2 | Control plane unauthenticated under PSK (transfer) | Every control datagram carries a `ctr + GMAC` trailer under a separate control key; unsigned ones are ignored |
+| 3 | Address migration without path validation (transfer) | `PathChallenge`/`PathResponse`: a new source must echo a random challenge before the peer address moves |
+| 5 | No session binding without encryption; replayable SETUP | Retry tokens bind a lane to a validated address; SETUP replies carry a fresh responder nonce the FINACK must echo |
+| 6 | No key confirmation (transfer) | The StreamStart's signature confirms the key; a mismatch returns `AuthFailed` at the handshake |
+| 7 | Block growth not MTU-aware | Growth capped at the route MTU (kernel-reported); a loss after growth sets a ceiling, re-probed DPLPMTUD-style |
+| 8 | Window counted in blocks; no slow start | Window in configured-block bytes, capped by the path's largest block; opt-in slow start (used by transfer and mux) |
+| 9 | No flow control | ACKs carry `rwnd`; the transfer sender stays within it, and the receiver sends window updates |
+| 10 | SACK bitmask discarded | `apply_ack()` releases SACKed blocks; RTO resends the base plus known holes |
+| 11 | Version mismatch is silent | Fixed-layout version-mismatch reply; `TransferStatus::VersionMismatch` |
+| 15 | `file_id` from name+size+mtime only | Also hashes ctime, inode and device |
+| 16 | O(window) receive path | Ring-indexed `ReceiverStream` |
+| 17 | Unbounded `vector<bool>` in `ReassemblyStream` | Window-bounded ring; delivery trace capped |
+| 18 | Amplification from the transfer receiver | Retry before anything else; idle ACKs stop after three to a silent peer |
+| 19 | PSK brute-forceable if it is a password | Transfer refuses PSKs under 16 bytes and documents that keys must be random (PAKE remains open) |
+| 20 | Predictable nonces (`mt19937_64`) | `secure_random_u64()` (crypto RNG or `getrandom`) |
+| 21 | No AES-GCM usage limit | Lane keys rotate every 2²² blocks, derived identically on both ends |
+| 22 | No pacing | Per-lane pacing over the RTT; smaller GSO bursts on real-RTT paths |
+| 23 | Aggressive RTO, no backoff | `max(SRTT + 4·RTTVAR, 2·SRTT)`, exponential backoff, one halving per run of timeouts |
+| 24 | No extension mechanism | TLV extension areas in StreamStart and SETUP, with critical-bit semantics |
+| 25 | `base_port + lane` wraps past 65535 | `ConfigError` |
+| 28 | PSK over 256 bytes fails derivation (core part) | Copied into a buffer sized to the key |
+| 30 | SETUP unvalidated; mux stream indexing; dropped NACKs; `SendQueue(0)` | SETUP validated by the responder; mux requires ids 0..n−1; NACKs de-duplicated and resent at once if the backlog is full; capacity clamped |
+| 31 | DTLS debug copy in production path; `send_time_ns` leaks uptime | Wire recording opt-in; transfer and mux send times carry a random per-stream offset |
+| — | Senders always opened IPv4 sockets (IPv6 hosts unreachable) | Socket opened in the destination's family |
 
-   Data integrity still holds, because the receiver ends `Incomplete`
-   rather than accepting forged bytes. Delivery guarantees and availability
-   do not.
-3. **Address migration without path validation.** The SDK re-anchors
-   `c->peer` to the source of *any* Ack, Nack or Close arriving on the
-   connection socket, without checking a nonce. An off-path attacker who
-   guesses the ephemeral port can redirect a connection, or kill it with a
-   2-byte `Close`. The transfer sender re-anchors on any Ack carrying the
-   lane nonce, but that nonce is sent in clear in StreamStart. Both can
-   turn the sender into a traffic reflector aimed at a third party. QUIC
-   requires PATH_CHALLENGE for exactly this reason.
-4. **The SDK server never authenticates the client.** Under PSK only the
-   server proves key possession. Each HELLO, even one with a spoofed
-   source, allocates a socket, a connection and a pump thread, and
-   `fuse_accept` hands it to the application. There is no stateless retry
-   or cookie. Together with `fuse_http_serve`'s `fuse_recv(-1)`, which
-   waits forever, an unauthenticated client can exhaust server threads.
-5. **Unencrypted mode has no session binding.** The first StreamStart to
-   reach a receiver port claims the lane. The mux SETUP handshake has no
-   nonce, so a stale or replayed SETUP can complete. FNV-1a only detects
-   corruption, and that is documented.
-6. **No key confirmation in the transfer handshake.** A wrong PSK is only
-   diagnosed once ≥ 20 data blocks have failed authentication
-   (`AuthFailed`). It should fail at StreamStart.
+Measured through `bench/fuse_netem` (32 MiB, 4 lanes, every output
+byte-identical), against the v7 code: 2% loss 81 → 220 MB/s, 5% loss
+37 → ~170 MB/s; 50 ms RTT 54 → ~51 MB/s; 25 ms RTT + 1% loss
+6.7 → 5.6 MB/s (the window no longer inflates with block size, #8);
+jitter and reordering unchanged. Loopback throughput is unchanged.
 
-### Transport behaviour
+### Still open
 
-7. **Block-size growth is not MTU-aware.** The transfer sender doubles the
-   block up to 16 KiB after 8 clean ACK-advances. It never sets
-   `IP_MTU_DISCOVER` and never probes, so on a 1500-MTU path every block
-   above ~1450 bytes is IP-fragmented. Losing one fragment loses the whole
-   block, and the next NACK resets the size: a sawtooth into fragmentation.
-   This needs DPLPMTUD-style probing (RFC 8899).
-8. **Congestion control is unfair on a shared bottleneck, and slow to
-   recover.**
-   - The window is counted in blocks while the block size changes up to
-     13×.
-   - There is no slow start: the window starts at 128 blocks and grows +16
-     per clean RTT (transfer), or +8 (SDK).
-   - Any NACK in an RTT halves it.
-   - Every lane/stream runs its own controller, so *N* lanes compete like
-     *N* TCP flows against other traffic.
+**Socket-style SDK and HTTP mapping (next pass).** These were left untouched
+on purpose, and still have:
 
-   Per-stream CC also cannot isolate latency inside a *network* queue. It
-   only prevents coupling between Fuse's own streams. The latency-under-load
-   result is a loopback measurement for that reason.
-9. **No flow control.** A receiver whose writer rings or SDK inbox
-   (256 MiB) are full silently drops blocks. The sender reads that as loss
-   and halves its window, so a slow disk or slow application looks like
-   congestion.
-10. **SACK information is discarded.** The ACK carries a 128-byte bitmask
-    every 8 blocks, but senders only use `base_seq_no`. Recovery depends on
-    NACKs. The RTO resends only the base block, one per RTO.
-11. **Version mismatch is silent.** A peer on another `kProtocolVersion`
-    drops every datagram, so the user sees `Timeout`, not "incompatible
-    version". There is no version negotiation or error reply.
-12. **No liveness on idle SDK connections.** `Heartbeat` is defined but
-    never sent, so a peer that vanishes is only noticed when an operation
-    times out. `fuse_recv(-1)` can wait forever.
-13. **The SDK is stop-and-wait per message.** `fuse_send` returns only
-    after the whole message is acknowledged, so small-message throughput
-    per connection is bounded by one message per RTT.
-14. **Transfer lanes need N consecutive open UDP ports.** That is hostile
-    to firewalls and NAT. The SDK's single-port model does not extend to
-    the transfer API.
-15. **`file_id` is a hash of name+size+mtime.** A file rewritten in place
-    with the same size and mtime would resume against stale bytes. The
-    final digest still catches this (with crypto), at the cost of a wasted
-    transfer. Without crypto the digest is FNV and is not tamper-proof.
+- #1 (SDK half): `retransmit_locked` re-seals with the retransmission bit in
+  the AAD, so the **SDK still has the GCM nonce-reuse flaw**.
+- #2, #3 (SDK half): SDK control messages are unauthenticated, and the SDK
+  re-anchors its peer on any Ack, Nack or Close.
+- #4: the SDK server never authenticates the client and allocates per HELLO.
+- #12: no liveness on idle SDK connections (Heartbeat is never sent).
+- #13: the SDK is stop-and-wait per message.
+- #26: about 17 MB per SDK connection (its registry slots embed 16 KiB
+  payloads while it only sends 1200-byte blocks).
+- #27: `fuse_close` deletes after 2 s even if a caller is still inside.
+- #28 (SDK half): `fuse_connect` takes the PSK through `strlen`.
+- #29: HTTP header injection, timeout scope, reason truncation, detached
+  threads, `fuse_http_serve` status, and no HTTP tests.
 
-### Performance (implementation, not wire format)
+**Protocol core, needing redesign rather than a fix:**
 
-16. `ReceiverStream::on_receive` scans the whole window (up to 1024
-    positions) on every block, and `slide_base_over_contiguous_prefix`
-    shifts two 1024-entry arrays per advanced sequence number. That is
-    O(window) per packet, not the O(1) the design describes.
-17. `ReassemblyStream` (ORDERED=0) grows a `vector<bool>` to `seq_no + 1`
-    using a wire-supplied value, and `delivery_order_` grows without bound.
-    No transport uses it today, but it is public API.
-
-### Further issues (second pass)
-
-18. **Traffic amplification from the transfer receiver.**
-    - The first StreamStart to reach a waiting receiver lane is accepted
-      from whatever source address it carries, with no address validation.
-    - After that, the receiver sends a 156-byte Ack to that address on
-      every idle loop (about every 20 ms) until its idle timeout
-      (`timeout_ms` + 1 s, 121 s by default).
-    - So one spoofed 70-byte StreamStart produces about 50 Acks/s for two
-      minutes, roughly 0.9 MB aimed at a victim per packet, per lane.
-    - A ResumeRanges answer for a fragmented partial file can be up to
-      64 × ~1 KB, and it is re-sent for every retried StreamStart.
-    - Acks should only flow after data arrives, and the handshake needs a
-      return-routability check.
-19. **The PSK can be cracked offline if it is a password.** The PSK is used
-    directly as HKDF input, with no password hashing and no PAKE. One
-    captured SDK handshake is enough: the client challenge is in clear in
-    HELLO, and `proof` is that challenge sealed under a key derived from
-    the PSK and the public salts. One captured encrypted transfer block
-    gives the same check. Either way a human-chosen key can be
-    brute-forced offline. At minimum, document that the key must be
-    high-entropy random bytes. Better, use a PAKE (e.g. CPace/OPAQUE) or
-    ECDHE-PSK.
-20. **Session nonces are predictable.** StreamStart nonces come from
-    `std::mt19937_64`, which is not a cryptographic generator: its state can
-    be recovered from enough observed outputs, and the nonces are sent in
-    clear. Since the nonce is the only session check on Acks and
-    StreamClose (#2, #3), predicting future nonces enables off-path
-    forgery. Use `random_bytes()`.
-21. **No AES-GCM key update or usage limit.** One key covers an entire
-    transfer or connection. At 1200-byte blocks, a transfer of roughly
-    10 GB already exceeds the ~2²³-record confidentiality limit commonly
-    applied to AES-GCM (RFC 9001 §6.6).
-22. **No pacing.** Each send call carries up to ~60 KB (one GSO batch),
-    and the sender issues these back-to-back until the congestion window
-    (up to 1024 blocks) is full, all at line rate. On shallow-buffered paths
-    those bursts self-induce loss, which the CC then halves for.
-23. **The RTO is aggressive and has no backoff.** RTO = 2 × SRTT with a
-    5 ms floor (transfer, mux) or 3 × SRTT with a 20 ms floor (SDK). None of
-    them has an RTT-variance term or exponential backoff on repeated
-    timeouts. Jitter above about SRTT causes spurious
-    retransmits, and each one also halves the window.
-24. **No extension mechanism.** Every field change bumps
-    `kProtocolVersion` (seven times so far), and any version mismatch
-    silently breaks interop (#11). There are no TLV/extension fields or
-    reserved bits, so optional features can't be added compatibly.
-25. **`base_port + lane` silently wraps past 65535.** The sum is cast to
-    `uint16_t` and `lanes` isn't checked against `base_port`. Lanes past
-    the top bind ports near 0, or fail to bind ports below 1024, with a
-    misleading `SocketError`.
-
-### Implementation bugs found in the same pass
-
-26. **Each SDK connection uses about 17 MB.** `RegistrySlot` embeds a
-    full `kMaxPayloadSize` (16 KiB) payload, and the SDK allocates 1024
-    slots per connection even though it only ever sends 1200-byte blocks.
-    `start_conn` builds a second registry while the first still exists,
-    so memory briefly peaks around 34 MB. Combined with #4, a flood of
-    unauthenticated HELLOs runs the server out of memory.
-27. `fuse_close` deletes the connection after 2 s even if another thread
-    is still inside it (`in_use > 0`): a use-after-free, though it only
-    happens if the caller breaks the API contract.
-28. `fuse_connect` takes the PSK through `strlen`, so it can't contain NUL
-    bytes. The transfer API takes a `std::string` and can, so the same
-    binary key works in one API and not the other. A PSK over 256 bytes
-    fails key derivation and is reported as `Unsupported`.
-29. HTTP mapping:
-    - `fuse_http_fetch`'s `timeout_ms` only bounds the receive, not the
-      connect or send, despite what `http.h` says.
-    - Method, path, headers and reason phrase are not checked for CR/LF,
-      so header injection is possible.
-    - A reason phrase longer than the 64-byte status-line buffer is
-      silently truncated.
-    - Detached handler threads can outlive `user_data` once
-      `fuse_http_serve` returns.
-30. Mux transfer and SETUP:
-    - `SetupPayload` values aren't validated: duplicate `stream_id`s,
-      `block_size` > 16384, and `protocol_version` ≠ 7 are all accepted.
-    - The mux receiver indexes streams by `stream_id`, assuming they run
-      0..n-1.
-    - A NACK arriving while the retransmit backlog is full is silently
-      dropped.
-    - `SendQueue` with capacity 0 divides by zero.
-31. `DtlsSession` copies every outgoing record into a 2 KB `last_wire_`
-    buffer, a test aid left in the production path. Every DATA block also
-    exposes the sender's raw monotonic clock (`send_time_ns`), which
-    leaks host uptime.
+- #8 (part): every lane still runs its own controller, so N lanes compete
+  like N flows on a shared bottleneck. That is the per-stream design premise.
+- #14: transfer lanes still need N consecutive open UDP ports. A single-port
+  transfer needs a reworked receive pipeline (demultiplexing lanes by
+  `stream_id` on one socket).
+- #19 (full): password-derived keys need a PAKE (e.g. CPace) or ECDHE-PSK.
+- The mux transfer has no encryption option at all, so its control plane
+  is unauthenticated too, and it has no address validation.
 
 ## Gaps / not yet done
 
-*(Resolved and no longer gaps: batched send/receive (GSO + `recvmmsg`),
-RTT-adaptive RTO/NACK timers, the 64-block window cap (now 1024), a public
-transfer API, and in-place resumable file receive.)*
-
-1. **Fix the security issues above,** #1 before anything else. Authenticating
-   control messages (an AEAD over Ack/Nack/Close/StreamClose/ResumeRanges
-   with a separate nonce space) closes #2 and #3 and most of #5.
-2. **Real-NIC testing.** Impairments are emulated (`bench/fuse_netem`,
+1. **Real-NIC testing.** Impairments are emulated (`bench/fuse_netem`,
    `scripts/net-sim/`). There is still no physical two-host run, and no run
-   on a 1500-MTU path with block growth enabled (#7).
-3. **Straggler lanes under heavy loss.** Static sharding means the slowest
-   lane decides completion: at 5% loss throughput swings 27–226 MB/s where
-   QUIC holds ~83. Dynamic re-sharding or work-stealing is the fix.
-4. **Stage 4 flags in the transports.** ORDERED=0, COALESCE and LOSSLESS=0
+   on a real 1500-MTU path.
+2. **Straggler lanes under heavy loss.** Static sharding means the slowest
+   lane decides completion. Dynamic re-sharding or work-stealing is the fix.
+3. **Stage 4 flags in the transports.** ORDERED=0, COALESCE and LOSSLESS=0
    exist only as primitives. The mixed loss-tolerant + loss-intolerant
    session that motivates the protocol is benchmarked by `fuse_bench` but
    is not available through any public API.
-5. **DTLS is not wired into any transport,** so the forward-secret option
-   exists only as a primitive. Either integrate it (accepting the loss of
-   GSO batching) or replace the PSK key schedule with an ECDHE-PSK exchange
-   in the transfer and SDK handshakes.
-6. **macOS batching.** `udp_darwin.cpp` does one syscall per datagram.
-   `sendmsg_x`/`recvmsg_x` have not been verified against a real SDK.
-7. **Build, test and release hygiene:**
-   - `CMakeLists.txt` does `add_subdirectory(scripts/net-sim/src)`, but
-     that directory is not in the repo. Any configure with
-     `FUSE_BUILD_BENCH=ON` fails, which is the default top-level build,
-     `cmake --preset default`, and both CI jobs. `scripts/net-sim/` also
-     still expects `fuse_quickstart_send/recv`, which moved to fuse-sdk.
-   - `install(DIRECTORY include/fuse ...)` excludes `sdk.h`,
-     `transfer.hpp` and `mux_transfer.hpp` but not `http.h`. The
-     protocol-only package therefore ships a header whose library it
-     doesn't install.
-   - `fuse/fuse.h` (C scaffold) and `fuse/sdk.h` both define
-     `enum fuse_status`, with conflicting values (`FUSE_ERR_SOCKET` is -5
-     in one and -2 in the other), so they can't be included in one
-     translation unit.
-   - The project version is 0.1.0, but tag `v0.1.1` exists, so
-     `fuse_version()` and `fuse.pc` report 0.1.0.
-   - Transfer tests use fixed UDP ports. `ctest -j` makes them collide
-     (spurious failures, and one 10+ minute hang because no per-test
-     `TIMEOUT` is set).
-   - Resume tests `GTEST_SKIP` whenever the transfer finishes before it can
-     be interrupted, so on a fast machine resume is not actually tested.
-   - `fuse/http.h` has no tests in this repo.
-   - `fuse_http_serve` returns `FUSE_OK` even when `fuse_accept` fails with
-     a real error.
-8. **The C scaffold (`fuse::fuse`: varint, packet, connection IDs,
-   QUIC-style initial secrets)** is unused by the protocol and is a dead
-   end. Decide whether to delete it or build on it.
+4. **DTLS is not wired into any transport,** so the forward-secret option
+   exists only as a primitive.
+5. **macOS batching.** `udp_darwin.cpp` does one syscall per datagram, and
+   `path_mtu()` is not implemented there (blocks don't grow on macOS).
+6. **Build and release hygiene.** Fixed: the missing `scripts/net-sim/src`
+   no longer breaks configure; `http.h` is no longer installed; the C
+   scaffold's status enum is now `fuse_result`, so it no longer clashes with
+   `sdk.h`; the project version is 0.2.0; tests probe free ports (so
+   `ctest -j` works) and have a per-test timeout; resume tests no longer
+   skip on fast machines. Still open: `scripts/net-sim/` expects
+   `fuse_quickstart_send/recv`, which moved to fuse-sdk.
+7. **The C scaffold (`fuse::fuse`)** is still unused by the protocol.
 
 ## Explicit non-goals (do not implement without revisiting)
 
