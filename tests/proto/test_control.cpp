@@ -65,10 +65,11 @@ TEST(Aux, AckRoundTrip) {
     ack.received_bitmask[0] = 0b10110;
     ack.echoed_send_time = 55555;
     ack.nonce = 0xdeadbeefULL;
+    ack.rwnd = 77;
 
     uint8_t buf[kMaxAuxDatagramSize];
     size_t len = encode_ack(ack, buf, sizeof(buf));
-    ASSERT_GT(len, 0u);
+    ASSERT_EQ(len, 160u);
 
     Ack got;
     ASSERT_TRUE(decode_ack(buf, len, &got));
@@ -79,6 +80,8 @@ TEST(Aux, AckRoundTrip) {
     }
     EXPECT_EQ(got.echoed_send_time, ack.echoed_send_time);
     EXPECT_EQ(got.nonce, ack.nonce);
+    EXPECT_EQ(got.rwnd, 77u);
+    EXPECT_EQ(Ack{}.rwnd, kRwndUnlimited) << "default must not limit anyone";
 }
 
 TEST(Aux, NackRoundTrip) {
