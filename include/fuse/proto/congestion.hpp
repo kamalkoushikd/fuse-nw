@@ -22,6 +22,18 @@
 
 namespace fuse::proto {
 
+// ROADMAP #31: DATA's send_time_ns used to be the sender's raw monotonic
+// clock, which tells anyone on the path the host's uptime. Senders now put
+// now + a random per-stream offset on the wire; only the sender ever
+// interprets the value (the receiver just echoes it), so RTT is the
+// wrap-safe difference in that same offset domain. Returns 0 (no sample)
+// for an echo that is not plausibly one of ours: in the future, or older
+// than a minute.
+inline uint64_t rtt_sample_from_echo(uint64_t wire_now, uint64_t echoed) {
+    const uint64_t d = wire_now - echoed; // modulo 2^64, like the clock itself
+    return d < 60'000'000'000ull ? d : 0;
+}
+
 class CongestionController {
 public:
     // `max_window` is the stream's SETUP-negotiated window (the cap).

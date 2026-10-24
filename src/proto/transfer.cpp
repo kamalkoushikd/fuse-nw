@@ -1683,6 +1683,10 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     uint64_t sent_bytes = 0; // new payload bytes sent (not retransmissions)
     // Pacing (ROADMAP #22): earliest time the next batch of new data may go.
     uint64_t next_batch_ns = 0;
+    // What goes in DATA's send_time_ns: our clock plus a random offset, so
+    // the wire never shows the host's uptime (ROADMAP #31).
+    const uint64_t clock_offset = secure_random_u64();
+    const auto wire_now = [clock_offset] { return now_ns() + clock_offset; };
     // The receiver's advertised window in blocks (ROADMAP #9).
     uint32_t peer_rwnd = kRwndUnlimited;
 
@@ -1736,7 +1740,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             body = sealed.data();
             hdr.payload_len = static_cast<uint16_t>(sl->payload_len + kAeadTagLen);
         }
-        const size_t n = encode_data_datagram(hdr, now_ns(), body, rtx.data(), rtx.size());
+        const size_t n = encode_data_datagram(hdr, wire_now(), body, rtx.data(), rtx.size());
         if (n == 0 || !sock.send_to(rtx.data(), n, dst)) return false;
         ++retransmits;
         return true;
@@ -1818,7 +1822,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                     hdr.payload_len = static_cast<uint16_t>(len + kAeadTagLen);
                 }
 
-                const size_t n = encode_data_datagram(hdr, now_ns(), body,
+                const size_t n = encode_data_datagram(hdr, wire_now(), body,
                                                       staging.data() + bytes_in_batch,
                                                       staging.size() - bytes_in_batch);
                 if (n == 0) break;
@@ -1891,8 +1895,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 // epochs right when they need to stay responsive.
                 if (ack.echoed_send_time > 0 && ack.echoed_send_time != last_rtt_echo) {
                     last_rtt_echo = ack.echoed_send_time;
-                    const uint64_t t = now_ns();
-                    if (t > ack.echoed_send_time) cc.on_rtt_sample(t - ack.echoed_send_time);
+                    cc.on_rtt_sample(rtt_sample_from_echo(wire_now(), ack.echoed_send_time));
                 }
             } else if (type == MsgType::Nack) {
                 Nack nack;
