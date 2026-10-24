@@ -12,7 +12,6 @@
 #include <memory>
 #include <mutex>
 #include <new>
-#include <random>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -24,6 +23,7 @@
 #include "fuse/proto/receiver.hpp"
 #include "fuse/proto/registry.hpp"
 #include "fuse/proto/send_queue.hpp"
+#include "fuse/proto/session_crypto.hpp"
 #include "fuse/proto/setup.hpp"
 #include "fuse/proto/udp.hpp"
 
@@ -54,10 +54,9 @@ void set_timeout_us(int fd, long us) {
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 }
 
-uint64_t random_nonce() {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    return rng();
-}
+// Session nonces are the only session check on several control messages, so
+// they must not be predictable from earlier ones (ROADMAP #20).
+uint64_t random_nonce() { return secure_random_u64(); }
 
 // Same ranking as transfer.cpp's worst() — duplicated rather than shared
 // since transfer.cpp is deliberately left untouched by this module.

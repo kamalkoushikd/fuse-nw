@@ -205,3 +205,12 @@ TEST(SessionCrypto, FailsClosedWithoutBackend) {
 }
 
 #endif
+
+// Protocol nonces must come from a secure source in every build, not a
+// seeded PRNG (ROADMAP #20). Collisions among a few thousand draws from a
+// real 64-bit source are vanishingly unlikely.
+TEST(SessionCrypto, SecureRandomIsAvailableAndVaries) {
+    std::set<uint64_t> seen;
+    for (int i = 0; i < 4096; ++i) seen.insert(secure_random_u64());
+    EXPECT_EQ(seen.size(), 4096u);
+}
