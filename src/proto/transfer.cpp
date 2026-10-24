@@ -98,15 +98,32 @@ bool cancel_requested(const TransferConfig &cfg) {
 // its own timeout. Best effort and unacknowledged: sent a few times because
 // one lost datagram would otherwise cost the peer the full timeout, and the
 // peer's timeout still covers the case where all copies are lost.
+// Under a pre-shared key `auth` signs it; nullptr sends it unauthenticated
+// (plaintext sessions, and the receiver's auth-failed reply, which by
+// definition has no key in common with the peer).
 void send_stream_close(UdpSocket &sock, const PeerAddr &to, uint16_t lane, uint64_t nonce,
-                       uint8_t reason) {
+                       uint8_t reason, ControlAuth *auth) {
     StreamClose sc;
     sc.stream_id = lane;
     sc.nonce = nonce;
     sc.reason = reason;
-    uint8_t buf[32];
-    const size_t n = encode_stream_close(sc, buf, sizeof(buf));
+    uint8_t buf[64];
+    size_t n = encode_stream_close(sc, buf, sizeof(buf));
+    if (n != 0 && auth != nullptr) n = auth->seal(buf, n, sizeof(buf));
     for (int i = 0; n != 0 && i < 3; ++i) sock.send_to(buf, n, to);
+}
+
+// Signs an encoded control datagram in place when the session is keyed.
+// Returns the length to send (0 = don't send).
+size_t seal_ctl(ControlAuth *auth, uint8_t *buf, size_t n, size_t cap) {
+    if (n == 0 || auth == nullptr) return n;
+    return auth->seal(buf, n, cap);
+}
+
+// True if a received control datagram may be acted on: always in plaintext
+// sessions (auth == nullptr), and only with a valid trailer under a key.
+bool ctl_authentic(const ControlAuth *auth, const uint8_t *dg, size_t len) {
+    return auth == nullptr || auth->open(dg, len, nullptr);
 }
 
 // Written by one lane thread, read by the calling thread for progress
@@ -618,7 +635,8 @@ void coarsen_ranges(std::vector<ResumeRange> *r, size_t limit) {
 // Encodes a lane's ResumeRanges answer, split across as many datagrams as
 // the list needs (at least one, even for an empty list).
 std::vector<std::vector<uint8_t>> encode_resume_answer(uint16_t lane, uint64_t nonce, bool resumed,
-                                                       const std::vector<ResumeRange> &want) {
+                                                       const std::vector<ResumeRange> &want,
+                                                       ControlAuth *auth) {
     const size_t parts =
         std::max<size_t>(1, (want.size() + kMaxResumeRangesPerMsg - 1) / kMaxResumeRangesPerMsg);
     std::vector<std::vector<uint8_t>> msgs;
@@ -634,7 +652,8 @@ std::vector<std::vector<uint8_t>> encode_resume_answer(uint16_t lane, uint64_t n
             std::min<size_t>(kMaxResumeRangesPerMsg, want.size() - std::min(first, want.size())));
         for (uint16_t i = 0; i < rr.count; ++i) rr.ranges[i] = want[first + i];
         std::vector<uint8_t> buf(2048);
-        buf.resize(encode_resume_ranges(rr, buf.data(), buf.size()));
+        buf.resize(seal_ctl(auth, buf.data(), encode_resume_ranges(rr, buf.data(), buf.size()),
+                            buf.size()));
         msgs.push_back(std::move(buf));
     }
     return msgs;
@@ -864,6 +883,13 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
     bool peer_finished = false, peer_aborted = false;
     uint64_t peer_nonce = 0; // echoed in every Ack once StreamStart arrives
     PeerAddr peer{};
+    // Under a pre-shared key: this lane's control-plane signer/verifier,
+    // created once a StreamStart authenticates. nullptr in plaintext mode.
+    std::unique_ptr<ControlAuth> auth;
+    // StreamStarts that failed authentication before any session existed:
+    // evidence of a key mismatch, reported as AuthFailed if nothing else
+    // ever succeeds on this lane.
+    uint64_t bad_starts = 0, last_auth_reply_ns = 0;
     const auto send_resume_answer = [&] {
         for (const auto &m : resume_answer) sock.send_to(m.data(), m.size(), peer);
     };
@@ -880,6 +906,7 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
     // an abort. Require a minimum sample size so a couple of early failures
     // during key/salt setup don't misreport a healthy transfer.
     const auto classify = [&](TransferStatus fallback) {
+        if (!have_start && bad_starts > 0) return TransferStatus::AuthFailed;
         const uint64_t auth_sample = delivered + auth_failures;
         if (auth_sample >= 20 && auth_failures * 2 > auth_sample) {
             return TransferStatus::AuthFailed;
@@ -892,7 +919,7 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
     // into a closed port until its own timeout.
     const auto give_up = [&](TransferStatus st) {
         if (have_peer && have_start) {
-            send_stream_close(sock, peer, lane, peer_nonce, kStreamCloseAborted);
+            send_stream_close(sock, peer, lane, peer_nonce, kStreamCloseAborted, auth.get());
         }
         res->bytes.store(written);
         res->auth_failures.store(auth_failures);
@@ -982,9 +1009,42 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
                 StreamStart ss;
                 if (!decode_stream_start(dg, dlen, &ss)) continue;
                 if (!have_start) {
-                    // Every size here is the sender's unauthenticated claim.
-                    // Ordered so nothing can overflow: the lane must fit
-                    // inside the transfer.
+                    // Authenticate first (v8 key confirmation): under a PSK
+                    // the StreamStart is signed with a key derived from its
+                    // own salt, so a sender holding a different key -- or
+                    // none, or a plaintext receiver facing an encrypting
+                    // sender -- is found out here, before anything is
+                    // allocated, rather than after 20 failed data blocks.
+                    bool salted = false;
+                    for (uint8_t b : ss.session_salt) salted |= (b != 0);
+                    uint8_t session_key[kSessionKeyLen] = {};
+                    std::unique_ptr<ControlAuth> trial;
+                    bool authentic = !want_crypto && !salted;
+                    if (want_crypto && salted) {
+                        const std::string &psk = cfg.pre_shared_key;
+                        trial = std::make_unique<ControlAuth>();
+                        authentic = derive_session_key(reinterpret_cast<const uint8_t *>(psk.data()),
+                                                       psk.size(), ss.session_salt,
+                                                       kSessionSaltLen, session_key) &&
+                                    trial->init(session_key, lane, /*local_dir=*/1) &&
+                                    trial->open(dg, dlen, nullptr);
+                    }
+                    if (!authentic) {
+                        ++bad_starts;
+                        // Tell the sender (unauthenticated: we share no key
+                        // with it), at most every 100 ms so this can't be
+                        // used to make us flood a spoofed address.
+                        const uint64_t t = now_ns();
+                        if (t - last_auth_reply_ns > 100'000'000ull) {
+                            last_auth_reply_ns = t;
+                            send_stream_close(sock, srcs[i], lane, ss.nonce, kStreamCloseAuthFailed,
+                                              nullptr);
+                        }
+                        continue;
+                    }
+                    // Every size here is the sender's claim (authenticated
+                    // under a PSK, not otherwise). Ordered so nothing can
+                    // overflow: the lane must fit inside the transfer.
                     if (ss.total_bytes > ss.file_total_bytes ||
                         ss.stream_base_offset > ss.file_total_bytes - ss.total_bytes) {
                         continue;
@@ -1016,14 +1076,9 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
 
                     if (want_crypto) {
                         LaneKey &k = p->keys[lane];
-                        const std::string &psk = cfg.pre_shared_key;
-                        if (!derive_session_key(reinterpret_cast<const uint8_t *>(psk.data()),
-                                                psk.size(), ss.session_salt, kSessionSaltLen,
-                                                k.key)) {
-                            res->status.store(static_cast<int>(TransferStatus::Unsupported));
-                            return;
-                        }
+                        std::memcpy(k.key, session_key, kSessionKeyLen);
                         k.ready.store(true, std::memory_order_release);
+                        auth = std::move(trial);
                     }
                     have_start = true;
                     peer_nonce = ss.nonce;
@@ -1041,12 +1096,13 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
                     coarsen_ranges(&want, kMaxResumeRanges);
                     expected_bytes = 0;
                     for (const ResumeRange &r : want) expected_bytes += r.length;
-                    resume_answer = encode_resume_answer(lane, peer_nonce, p->sink->resumed(), want);
+                    resume_answer = encode_resume_answer(lane, peer_nonce, p->sink->resumed(), want,
+                                                         auth.get());
                     send_resume_answer();
 
                     res->expected.store(expected_bytes, std::memory_order_relaxed);
                     res->started.store(true, std::memory_order_release);
-                } else if (ss.nonce == peer_nonce) {
+                } else if (ss.nonce == peer_nonce && ctl_authentic(auth.get(), dg, dlen)) {
                     // A retried StreamStart (our Ack or resume answer was
                     // lost) carrying the same nonce we already accepted —
                     // safe to treat as this session even if it now arrives
@@ -1064,20 +1120,22 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
                 if (have_start) {
                     // Only this session's nonce counts once a session
                     // exists: a close left over from an earlier transfer on
-                    // this port must not end this one.
-                    if (sc.nonce != peer_nonce) continue;
+                    // this port must not end this one. Under a PSK it must
+                    // also be signed by the sender.
+                    if (sc.nonce != peer_nonce || !ctl_authentic(auth.get(), dg, dlen)) continue;
                     if (sc.reason == kStreamCloseAborted) {
                         peer_aborted = true;
                     } else {
                         peer_finished = true;
                     }
-                } else if (sc.reason == kStreamCloseAborted) {
+                } else if (sc.reason == kStreamCloseAborted && !want_crypto) {
                     // No session yet, so no nonce to check: a sender that is
                     // cancelled before its StreamStart reached us (e.g.
                     // Ctrl+C while it was still loading the file) can only
                     // say "I'm not coming". Accepting that is no weaker than
-                    // the pre-session state, where any first StreamStart
-                    // already claims the lane.
+                    // the plaintext pre-session state. Under a PSK there is
+                    // no key yet to check it against, so an unverifiable
+                    // abort is ignored rather than letting anyone end us.
                     peer_aborted = true;
                 }
                 continue;
@@ -1087,14 +1145,17 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
                 // will be verified against. Sent on lane 0 only.
                 DigestMessage dm;
                 if (lane != 0 || !have_start || !decode_digest(dg, dlen, &dm) ||
-                    dm.nonce != peer_nonce) {
+                    dm.nonce != peer_nonce || !ctl_authentic(auth.get(), dg, dlen)) {
                     continue;
                 }
                 if (!p->have_digest.load(std::memory_order_acquire)) {
                     std::memcpy(p->digest, dm.digest, kDigestLen);
                     p->have_digest.store(true, std::memory_order_release);
                 }
-                sock.send_to(dg, dlen, srcs[i]); // the echo is the sender's acknowledgement
+                // The echo is the sender's acknowledgement; signed by us.
+                const size_t en = seal_ctl(auth.get(), tx.data(),
+                                           encode_digest(dm, tx.data(), tx.size()), tx.size());
+                if (en) sock.send_to(tx.data(), en, srcs[i]);
                 continue;
             }
             if (type != MsgType::Data || !have_start) continue;
@@ -1157,7 +1218,8 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
             last_ack_ns = t;
             Ack ack = rx.build_ack();
             ack.nonce = peer_nonce;
-            const size_t n = encode_ack(ack, tx.data(), tx.size());
+            const size_t n = seal_ctl(auth.get(), tx.data(), encode_ack(ack, tx.data(), tx.size()),
+                                      tx.size());
             if (n) sock.send_to(tx.data(), n, peer);
         }
 
@@ -1171,7 +1233,8 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
                                                                             20'000'000, 500'000'000);
         Nack nack;
         if (rx.collect_nacks(t, reorder_ns, renack_ns, &nack) > 0) {
-            const size_t n = encode_nack(nack, tx.data(), tx.size());
+            const size_t n = seal_ctl(auth.get(), tx.data(),
+                                      encode_nack(nack, tx.data(), tx.size()), tx.size());
             if (n) sock.send_to(tx.data(), n, peer);
             nack_sent_ns = t;
         }
@@ -1204,7 +1267,8 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
     for (int i = 0; !peer_finished && i < 8; ++i) {
         Ack ack = rx.build_ack();
         ack.nonce = peer_nonce;
-        const size_t n = encode_ack(ack, tx.data(), tx.size());
+        const size_t n = seal_ctl(auth.get(), tx.data(), encode_ack(ack, tx.data(), tx.size()),
+                                  tx.size());
         if (n) sock.send_to(tx.data(), n, peer);
     }
 
@@ -1253,6 +1317,16 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     if (keys.enabled && !cipher.init(keys.key, lane)) {
         res->status.store(static_cast<int>(TransferStatus::Unsupported));
         return;
+    }
+    // Signs every control datagram we send and verifies the receiver's
+    // (v8). nullptr in plaintext mode.
+    std::unique_ptr<ControlAuth> auth;
+    if (keys.enabled) {
+        auth = std::make_unique<ControlAuth>();
+        if (!auth->init(keys.key, lane, /*local_dir=*/0)) {
+            res->status.store(static_cast<int>(TransferStatus::Unsupported));
+            return;
+        }
     }
 
     std::vector<uint8_t> staging(kGsoBudget + kMaxDatagramSize);
@@ -1303,7 +1377,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             // whose Ack we just haven't seen yet — or never seen one at all
             // (it accepts a pre-session abort too): either way, tell it
             // we're leaving so it doesn't wait out its own timeout.
-            send_stream_close(sock, dst, lane, ss.nonce, kStreamCloseAborted);
+            send_stream_close(sock, dst, lane, ss.nonce, kStreamCloseAborted, auth.get());
             res->status.store(static_cast<int>(cancelled         ? TransferStatus::Cancelled
                                                : sibling_stopped ? TransferStatus::PeerAborted
                                                                  : TransferStatus::Timeout));
@@ -1311,18 +1385,34 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             return;
         }
         if (t >= next_send_ns) {
-            const size_t n = encode_stream_start(ss, ctl.data(), ctl.size());
-            sock.send_to(ctl.data(), n, dst);
+            const size_t n = seal_ctl(auth.get(), ctl.data(),
+                                      encode_stream_start(ss, ctl.data(), ctl.size()), ctl.size());
+            if (n) sock.send_to(ctl.data(), n, dst);
             next_send_ns = t + resend_every_ns;
             resend_every_ns = std::min<uint64_t>(resend_every_ns * 2, 200'000'000ull);
         }
         size_t got = 0;
-        if (sock.recv_from(ctl.data(), ctl.size(), &got, nullptr)) {
-            MsgType mt;
-            if (peek_msg_type(ctl.data(), got, &mt) && mt == MsgType::Ack) {
+        MsgType mt;
+        if (sock.recv_from(ctl.data(), ctl.size(), &got, nullptr) &&
+            peek_msg_type(ctl.data(), got, &mt)) {
+            const bool authentic = ctl_authentic(auth.get(), ctl.data(), got);
+            if (mt == MsgType::StreamClose) {
+                // The receiver could not authenticate our StreamStart: the
+                // keys differ. Unsigned by necessity (it has no key it
+                // shares with us), so only its nonce ties it to us; at worst
+                // a forged one ends a handshake an on-path attacker could
+                // block anyway.
+                StreamClose sc;
+                if (decode_stream_close(ctl.data(), got, &sc) && sc.nonce == ss.nonce &&
+                    sc.reason == kStreamCloseAuthFailed) {
+                    res->status.store(static_cast<int>(TransferStatus::AuthFailed));
+                    stop_all->store(true, std::memory_order_release);
+                    return;
+                }
+            } else if (mt == MsgType::Ack && authentic) {
                 Ack ack;
                 if (decode_ack(ctl.data(), got, &ack) && ack.nonce == ss.nonce) acked = true;
-            } else if (mt == MsgType::ResumeRanges) {
+            } else if (mt == MsgType::ResumeRanges && authentic) {
                 ResumeRanges rr;
                 if (decode_resume_ranges(ctl.data(), got, &rr) && rr.nonce == ss.nonce) {
                     if (parts_expected == 0) {
@@ -1426,7 +1516,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     // Every early exit tells the receiver, so it stops at once instead of
     // waiting out its own idle timeout.
     const auto give_up = [&](TransferStatus st, bool tell_peer) {
-        if (tell_peer) send_stream_close(sock, dst, lane, ss.nonce, kStreamCloseAborted);
+        if (tell_peer) send_stream_close(sock, dst, lane, ss.nonce, kStreamCloseAborted, auth.get());
         res->retransmits.store(retransmits);
         res->status.store(static_cast<int>(st));
     };
@@ -1530,6 +1620,10 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             did_work = true;
             MsgType type;
             if (!peek_msg_type(ctl.data(), got, &type)) continue;
+            // Under a PSK nothing unsigned is acted on: a forged Ack would
+            // claim delivery of data the receiver never got, a forged Nack
+            // would halve the window, a forged close would end the lane.
+            if (!ctl_authentic(auth.get(), ctl.data(), got)) continue;
 
             if (type == MsgType::Ack) {
                 Ack ack;
@@ -1707,7 +1801,8 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     // receiver echoes it back.
     if (resumed && lane == 0) {
         digester.join(); // started right after the handshake
-        const size_t dn = encode_digest(dm, rtx.data(), rtx.size());
+        const size_t dn = seal_ctl(auth.get(), rtx.data(), encode_digest(dm, rtx.data(), rtx.size()),
+                                   rtx.size());
         const uint64_t begin = now_ns();
         uint64_t next_send = 0;
         for (bool echoed = false; !echoed;) {
@@ -1733,6 +1828,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             while (!echoed && sock.recv_from(ctl.data(), ctl.size(), &got, nullptr)) {
                 MsgType type;
                 if (!peek_msg_type(ctl.data(), got, &type)) continue;
+                if (!ctl_authentic(auth.get(), ctl.data(), got)) continue;
                 if (type == MsgType::FileDigest) {
                     DigestMessage echo;
                     echoed = decode_digest(ctl.data(), got, &echo) && echo.nonce == ss.nonce &&
@@ -1756,7 +1852,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
 
     // Everything is acknowledged: let the receiver leave now instead of
     // lingering to re-send Acks we no longer need.
-    send_stream_close(sock, dst, lane, ss.nonce, kStreamCloseFinished);
+    send_stream_close(sock, dst, lane, ss.nonce, kStreamCloseFinished, auth.get());
     res->bytes.store(session_bytes);
     res->retransmits.store(retransmits);
     res->final_block.store(block);

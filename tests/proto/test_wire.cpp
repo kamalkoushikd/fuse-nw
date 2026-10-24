@@ -55,7 +55,7 @@ TEST(Wire, HeaderSizesMatchSpec) {
     // v6 added stream_base_offset/file_total_bytes to StreamStart so a
     // receiver can write each block straight to its place in the output.
     // v7 added resume: file_id in StreamStart, ResumeRanges and FileDigest.
-    EXPECT_EQ(kProtocolVersion, 7u);
+    EXPECT_EQ(kProtocolVersion, 8u);
 
     // The MTU-safe default stays well under a 1500-byte path MTU; the
     // ceiling is only reached by probing a link that proves it can take it.
