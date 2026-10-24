@@ -47,7 +47,13 @@ namespace fuse::proto {
 // v7 added resume: StreamStart carries a file_id, the receiver answers with
 // ResumeRanges (what it still needs), and a resumed transfer ends with a
 // whole-file FileDigest.
-inline constexpr uint8_t  kProtocolVersion = 7;
+//
+// v8 authenticates the control plane under a pre-shared key (every control
+// datagram carries a ctr+GMAC trailer, see session_crypto.hpp ControlAuth),
+// takes the retransmission bit out of the DATA AAD, rotates data keys per
+// 2^22-block epoch, and adds StreamClose reason "auth failed" so a key
+// mismatch is diagnosed at the handshake.
+inline constexpr uint8_t  kProtocolVersion = 8;
 
 // The default block payload (kDefaultPayloadSize) sits under a typical
 // 1500-byte path MTU once the datagram's own headers are accounted for, so

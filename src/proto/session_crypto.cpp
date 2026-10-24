@@ -71,6 +71,9 @@ bool LaneCipher::open(uint16_t, uint64_t, const uint8_t *, size_t, const uint8_t
     return false;
 }
 bool derive_lane_epoch_key(const uint8_t *, uint16_t, uint64_t, uint8_t *) { return false; }
+bool ControlAuth::init(const uint8_t *, uint16_t, uint8_t) { return false; }
+size_t ControlAuth::seal(uint8_t *, size_t, size_t) { return 0; }
+bool ControlAuth::open(const uint8_t *, size_t, size_t *) const { return false; }
 
 #else
 
@@ -215,6 +218,78 @@ bool derive_lane_epoch_key(const uint8_t session_key[kSessionKeyLen], uint16_t l
                                       sizeof(kProtocol) - 1,
                                       reinterpret_cast<const byte *>(kLabel), sizeof(kLabel) - 1,
                                       context, sizeof(context), WC_SHA256) == 0;
+}
+
+namespace {
+
+void control_nonce(uint16_t lane, uint64_t ctr, uint8_t dir, uint8_t out[kAeadNonceLen]) {
+    put_u16(out, lane);
+    put_u64(out + 2, ctr);
+    out[10] = dir;
+    out[11] = 0x01; // data nonces end in 0x0000
+}
+
+} // namespace
+
+bool ControlAuth::init(const uint8_t session_key[kSessionKeyLen], uint16_t lane,
+                       uint8_t local_dir) {
+    if (cipher_ || session_key == nullptr || local_dir > 1) {
+        return false;
+    }
+    uint8_t k[kSessionKeyLen];
+    static const char kProtocol[] = "fuse2 ";
+    static const char kLabel[] = "control key";
+    bool ok = wc_Tls13_HKDF_Expand_Label(k, static_cast<word32>(kSessionKeyLen), session_key,
+                                         kSessionKeyLen, reinterpret_cast<const byte *>(kProtocol),
+                                         sizeof(kProtocol) - 1,
+                                         reinterpret_cast<const byte *>(kLabel),
+                                         sizeof(kLabel) - 1, nullptr, 0, WC_SHA256) == 0;
+    auto c = std::make_unique<LaneCipher>();
+    ok = ok && c->init(k);
+    wc_ForceZero(k, sizeof(k));
+    if (!ok) {
+        return false;
+    }
+    cipher_ = std::move(c);
+    lane_ = lane;
+    dir_ = local_dir;
+    return true;
+}
+
+size_t ControlAuth::seal(uint8_t *dg, size_t len, size_t cap) {
+    if (!cipher_ || dg == nullptr || cap < len || cap - len < kControlTrailerLen ||
+        len > UINT32_MAX) {
+        return 0;
+    }
+    const uint64_t ctr = next_ctr_++;
+    put_u64(dg + len, ctr);
+    uint8_t nonce[kAeadNonceLen];
+    control_nonce(lane_, ctr, dir_, nonce);
+    // GMAC: empty plaintext, the whole datagram (with the counter) as AAD.
+    if (wc_AesGcmEncrypt(static_cast<Aes *>(cipher_->aes_), nullptr, nullptr, 0, nonce,
+                         kAeadNonceLen, dg + len + 8, kAeadTagLen, dg,
+                         static_cast<word32>(len + 8)) != 0) {
+        return 0;
+    }
+    return len + kControlTrailerLen;
+}
+
+bool ControlAuth::open(const uint8_t *dg, size_t len, size_t *body_len) const {
+    if (!cipher_ || dg == nullptr || len < kControlTrailerLen || len > UINT32_MAX) {
+        return false;
+    }
+    const size_t body = len - kControlTrailerLen;
+    uint64_t ctr = 0;
+    get_u64(dg + body, &ctr);
+    uint8_t nonce[kAeadNonceLen];
+    control_nonce(lane_, ctr, static_cast<uint8_t>(dir_ ^ 1), nonce);
+    if (wc_AesGcmDecrypt(static_cast<Aes *>(cipher_->aes_), nullptr, nullptr, 0, nonce,
+                         kAeadNonceLen, dg + body + 8, kAeadTagLen, dg,
+                         static_cast<word32>(body + 8)) != 0) {
+        return false;
+    }
+    if (body_len) *body_len = body;
+    return true;
 }
 
 #endif // FUSE_PROTO_WITH_DTLS

@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <string>
 #include <numeric>
 #include <thread>
@@ -150,8 +151,16 @@ TEST(Transfer, WrongKeyDoesNotYieldData) {
     fuse::TransferStatus rs = fuse::TransferStatus::Ok;
     std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    fuse::send_buffer(tx, payload.data(), payload.size(), nullptr);
+    const auto t0 = std::chrono::steady_clock::now();
+    const fuse::TransferStatus ss = fuse::send_buffer(tx, payload.data(), payload.size(), nullptr);
+    const double send_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     receiver.join();
+
+    // v8 key confirmation: the mismatch is found at the handshake, so the
+    // sender learns it promptly instead of after its connect timeout.
+    EXPECT_EQ(ss, fuse::TransferStatus::AuthFailed) << fuse::to_string(ss);
+    EXPECT_LT(send_ms, 2000.0);
 
     // Specifically AuthFailed, not just "not Ok": the idle-timeout exit path
     // used to skip the auth-failure classification entirely (it lived only
@@ -162,6 +171,34 @@ TEST(Transfer, WrongKeyDoesNotYieldData) {
     // AuthFailed.
     EXPECT_EQ(rs, fuse::TransferStatus::AuthFailed) << fuse::to_string(rs);
     EXPECT_NE(got, payload) << "no plaintext may be recovered with the wrong key";
+}
+
+// Mismatched encryption settings fail closed at the handshake, in both
+// directions: neither end may fall back to plaintext.
+TEST(Transfer, EncryptionMismatchFailsAtHandshake) {
+    const auto payload = make_payload(64 * 1024);
+    for (bool sender_has_key : {true, false}) {
+        SCOPED_TRACE(sender_has_key ? "only sender keyed" : "only receiver keyed");
+        const uint16_t port = next_port();
+        fuse::TransferConfig rx;
+        rx.bind_address = "127.0.0.1";
+        rx.base_port = port;
+        rx.lanes = 1;
+        rx.timeout_ms = 1500;
+        fuse::TransferConfig tx = rx;
+        tx.host = "127.0.0.1";
+        (sender_has_key ? tx : rx).pre_shared_key = "a-long-enough-pre-shared-key";
+
+        std::vector<uint8_t> got;
+        fuse::TransferStatus rs = fuse::TransferStatus::Ok;
+        std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const fuse::TransferStatus ss = fuse::send_buffer(tx, payload.data(), payload.size(), nullptr);
+        receiver.join();
+        EXPECT_EQ(ss, fuse::TransferStatus::AuthFailed) << fuse::to_string(ss);
+        EXPECT_EQ(rs, fuse::TransferStatus::AuthFailed) << fuse::to_string(rs);
+        EXPECT_TRUE(got.empty());
+    }
 }
 
 #endif // FUSE_PROTO_WITH_DTLS
@@ -723,6 +760,15 @@ public:
     // how many of those carried different payload bytes than the first copy.
     // Under encryption a resend must be the identical ciphertext and tag: a
     // second, different tag under the same nonce is the GCM nonce-reuse flaw.
+    // What an on-path observer learns: the sender's address and the lane
+    // nonce from its (plaintext-framed) StreamStart.
+    bool observed(fuse::proto::PeerAddr *sender, uint64_t *nonce) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!seen_start_) return false;
+        *sender = sender_seen_;
+        *nonce = nonce_seen_;
+        return true;
+    }
     uint64_t resends() const { return resends_.load(); }
     uint64_t changed_resends() const { return changed_resends_.load(); }
 
@@ -743,6 +789,13 @@ private:
                 sender = from;
                 have_sender = true;
                 MsgType t;
+                StreamStart start;
+                if (decode_stream_start(buf.data(), got, &start)) {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    seen_start_ = true;
+                    sender_seen_ = from;
+                    nonce_seen_ = start.nonce;
+                }
                 BlockHeader h;
                 uint64_t st = 0;
                 const uint8_t *pl = nullptr;
@@ -778,6 +831,10 @@ private:
     std::atomic<uint64_t> dropped_{0};
     std::atomic<uint64_t> resends_{0}, changed_resends_{0};
     std::map<uint64_t, std::vector<uint8_t>> first_copy_;
+    std::mutex mu_;
+    bool seen_start_ = false;
+    fuse::proto::PeerAddr sender_seen_{};
+    uint64_t nonce_seen_ = 0;
     std::thread thread_;
 };
 
@@ -920,6 +977,72 @@ TEST(Transfer, LossyLinkRecoversThroughRetransmitThread) {
         }
     }
 }
+
+#if FUSE_PROTO_WITH_DTLS
+// Under a pre-shared key the control plane is authenticated (v8): an
+// attacker who has seen the lane nonce can no longer abort the transfer
+// with a forged StreamClose, nor make the sender believe undelivered data
+// arrived with a forged Ack.
+TEST(Transfer, ForgedControlMessagesAreIgnoredUnderPsk) {
+    using namespace fuse::proto;
+    namespace fs = std::filesystem;
+    const auto payload = make_payload(8 * 1024 * 1024);
+    const uint16_t rx_port = next_port();
+    const uint16_t relay_port = next_port();
+
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = rx_port;
+    rx.lanes = 1;
+    rx.timeout_ms = 20000;
+    rx.pre_shared_key = "control-plane-test-key";
+    fuse::TransferConfig tx = rx;
+    tx.host = "127.0.0.1";
+    tx.base_port = relay_port;
+
+    pipeline_test::LossyRelay relay(relay_port, rx_port, 40);
+    std::vector<uint8_t> got;
+    fuse::TransferStatus rs = fuse::TransferStatus::Incomplete, ss = rs;
+    std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    std::atomic<bool> done{false};
+    std::thread sender([&] {
+        ss = fuse::send_buffer(tx, payload.data(), payload.size(), nullptr);
+        done.store(true);
+    });
+
+    UdpSocket atk;
+    ASSERT_TRUE(atk.open("127.0.0.1", 0));
+    PeerAddr victim{};
+    uint64_t nonce = 0;
+    while (!relay.observed(&victim, &nonce) && !done.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    uint64_t forged = 0;
+    while (!done.load()) {
+        uint8_t buf[256];
+        StreamClose sc;
+        sc.nonce = nonce;
+        sc.reason = kStreamCloseAborted;
+        size_t n = encode_stream_close(sc, buf, sizeof(buf));
+        atk.send_to(buf, n, victim);
+        Ack ack;
+        ack.nonce = nonce;
+        ack.base_seq_no = UINT64_MAX;
+        n = encode_ack(ack, buf, sizeof(buf));
+        atk.send_to(buf, n, victim);
+        forged += 2;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    sender.join();
+    receiver.join();
+    EXPECT_GT(forged, 0u);
+    EXPECT_EQ(ss, fuse::TransferStatus::Ok) << fuse::to_string(ss);
+    EXPECT_EQ(rs, fuse::TransferStatus::Ok) << fuse::to_string(rs);
+    EXPECT_EQ(got, payload);
+}
+
+#endif // FUSE_PROTO_WITH_DTLS
 
 // StreamStart sizes are unauthenticated claims: a lane that doesn't fit
 // inside its own transfer, or a lane that disagrees with the others about

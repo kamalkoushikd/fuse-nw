@@ -87,6 +87,11 @@ struct Nack {
 // it is not authenticated under a PSK — the nonce is the only session check.
 inline constexpr uint8_t kStreamCloseFinished = 0; // sender: every byte acknowledged
 inline constexpr uint8_t kStreamCloseAborted  = 1; // either side: giving up on this lane
+// Receiver -> sender (v8): the StreamStart failed authentication, i.e. the
+// two ends hold different pre-shared keys (or only one has one). Sent
+// unauthenticated, since the receiver has no key it shares with this peer;
+// it only lets a mis-keyed sender fail fast instead of timing out.
+inline constexpr uint8_t kStreamCloseAuthFailed = 2;
 
 struct StreamClose {
     uint16_t stream_id = 0;
