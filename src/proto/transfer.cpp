@@ -2295,12 +2295,18 @@ TransferStatus receive_to_sink(const TransferConfig &cfg, Sink *sink, TransferSt
 // password, and is refused rather than silently protecting nothing.
 constexpr size_t kMinPreSharedKeyLen = 16;
 
+// Lane i uses base_port + i; the last lane's port must still be a port
+// (ROADMAP #25: the sum was cast to uint16_t and wrapped to ports near 0).
+bool ports_overflow(const TransferConfig &cfg) {
+    return static_cast<uint32_t>(cfg.base_port) + cfg.lanes - 1 > 65535u;
+}
+
 bool psk_too_short(const TransferConfig &cfg) {
     return !cfg.pre_shared_key.empty() && cfg.pre_shared_key.size() < kMinPreSharedKeyLen;
 }
 
 TransferStatus check_receive_config(const TransferConfig &cfg) {
-    if (cfg.lanes == 0 || cfg.base_port == 0 || psk_too_short(cfg)) {
+    if (cfg.lanes == 0 || cfg.base_port == 0 || ports_overflow(cfg) || psk_too_short(cfg)) {
         return TransferStatus::ConfigError;
     }
     if (!cfg.pre_shared_key.empty() && !session_crypto_available()) {
@@ -2340,7 +2346,8 @@ namespace {
 // of that file resume it.
 TransferStatus send_impl(const TransferConfig &cfg, const uint8_t *data, size_t len,
                          uint64_t file_id, TransferStats *stats) {
-    if (cfg.lanes == 0 || cfg.base_port == 0 || cfg.block_size == 0 || psk_too_short(cfg) ||
+    if (cfg.lanes == 0 || cfg.base_port == 0 || ports_overflow(cfg) || cfg.block_size == 0 ||
+        psk_too_short(cfg) ||
         (data == nullptr && len > 0)) {
         return TransferStatus::ConfigError;
     }
