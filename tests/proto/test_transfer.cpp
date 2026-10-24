@@ -791,6 +791,15 @@ public:
         thread_.join();
     }
     uint64_t dropped() const { return dropped_.load(); }
+    // Drops one in `one_in` data datagrams longer than `threshold` bytes,
+    // the way a 1500-byte path loses fragmented datagrams when a fragment
+    // is lost. Set before traffic starts.
+    void lose_large_datagrams(size_t threshold, int one_in) {
+        large_threshold_ = threshold;
+        large_one_in_ = one_in;
+    }
+    uint64_t data_datagrams() const { return data_total_.load(); }
+    uint64_t large_datagrams() const { return data_large_.load(); }
     // Blocks seen more than once (a retransmission of an earlier seq), and
     // how many of those carried different payload bytes than the first copy.
     // Under encryption a resend must be the identical ciphertext and tag: a
@@ -845,6 +854,16 @@ private:
                         if (it->second != body) changed_resends_.fetch_add(1);
                     }
                 }
+                if (peek_msg_type(buf.data(), got, &t) && t == MsgType::Data) {
+                    data_total_.fetch_add(1);
+                    if (large_one_in_ > 0 && got > large_threshold_) {
+                        data_large_.fetch_add(1);
+                        if (++large_seen_ % static_cast<uint64_t>(large_one_in_) == 0) {
+                            dropped_.fetch_add(1);
+                            continue;
+                        }
+                    }
+                }
                 if (peek_msg_type(buf.data(), got, &t) && t == MsgType::Data && got > 20 &&
                     (buf[12] & kFlagRetransmission) == 0 && ++data_seen % drop_every_ == 0) {
                     dropped_.fetch_add(1);
@@ -872,6 +891,10 @@ private:
     fuse::proto::PeerAddr receiver_;
     int drop_every_;
     uint64_t rebind_after_ = 0;
+    size_t large_threshold_ = 0;
+    int large_one_in_ = 0;
+    uint64_t large_seen_ = 0;
+    std::atomic<uint64_t> data_total_{0}, data_large_{0};
     bool rebound_ = false;
     std::atomic<bool> stop_{false};
     std::atomic<uint64_t> dropped_{0};
@@ -1271,6 +1294,38 @@ TEST(Transfer, SmallReceiverRingsAreNotOverrun) {
     std::printf("[ info ] retransmits with 16-slot rings: %llu\n",
                 static_cast<unsigned long long>(st.retransmits));
     EXPECT_LT(st.retransmits, 400u) << "the receiver's rings were overrun";
+}
+
+// ROADMAP #7: on a path that loses large (fragmented) datagrams, block-size
+// growth must settle below the failing size instead of sawtoothing into it.
+TEST(Transfer, BlockGrowthSettlesOnAPathThatLosesLargeDatagrams) {
+    const auto payload = make_payload(24 * 1024 * 1024);
+    const uint16_t rx_port = next_port();
+    const uint16_t relay_port = next_port();
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = rx_port;
+    rx.lanes = 1;
+    rx.timeout_ms = 30000;
+    fuse::TransferConfig tx = rx;
+    tx.host = "127.0.0.1";
+    tx.base_port = relay_port;
+
+    pipeline_test::LossyRelay relay(relay_port, rx_port, 1 << 30);
+    relay.lose_large_datagrams(1500, 3); // a third of anything bigger than an Ethernet MTU
+    std::vector<uint8_t> got;
+    fuse::TransferStatus rs = fuse::TransferStatus::Incomplete;
+    std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(fuse::send_buffer(tx, payload.data(), payload.size()), fuse::TransferStatus::Ok);
+    receiver.join();
+    EXPECT_EQ(rs, fuse::TransferStatus::Ok);
+    EXPECT_EQ(got, payload);
+    const double large = static_cast<double>(relay.large_datagrams()) /
+                         static_cast<double>(std::max<uint64_t>(1, relay.data_datagrams()));
+    std::printf("[ info ] %.1f%% of %llu data datagrams were > 1500 bytes\n", 100 * large,
+                static_cast<unsigned long long>(relay.data_datagrams()));
+    EXPECT_LT(large, 0.10) << "the sender kept growing into a size the path loses";
 }
 
 // Return routability (ROADMAP #18, #5): a StreamStart from an address that

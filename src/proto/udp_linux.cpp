@@ -5,6 +5,8 @@
 #endif
 
 #include <linux/udp.h> // UDP_SEGMENT
+#include <netinet/in.h>
+#include <unistd.h>
 #include <sys/socket.h>
 
 #include <cerrno>
@@ -59,6 +61,32 @@ UdpSocket &UdpSocket::operator=(UdpSocket &&other) noexcept {
         batch_scratch_ = std::exchange(other.batch_scratch_, nullptr);
     }
     return *this;
+}
+
+uint16_t path_mtu(const PeerAddr &dst) {
+    const int family = dst.addr.ss_family;
+    if (family != AF_INET && family != AF_INET6) {
+        return 0;
+    }
+    // A throwaway connected socket: connect() makes the kernel resolve the
+    // route, after which IP_MTU / IPV6_MTU report its MTU. (The transfer
+    // sockets themselves stay unconnected, so they keep receiving from a
+    // migrated peer.)
+    const int fd = ::socket(family, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        return 0;
+    }
+    int mtu = 0;
+    socklen_t len = sizeof(mtu);
+    const bool ok =
+        ::connect(fd, reinterpret_cast<const sockaddr *>(&dst.addr), dst.len) == 0 &&
+        (family == AF_INET ? ::getsockopt(fd, IPPROTO_IP, IP_MTU, &mtu, &len)
+                           : ::getsockopt(fd, IPPROTO_IPV6, IPV6_MTU, &mtu, &len)) == 0;
+    ::close(fd);
+    if (!ok || mtu <= 0) {
+        return 0;
+    }
+    return static_cast<uint16_t>(mtu > 65535 ? 65535 : mtu);
 }
 
 bool UdpSocket::send_segmented(const uint8_t *buf, size_t len, uint16_t segment_size,
