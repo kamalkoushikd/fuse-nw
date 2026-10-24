@@ -1432,19 +1432,20 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                const uint8_t *whole, uint64_t file_id, LaneResult *res,
                std::atomic<bool> *stop_all) {
     UdpSocket sock;
-    if (!sock.open("0.0.0.0", 0)) {
-        res->status.store(static_cast<int>(TransferStatus::SocketError));
-        return;
-    }
-    set_bufs(sock.fd(), 32 << 20);
-    set_timeout_us(sock.fd(), 200);
-
     PeerAddr dst;
     if (!UdpSocket::resolve(cfg.host.c_str(), static_cast<uint16_t>(cfg.base_port + lane),
                             &dst)) {
         res->status.store(static_cast<int>(TransferStatus::ConfigError));
         return;
     }
+    // The local socket must be of the destination's family: it used to be
+    // IPv4 always, so an IPv6 host could never be reached.
+    if (!sock.open(wildcard_for(dst), 0)) {
+        res->status.store(static_cast<int>(TransferStatus::SocketError));
+        return;
+    }
+    set_bufs(sock.fd(), 32 << 20);
+    set_timeout_us(sock.fd(), 200);
 
     SenderRegistry reg(lane, kWindow);
     CongestionController cc(kWindow, true, 1, 16);

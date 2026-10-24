@@ -43,6 +43,11 @@ uint16_t peer_port(const PeerAddr &p);
 // determined on this platform. Used to cap block growth (ROADMAP #7).
 uint16_t path_mtu(const PeerAddr &dst);
 
+// The wildcard local address of `dst`'s family ("::" or "0.0.0.0"), for a
+// client socket that must be able to reach it: an AF_INET socket cannot
+// send to an IPv6 address.
+const char *wildcard_for(const PeerAddr &dst);
+
 // IP + UDP header bytes for a datagram to `dst` (28 for IPv4, 48 for IPv6).
 size_t ip_udp_overhead(const PeerAddr &dst);
 
