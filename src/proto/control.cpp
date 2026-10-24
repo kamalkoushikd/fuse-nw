@@ -107,7 +107,7 @@ bool decode_stream_start(const uint8_t *in, size_t in_len, StreamStart *ss) {
 }
 
 size_t encode_ack(const Ack &ack, uint8_t *out, size_t out_cap) {
-    const size_t total = kOuterHeaderSize + 2 + 8 + kMaskWords * 8 + 8 + 8;
+    const size_t total = kOuterHeaderSize + 2 + 8 + kMaskWords * 8 + 8 + 8 + 4;
     if (out_cap < total) {
         return 0;
     }
@@ -119,12 +119,13 @@ size_t encode_ack(const Ack &ack, uint8_t *out, size_t out_cap) {
     }
     off += put_u64(out + off, ack.echoed_send_time);
     off += put_u64(out + off, ack.nonce);
+    off += put_u32(out + off, ack.rwnd);
     return off;
 }
 
 bool decode_ack(const uint8_t *in, size_t in_len, Ack *ack) {
     size_t off = check_outer(in, in_len, MsgType::Ack);
-    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8 + kMaskWords * 8 + 8 + 8) {
+    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8 + kMaskWords * 8 + 8 + 8 + 4) {
         return false;
     }
     off += get_u16(in + off, &ack->stream_id);
@@ -134,6 +135,7 @@ bool decode_ack(const uint8_t *in, size_t in_len, Ack *ack) {
     }
     off += get_u64(in + off, &ack->echoed_send_time);
     off += get_u64(in + off, &ack->nonce);
+    off += get_u32(in + off, &ack->rwnd);
     return true;
 }
 
