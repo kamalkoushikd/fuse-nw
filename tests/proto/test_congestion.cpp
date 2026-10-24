@@ -195,3 +195,12 @@ TEST(Congestion, PacingSpreadsTheWindowOverAnRtt) {
     EXPECT_EQ(cc.pacing_interval_ns(60000, 1200000), 400'000u);
     EXPECT_EQ(cc.pacing_interval_ns(1200000, 1200000), 8'000'000u);
 }
+
+// ROADMAP #31: RTT from an echo in a randomly offset clock domain, wrap-safe.
+TEST(Congestion, RttFromOffsetEchoIsWrapSafe) {
+    const uint64_t offset = 0xFFFFFFFFFFFFFF00ull; // sends near the top, echo wraps past 0
+    const uint64_t sent = 0x10 + offset, now = 0x10 + 5'000'000 + offset;
+    EXPECT_EQ(rtt_sample_from_echo(now, sent), 5'000'000u);
+    EXPECT_EQ(rtt_sample_from_echo(sent, now), 0u) << "an echo from the future is not ours";
+    EXPECT_EQ(rtt_sample_from_echo(now, now - 120'000'000'000ull), 0u) << "implausibly old";
+}
