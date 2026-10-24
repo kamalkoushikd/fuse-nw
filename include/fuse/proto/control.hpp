@@ -64,6 +64,26 @@ struct StreamStart {
     // modification time), so a receiver holding a partial copy can tell
     // whether it belongs to this file. 0 = not a file / don't resume.
     uint64_t file_id = 0;
+    // v8: the address-validation token from the receiver's Retry, 0 on the
+    // first attempt. A receiver only claims a lane (and sends anything
+    // larger than a Retry) for a StreamStart whose token proves the sender
+    // receives at its source address.
+    uint64_t token = 0;
+};
+
+// v8 address validation: the receiver's answer to a StreamStart without a
+// valid token. 20 bytes, smaller than the 78-byte StreamStart it answers.
+struct Retry {
+    uint16_t stream_id = 0;
+    uint64_t nonce     = 0; // echoes the StreamStart nonce
+    uint64_t token     = 0;
+};
+
+// v8 path validation. A PathResponse echoes the PathChallenge's value.
+struct PathProbe {
+    uint16_t stream_id = 0;
+    uint64_t nonce     = 0; // the lane's session nonce
+    uint64_t challenge = 0;
 };
 
 struct Ack {
@@ -153,6 +173,13 @@ bool   decode_resume_ranges(const uint8_t *in, size_t in_len, ResumeRanges *rr);
 
 size_t encode_digest(const DigestMessage &dm, uint8_t *out, size_t out_cap);
 bool   decode_digest(const uint8_t *in, size_t in_len, DigestMessage *dm);
+
+size_t encode_retry(const Retry &r, uint8_t *out, size_t out_cap);
+bool   decode_retry(const uint8_t *in, size_t in_len, Retry *r);
+
+// `type` is MsgType::PathChallenge or MsgType::PathResponse.
+size_t encode_path_probe(MsgType type, const PathProbe &pp, uint8_t *out, size_t out_cap);
+bool   decode_path_probe(MsgType type, const uint8_t *in, size_t in_len, PathProbe *pp);
 
 // Largest aux datagram: a full-window NACK. Used to size receive buffers.
 inline constexpr size_t kMaxAuxDatagramSize =
