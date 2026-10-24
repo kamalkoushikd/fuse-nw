@@ -39,9 +39,9 @@ struct RegistrySlot {
 
 class SenderRegistry {
 public:
-    // window_size is clamped to [1, kMaxWindow]; the storage is always
-    // kMaxWindow slots, but only the first window_size are used, matching
-    // the per-stream window negotiated at SETUP (Stage 2).
+    // window_size is clamped to [1, kMaxWindow], and exactly that many slots
+    // are allocated, matching the per-stream window negotiated at SETUP
+    // (Stage 2).
     explicit SenderRegistry(uint16_t stream_id, uint16_t window_size);
 
     uint16_t stream_id() const { return stream_id_; }
