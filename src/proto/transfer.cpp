@@ -77,12 +77,18 @@ uint64_t random_nonce() {
     return rng();
 }
 
+// The retransmission bit is deliberately left out. A retransmit re-seals the
+// same plaintext under the same (key, nonce); if the AAD differed between
+// the original and the resend, the two tags would let an observer solve for
+// GCM's authentication key and forge blocks. With the bit masked, a resend
+// is byte-for-byte the original ciphertext and tag, which leaks nothing.
+// (LastBlock stays authenticated, so it still cannot be flipped.)
 size_t build_aad(uint8_t *out, uint16_t lane, uint64_t seq, uint64_t offset, uint8_t flags) {
     size_t n = 0;
     n += put_u16(out + n, lane);
     n += put_u64(out + n, seq);
     n += put_u64(out + n, offset);
-    n += put_u8(out + n, flags);
+    n += put_u8(out + n, static_cast<uint8_t>(flags & ~kFlagRetransmission));
     return n;
 }
 
