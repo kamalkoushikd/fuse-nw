@@ -1663,6 +1663,34 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
         res->status.store(static_cast<int>(st));
     };
 
+    // Resends block `seq` from the registry (NACK and RTO paths). False if it
+    // is no longer held (already acknowledged) or the send was refused.
+    const auto resend = [&](uint64_t seq) {
+        const RegistrySlot *sl = reg.lookup(seq);
+        if (!sl) return false;
+        BlockHeader hdr;
+        hdr.stream_id = lane;
+        hdr.seq_no = seq;
+        // OR, not overwrite: a retransmitted last block is still the last
+        // block, and the receiver has no other way to learn a stream
+        // finished if this bit is dropped here.
+        hdr.flags = sl->flags | kFlagRetransmission;
+        hdr.payload_len = sl->payload_len;
+        hdr.offset = sl->offset;
+        const uint8_t *body = sl->payload;
+        if (keys.enabled) {
+            uint8_t aad[19];
+            const size_t al = build_aad(aad, lane, seq, hdr.offset, hdr.flags);
+            if (!seal(seq, aad, al, sl->payload, sl->payload_len, sealed.data())) return false;
+            body = sealed.data();
+            hdr.payload_len = static_cast<uint16_t>(sl->payload_len + kAeadTagLen);
+        }
+        const size_t n = encode_data_datagram(hdr, now_ns(), body, rtx.data(), rtx.size());
+        if (n == 0 || !sock.send_to(rtx.data(), n, dst)) return false;
+        ++retransmits;
+        return true;
+    };
+
     res->start_ns.store(t0);
 
     for (;;) {
@@ -1813,34 +1841,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 if (!decode_nack(ctl.data(), got, &nack)) continue;
                 cc.on_loss();
                 loss_seen = true;
-                for (uint16_t i = 0; i < nack.count; ++i) {
-                    const uint64_t seq = nack.missing[i];
-                    const RegistrySlot *sl = reg.lookup(seq);
-                    if (!sl) continue;
-                    BlockHeader hdr;
-                    hdr.stream_id = lane;
-                    hdr.seq_no = seq;
-                    // OR, not overwrite: a retransmitted last block is still
-                    // the last block, and the receiver has no other way to
-                    // learn a stream finished if this bit is dropped here.
-                    hdr.flags = sl->flags | kFlagRetransmission;
-                    hdr.payload_len = sl->payload_len;
-                    hdr.offset = sl->offset;
-                    const uint8_t *body = sl->payload;
-                    if (keys.enabled) {
-                        uint8_t aad[19];
-                        const size_t al = build_aad(aad, lane, seq, hdr.offset, hdr.flags);
-                        if (!seal(seq, aad, al, sl->payload, sl->payload_len,
-                                         sealed.data())) {
-                            continue;
-                        }
-                        body = sealed.data();
-                        hdr.payload_len = static_cast<uint16_t>(sl->payload_len + kAeadTagLen);
-                    }
-                    const size_t n =
-                        encode_data_datagram(hdr, now_ns(), body, rtx.data(), rtx.size());
-                    if (n && sock.send_to(rtx.data(), n, dst)) ++retransmits;
-                }
+                for (uint16_t i = 0; i < nack.count; ++i) resend(nack.missing[i]);
             } else if (type == MsgType::PathChallenge || type == MsgType::PathResponse) {
                 PathProbe pp;
                 if (!decode_path_probe(type, ctl.data(), got, &pp) || pp.nonce != ss.nonce) continue;
@@ -1864,16 +1865,11 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             }
         }
 
-        // Retransmission timeout, adaptive to the measured RTT. A fixed 5 ms
-        // is right for loopback but catastrophic on any real path: it fires
-        // ~RTT/5ms times before the ACK can arrive, so the sender retransmits
-        // every in-flight block many times over. The congestion controller
-        // already smooths an RTT estimate from the ACK echo; the RTO is
-        // ~2*RTT, with a 1 s default until the first sample lands.
-        const uint64_t srtt = cc.rtt_ns();
-        const uint64_t rto_ns =
-            srtt ? std::clamp<uint64_t>(srtt * 2, 5'000'000ull, 1'000'000'000ull)
-                 : 1'000'000'000ull;
+        // Retransmission timeout (ROADMAP #23): SRTT + 4·RTTVAR, at least
+        // 5 ms, at most 1 s, 1 s before any sample, doubling on consecutive
+        // timeouts. A fixed multiple of SRTT fired spuriously under jitter,
+        // and with no backoff a dead path was retried at a constant rate.
+        const uint64_t rto_ns = cc.rto_ns(5'000'000ull, 1'000'000'000ull, 1'000'000'000ull);
 
         const uint64_t t = now_ns();
         const bool base_advanced = (base != last_base);
@@ -1881,39 +1877,18 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             last_base = base;
             last_progress = t;
             last_real_progress = t;
+            cc.on_progress();
         } else if (t - last_progress > rto_ns) {
-            cc.on_loss();
-            const RegistrySlot *sl = reg.lookup(base);
-            if (sl) {
-                BlockHeader hdr;
-                hdr.stream_id = lane;
-                hdr.seq_no = base;
-                hdr.flags = sl->flags | kFlagRetransmission; // see the NACK path's comment above
-                hdr.payload_len = sl->payload_len;
-                hdr.offset = sl->offset;
-                const uint8_t *body = sl->payload;
-                if (keys.enabled) {
-                    uint8_t aad[19];
-                    const size_t al = build_aad(aad, lane, base, hdr.offset, hdr.flags);
-                    if (seal(base, aad, al, sl->payload, sl->payload_len,
-                                    sealed.data())) {
-                        body = sealed.data();
-                        hdr.payload_len = static_cast<uint16_t>(sl->payload_len + kAeadTagLen);
-                    }
-                }
-                const size_t n =
-                    encode_data_datagram(hdr, now_ns(), body, rtx.data(), rtx.size());
-                // A refused send (buffer full) must not count as progress, or
-                // the block is never retransmitted and the transfer stalls.
-                if (n && sock.send_to(rtx.data(), n, dst)) {
-                    ++retransmits;
-                    last_progress = t;
-                } else {
-                    timespec nap{0, 200000};
-                    nanosleep(&nap, nullptr);
-                }
-            } else {
+            if (!reg.lookup(base)) {
                 last_progress = t;
+            } else if (resend(base)) {
+                cc.on_timeout(); // one halving per run of timeouts, then backoff
+                last_progress = t;
+            } else {
+                // A refused send (buffer full) must not count as progress,
+                // or the block is never retransmitted and the transfer stalls.
+                timespec nap{0, 200000};
+                nanosleep(&nap, nullptr);
             }
         }
 

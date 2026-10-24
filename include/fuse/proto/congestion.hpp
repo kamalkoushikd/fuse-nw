@@ -46,19 +46,52 @@ public:
     bool enabled() const { return enabled_; }
     uint32_t window() const { return window_; }
     uint64_t rtt_ns() const { return srtt_ns_; }
+    uint64_t rttvar_ns() const { return rttvar_ns_; }
 
     // Feeds an RTT sample, typically now - ack.echoed_send_time. The first
-    // sample seeds the estimate; later samples smooth it (EWMA, 1/8).
+    // sample seeds the estimate; later samples smooth it (EWMA, 1/8). The
+    // RTT variance is tracked alongside (RFC 6298: 1/4 gain).
     void on_rtt_sample(uint64_t sample_ns) {
         if (!enabled_ || sample_ns == 0) {
             return;
         }
         if (srtt_ns_ == 0) {
             srtt_ns_ = sample_ns;
+            rttvar_ns_ = sample_ns / 2;
         } else {
+            const uint64_t dev = srtt_ns_ > sample_ns ? srtt_ns_ - sample_ns : sample_ns - srtt_ns_;
+            rttvar_ns_ = (rttvar_ns_ * 3 + dev) / 4;
             srtt_ns_ = (srtt_ns_ * 7 + sample_ns) / 8;
         }
     }
+
+    // Retransmission timeout (ROADMAP #23), RFC 6298 style: SRTT + 4·RTTVAR
+    // (at least 1 ms of variance allowance), clamped to [min_ns, max_ns],
+    // `initial_ns` before any sample, and doubled for each consecutive
+    // timeout without progress. A variance term keeps jitter from firing
+    // spurious retransmits; the backoff keeps a dead or overloaded path
+    // from being hammered at a fixed interval.
+    uint64_t rto_ns(uint64_t min_ns, uint64_t max_ns, uint64_t initial_ns) const {
+        uint64_t rto = initial_ns;
+        if (srtt_ns_ != 0) {
+            const uint64_t var = rttvar_ns_ * 4 > 1'000'000ull ? rttvar_ns_ * 4 : 1'000'000ull;
+            rto = srtt_ns_ + var;
+        }
+        rto = rto < min_ns ? min_ns : (rto > max_ns ? max_ns : rto);
+        for (unsigned i = 0; i < backoff_ && rto < max_ns; ++i) rto *= 2;
+        return rto > max_ns ? max_ns : rto;
+    }
+
+    // The RTO fired. Only the first timeout of a run counts as a loss (one
+    // window halving), however long the run lasts; later ones only back off.
+    void on_timeout() {
+        if (backoff_ == 0) on_loss();
+        if (backoff_ < kMaxBackoff) ++backoff_;
+    }
+
+    // The peer acknowledged something new: the path works, reset backoff.
+    void on_progress() { backoff_ = 0; }
+    unsigned backoff() const { return backoff_; }
 
     // Records that a loss (NACK) was observed in the current window.
     void on_loss() {
@@ -98,6 +131,8 @@ public:
     }
 
 private:
+    static constexpr unsigned kMaxBackoff = 6;
+
     bool enabled_;
     uint32_t clean_windows_to_grow_;
     uint32_t grow_step_;
@@ -106,6 +141,8 @@ private:
     uint32_t window_ = 1;
     uint32_t clean_streak_ = 0;
     uint64_t srtt_ns_ = 0;
+    uint64_t rttvar_ns_ = 0;
+    unsigned backoff_ = 0;
     uint64_t window_start_ns_ = 0;
     bool loss_in_window_ = false;
 };

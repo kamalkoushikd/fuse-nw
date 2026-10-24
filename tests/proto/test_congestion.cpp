@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 #include <cstdint>
 #include <vector>
 
@@ -120,4 +122,33 @@ TEST(Congestion, PerStreamStateIsIndependent) {
     // The lossy stream reacted; the tolerant stream did not move at all.
     EXPECT_EQ(tolerant.window(), 64u);
     EXPECT_LT(lossy.window(), 64u);
+}
+
+// ROADMAP #23: the RTO has a variance term and backs off exponentially.
+TEST(Congestion, RtoFollowsRfc6298AndBacksOff) {
+    CongestionController cc(128);
+    EXPECT_EQ(cc.rto_ns(5'000'000, 1'000'000'000, 1'000'000'000), 1'000'000'000u)
+        << "initial RTO before any sample";
+    cc.on_rtt_sample(10'000'000); // srtt 10 ms, rttvar 5 ms
+    EXPECT_EQ(cc.rto_ns(5'000'000, 1'000'000'000, 1'000'000'000), 30'000'000u);
+
+    // Jitter raises the RTO through the variance term, not just via SRTT.
+    for (int i = 0; i < 8; ++i) cc.on_rtt_sample(i % 2 ? 2'000'000 : 18'000'000);
+    const uint64_t jittery = cc.rto_ns(5'000'000, 1'000'000'000, 1'000'000'000);
+    EXPECT_GT(jittery, cc.rtt_ns() * 2);
+
+    const uint32_t before = cc.window();
+    cc.poll(1);
+    cc.on_timeout();
+    const uint64_t once = cc.rto_ns(5'000'000, 1'000'000'000, 1'000'000'000);
+    EXPECT_EQ(once, std::min<uint64_t>(jittery * 2, 1'000'000'000));
+    cc.on_timeout();
+    cc.on_timeout();
+    EXPECT_EQ(cc.backoff(), 3u);
+    cc.poll(1 + cc.rtt_ns()); // close exactly one epoch
+    EXPECT_EQ(cc.window(), std::max<uint32_t>(2, before / 2))
+        << "a run of timeouts halves the window once";
+    cc.on_progress();
+    EXPECT_EQ(cc.rto_ns(5'000'000, 1'000'000'000, 1'000'000'000), jittery);
+    EXPECT_EQ(cc.rto_ns(5'000'000, 20'000'000, 1'000'000'000), 20'000'000u) << "capped at max";
 }
