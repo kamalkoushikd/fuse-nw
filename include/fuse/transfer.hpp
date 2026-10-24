@@ -152,6 +152,7 @@ enum class TransferStatus {
     PeerAborted,   // the other side cancelled or gave up and said so
     IoError,       // receiver: writing the output failed (disk full, permissions, ...)
     VerifyFailed,  // receiver: a resumed file didn't match the sender's digest
+    VersionMismatch, // the peer speaks a different Fuse protocol version
 };
 
 // Human-readable form, for logs and error messages.
