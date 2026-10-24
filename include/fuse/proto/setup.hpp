@@ -15,8 +15,13 @@
 // Wire formats (each prefixed by the 2-byte outer header from wire.hpp):
 //   SetupData      : [protocol_version:1][num_workers:2][num_streams:2]
 //                    [ stream_id:2 worker_id:2 flags:1 block_size:2 window_size:2 ]*num_streams
-//   SetupHashReply : [hash:8]
-//   SetupFinAck    : [hash:8]
+//   SetupHashReply : [hash:8][responder_nonce:8]
+//   SetupFinAck    : [hash:8][responder_nonce:8]
+//
+// The responder nonce (v8) is fresh for every handshake the responder
+// takes part in, and the FINACK must echo it: a recorded DATA + FINACK pair
+// replayed later cannot complete a new handshake, because the replayed
+// FINACK carries the old nonce (ROADMAP #5).
 
 #include <cstddef>
 #include <cstdint>
@@ -87,8 +92,10 @@ size_t encode_setup_data(const SetupPayload &p, uint8_t *out, size_t out_cap);
 bool decode_setup_data(const uint8_t *in, size_t in_len, SetupPayload *p,
                        const uint8_t **raw_body, size_t *raw_body_len);
 
-size_t encode_setup_hash(MsgType type, uint64_t hash, uint8_t *out, size_t out_cap);
-bool   decode_setup_hash(MsgType expected, const uint8_t *in, size_t in_len, uint64_t *hash);
+size_t encode_setup_hash(MsgType type, uint64_t hash, uint64_t responder_nonce, uint8_t *out,
+                         size_t out_cap);
+bool   decode_setup_hash(MsgType expected, const uint8_t *in, size_t in_len, uint64_t *hash,
+                         uint64_t *responder_nonce);
 
 // --- Handshake state machines -------------------------------------------
 //
@@ -131,6 +138,7 @@ public:
 private:
     SetupPayload payload_;
     uint64_t my_hash_ = 0;
+    uint64_t responder_nonce_ = 0; // from the matching HASH-REPLY, echoed in FINACK
     uint64_t timeout_ns_;
     uint8_t  max_retries_;
     uint64_t last_send_ns_ = 0;
@@ -167,6 +175,7 @@ public:
 private:
     SetupPayload config_;
     uint64_t my_hash_ = 0;
+    uint64_t nonce_ = 0; // fresh per handshake; the FINACK must echo it
     uint64_t timeout_ns_;
     uint8_t  max_retries_;
     uint64_t last_send_ns_ = 0;
