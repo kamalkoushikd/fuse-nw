@@ -16,7 +16,6 @@
 #include <limits>
 #include <memory>
 #include <new>
-#include <random>
 #include <stdexcept>
 #include <thread>
 
@@ -67,22 +66,48 @@ void set_timeout_us(int fd, long us) {
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 }
 
-// Associated data binds a block to its identity so a valid block cannot be
-// replayed at another position.
 // Handshake anti-replay nonce for StreamStart (kept independent of the
 // crypto backend: this guards session identity, not confidentiality, so it
-// must work in unencrypted transfers too).
-uint64_t random_nonce() {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    return rng();
+// must work in unencrypted transfers too). It is the only session check on
+// several control messages, so it must not be predictable from earlier ones.
+uint64_t random_nonce() { return secure_random_u64(); }
+
+// Address-validation token (v8): a keyed PRF of the peer's address and the
+// lane nonce under a secret only this receiver lane knows. A sender can
+// only echo it back if it really receives at that address, which is what
+// keeps a spoofed StreamStart from claiming a lane or from making us send
+// anything bigger than the request to a victim (ROADMAP #18, #5).
+uint64_t address_token(const uint8_t secret[16], const PeerAddr &a, uint64_t nonce) {
+    uint8_t buf[2 + 2 + 16 + 8] = {};
+    size_t n = put_u16(buf, static_cast<uint16_t>(a.addr.ss_family));
+    n += put_u16(buf + n, peer_port(a));
+    if (a.addr.ss_family == AF_INET6) {
+        std::memcpy(buf + n, &reinterpret_cast<const sockaddr_in6 &>(a.addr).sin6_addr, 16);
+        n += 16;
+    } else {
+        std::memcpy(buf + n, &reinterpret_cast<const sockaddr_in &>(a.addr).sin_addr, 4);
+        n += 4;
+    }
+    n += put_u64(buf + n, nonce);
+    const uint64_t t = siphash24(secret, buf, n);
+    return t != 0 ? t : 1; // 0 means "no token" on the wire
 }
 
+// Associated data binds a block to its identity so a valid block cannot be
+// replayed at another position.
+
+// The retransmission bit is deliberately left out. A retransmit re-seals the
+// same plaintext under the same (key, nonce); if the AAD differed between
+// the original and the resend, the two tags would let an observer solve for
+// GCM's authentication key and forge blocks. With the bit masked, a resend
+// is byte-for-byte the original ciphertext and tag, which leaks nothing.
+// (LastBlock stays authenticated, so it still cannot be flipped.)
 size_t build_aad(uint8_t *out, uint16_t lane, uint64_t seq, uint64_t offset, uint8_t flags) {
     size_t n = 0;
     n += put_u16(out + n, lane);
     n += put_u64(out + n, seq);
     n += put_u64(out + n, offset);
-    n += put_u8(out + n, flags);
+    n += put_u8(out + n, static_cast<uint8_t>(flags & ~kFlagRetransmission));
     return n;
 }
 
@@ -94,15 +119,78 @@ bool cancel_requested(const TransferConfig &cfg) {
 // its own timeout. Best effort and unacknowledged: sent a few times because
 // one lost datagram would otherwise cost the peer the full timeout, and the
 // peer's timeout still covers the case where all copies are lost.
+// Under a pre-shared key `auth` signs it; nullptr sends it unauthenticated
+// (plaintext sessions, and the receiver's auth-failed reply, which by
+// definition has no key in common with the peer).
 void send_stream_close(UdpSocket &sock, const PeerAddr &to, uint16_t lane, uint64_t nonce,
-                       uint8_t reason) {
+                       uint8_t reason, ControlAuth *auth) {
     StreamClose sc;
     sc.stream_id = lane;
     sc.nonce = nonce;
     sc.reason = reason;
-    uint8_t buf[32];
-    const size_t n = encode_stream_close(sc, buf, sizeof(buf));
+    uint8_t buf[64];
+    size_t n = encode_stream_close(sc, buf, sizeof(buf));
+    if (n != 0 && auth != nullptr) n = auth->seal(buf, n, sizeof(buf));
     for (int i = 0; n != 0 && i < 3; ++i) sock.send_to(buf, n, to);
+}
+
+// Signs an encoded control datagram in place when the session is keyed.
+// Returns the length to send (0 = don't send).
+size_t seal_ctl(ControlAuth *auth, uint8_t *buf, size_t n, size_t cap) {
+    if (n == 0 || auth == nullptr) return n;
+    return auth->seal(buf, n, cap);
+}
+
+// True if a received control datagram may be acted on: always in plaintext
+// sessions (auth == nullptr), and only with a valid trailer under a key.
+bool ctl_authentic(const ControlAuth *auth, const uint8_t *dg, size_t len) {
+    return auth == nullptr || auth->open(dg, len, nullptr);
+}
+
+// Path validation (v8, ROADMAP #3). A peer's address is only replaced by a
+// new source after that source echoes a random challenge, so a datagram
+// with a spoofed or merely different source address cannot redirect where
+// this lane sends its traffic (no hijack, no reflection at a third party).
+// One candidate at a time; challenges are resent at most every 50 ms.
+class PathValidator {
+public:
+    // Authentic traffic arrived from `src`, which is not the current peer.
+    // Returns true (and fills *probe) if a challenge should be sent to it now.
+    bool want_probe(const PeerAddr &src, uint64_t now, uint64_t *challenge) {
+        if (!(active_ && candidate_ == src)) {
+            active_ = true;
+            candidate_ = src;
+            challenge_ = secure_random_u64();
+            sent_ns_ = 0;
+        }
+        if (sent_ns_ != 0 && now - sent_ns_ < 50'000'000ull) return false;
+        sent_ns_ = now;
+        *challenge = challenge_;
+        return true;
+    }
+    // A PathResponse arrived; true if it validates the candidate.
+    bool validated(const PeerAddr &src, uint64_t value) {
+        if (!active_ || !(src == candidate_) || value != challenge_) return false;
+        active_ = false;
+        return true;
+    }
+
+private:
+    PeerAddr candidate_{};
+    uint64_t challenge_ = 0, sent_ns_ = 0;
+    bool active_ = false;
+};
+
+// Sends a PathChallenge/PathResponse for `lane`, signed under a PSK.
+void send_path_probe(UdpSocket &sock, const PeerAddr &to, MsgType type, uint16_t lane,
+                     uint64_t nonce, uint64_t value, ControlAuth *auth) {
+    PathProbe pp;
+    pp.stream_id = lane;
+    pp.nonce = nonce;
+    pp.challenge = value;
+    uint8_t buf[64];
+    const size_t n = seal_ctl(auth, buf, encode_path_probe(type, pp, buf, sizeof(buf)), sizeof(buf));
+    if (n) sock.send_to(buf, n, to);
 }
 
 // Written by one lane thread, read by the calling thread for progress
@@ -614,7 +702,8 @@ void coarsen_ranges(std::vector<ResumeRange> *r, size_t limit) {
 // Encodes a lane's ResumeRanges answer, split across as many datagrams as
 // the list needs (at least one, even for an empty list).
 std::vector<std::vector<uint8_t>> encode_resume_answer(uint16_t lane, uint64_t nonce, bool resumed,
-                                                       const std::vector<ResumeRange> &want) {
+                                                       const std::vector<ResumeRange> &want,
+                                                       ControlAuth *auth) {
     const size_t parts =
         std::max<size_t>(1, (want.size() + kMaxResumeRangesPerMsg - 1) / kMaxResumeRangesPerMsg);
     std::vector<std::vector<uint8_t>> msgs;
@@ -630,7 +719,8 @@ std::vector<std::vector<uint8_t>> encode_resume_answer(uint16_t lane, uint64_t n
             std::min<size_t>(kMaxResumeRangesPerMsg, want.size() - std::min(first, want.size())));
         for (uint16_t i = 0; i < rr.count; ++i) rr.ranges[i] = want[first + i];
         std::vector<uint8_t> buf(2048);
-        buf.resize(encode_resume_ranges(rr, buf.data(), buf.size()));
+        buf.resize(seal_ctl(auth, buf.data(), encode_resume_ranges(rr, buf.data(), buf.size()),
+                            buf.size()));
         msgs.push_back(std::move(buf));
     }
     return msgs;
@@ -655,22 +745,22 @@ constexpr uint64_t kRouteRun = kWriteBatch;
 // Per-consumer scratch, reused for every batch.
 struct ConsumerState {
     explicit ConsumerState(uint16_t lanes) : ciphers(lanes), plain(kWriteBatch * kMaxPayloadSize) {}
-    std::vector<std::unique_ptr<LaneCipher>> ciphers; // this thread's own, per lane
+    std::vector<std::unique_ptr<LaneKeySchedule>> ciphers; // this thread's own, per lane
     std::vector<uint8_t> plain;                       // decrypted blocks of one batch
     iovec iov[kWriteBatch];
 };
 
-// This thread's cipher for `lane`, created on first use (LaneCipher is
-// thread-confined, so each consumer keeps its own). nullptr if the lane's
-// key isn't available.
-LaneCipher *cipher_for(RxPipeline &p, ConsumerState &cs, uint16_t lane) {
+// This thread's cipher for block `seq` of `lane`, created on first use
+// (ciphers are thread-confined, so each consumer keeps its own key schedule
+// per lane). nullptr if the lane's key isn't available.
+const LaneCipher *cipher_for(RxPipeline &p, ConsumerState &cs, uint16_t lane, uint64_t seq) {
     if (!cs.ciphers[lane]) {
         if (!p.keys[lane].ready.load(std::memory_order_acquire)) return nullptr;
-        auto c = std::make_unique<LaneCipher>();
-        if (!c->init(p.keys[lane].key)) return nullptr;
+        auto c = std::make_unique<LaneKeySchedule>();
+        if (!c->init(p.keys[lane].key, lane)) return nullptr;
         cs.ciphers[lane] = std::move(c);
     }
-    return cs.ciphers[lane].get();
+    return cs.ciphers[lane]->cipher_for(seq);
 }
 
 // Processes up to one batch from a channel: authenticate/decrypt each block,
@@ -712,7 +802,7 @@ bool drain_channel(RxPipeline &p, ConsumerState &cs, Channel &ch, bool want_cryp
             // `flags` rides in the AAD (not just lane/seq/offset) so
             // LastBlock can't be flipped on an otherwise-authentic block to
             // end the lane early.
-            LaneCipher *cipher = cipher_for(p, cs, ch.lane);
+            const LaneCipher *cipher = cipher_for(p, cs, ch.lane, hdr.seq_no);
             uint8_t aad[19];
             const size_t al = build_aad(aad, ch.lane, hdr.seq_no, hdr.offset, hdr.flags);
             uint8_t *out = cs.plain.data() + i * kMaxPayloadSize;
@@ -860,6 +950,46 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
     bool peer_finished = false, peer_aborted = false;
     uint64_t peer_nonce = 0; // echoed in every Ack once StreamStart arrives
     PeerAddr peer{};
+    // Under a pre-shared key: this lane's control-plane signer/verifier,
+    // created once a StreamStart authenticates. nullptr in plaintext mode.
+    std::unique_ptr<ControlAuth> auth;
+    PathValidator path;
+    // Traffic for this session arrived from a source other than `peer`:
+    // challenge it rather than switching to it.
+    const auto probe_path = [&](const PeerAddr &src) {
+        uint64_t challenge = 0;
+        if (path.want_probe(src, now_ns(), &challenge)) {
+            send_path_probe(sock, src, MsgType::PathChallenge, lane, peer_nonce, challenge,
+                            auth.get());
+        }
+    };
+    // StreamStarts that failed authentication before any session existed:
+    // evidence of a key mismatch, reported as AuthFailed if nothing else
+    // ever succeeds on this lane.
+    uint64_t bad_starts = 0, last_auth_reply_ns = 0;
+    // Keys this lane's address-validation tokens (see address_token).
+    uint8_t token_secret[16];
+    put_u64(token_secret, secure_random_u64());
+    put_u64(token_secret + 8, secure_random_u64());
+    // Timer-driven Acks sent since the peer was last heard from. Once the
+    // peer has been silent for a few, stop: Acks are only owed to a peer
+    // that is still talking, and an endless Ack stream to an address that
+    // never answers is a reflection vector (ROADMAP #18).
+    unsigned quiet_acks = 0;
+    uint64_t last_version_reply_ns = 0;
+    constexpr unsigned kMaxQuietAcks = 3;
+    // Flow control (ROADMAP #9): what this lane can still absorb -- free
+    // space in its writer rings plus the blocks already handed over and not
+    // yet written. Advertised in every Ack as rwnd.
+    const auto receive_window = [&]() -> uint32_t {
+        uint64_t w = pending;
+        for (uint16_t k = 0; k < p->writers; ++k) w += p->ring(lane, k).writable();
+        return static_cast<uint32_t>(std::min<uint64_t>(w, kWindow));
+    };
+    // The last rwnd sent. When it was low and the writers have since caught
+    // up, an Ack goes out at once (a window update) rather than at the next
+    // 8-block / 200 us cadence, or a sender that paused for us would sit idle.
+    uint32_t advertised_rwnd = kRwndUnlimited;
     const auto send_resume_answer = [&] {
         for (const auto &m : resume_answer) sock.send_to(m.data(), m.size(), peer);
     };
@@ -876,6 +1006,7 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
     // an abort. Require a minimum sample size so a couple of early failures
     // during key/salt setup don't misreport a healthy transfer.
     const auto classify = [&](TransferStatus fallback) {
+        if (!have_start && bad_starts > 0) return TransferStatus::AuthFailed;
         const uint64_t auth_sample = delivered + auth_failures;
         if (auth_sample >= 20 && auth_failures * 2 > auth_sample) {
             return TransferStatus::AuthFailed;
@@ -888,7 +1019,7 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
     // into a closed port until its own timeout.
     const auto give_up = [&](TransferStatus st) {
         if (have_peer && have_start) {
-            send_stream_close(sock, peer, lane, peer_nonce, kStreamCloseAborted);
+            send_stream_close(sock, peer, lane, peer_nonce, kStreamCloseAborted, auth.get());
         }
         res->bytes.store(written);
         res->auth_failures.store(auth_failures);
@@ -916,14 +1047,12 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
             if (c.flags & kFlagLastBlock) final_seq = c.seq;
 
             // `Accepted` means this block is both authentic (if encrypted)
-            // AND new, not a replay of something already delivered. Only
-            // then is its source trusted as where to send ACKs: that is
-            // what lets a transfer survive the sender's NAT mapping changing
-            // mid-flight, while an attacker resending a captured datagram
-            // from their own address still can't redirect the ACKs.
+            // AND new, not a replay of something already delivered. A new
+            // source on such a block is how a sender's NAT rebinding shows
+            // up, but it is only adopted once it answers a path challenge,
+            // so a spoofed or replayed datagram can't redirect the ACKs.
             if (rx.on_receive(c.seq, c.send_time, now_ns()) == ReceiveResult::Accepted) {
-                peer = c.src;
-                have_peer = true;
+                if (!(c.src == peer)) probe_path(c.src);
                 // A retransmission arriving after we NACK'd measures one RTT
                 // on the receiver's own clock (no cross-host comparison).
                 if ((c.flags & kFlagRetransmission) && nack_sent_ns != 0) {
@@ -972,15 +1101,73 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
             const uint8_t *dg = rx_buf.data() + i * slot;
             const size_t dlen = lens[i];
             MsgType type;
-            if (!peek_msg_type(dg, dlen, &type)) continue;
+            if (!peek_msg_type(dg, dlen, &type)) {
+                // A peer on another protocol version: tell it (at most every
+                // 100 ms, never more bytes than it sent) instead of leaving
+                // it to time out without knowing why.
+                const uint64_t t = now_ns();
+                if (is_foreign_version(dg, dlen) && t - last_version_reply_ns > 100'000'000ull) {
+                    last_version_reply_ns = t;
+                    const size_t vn = encode_version_mismatch(tx.data(), tx.size());
+                    if (vn) sock.send_to(tx.data(), vn, srcs[i]);
+                }
+                continue;
+            }
 
             if (type == MsgType::StreamStart) {
                 StreamStart ss;
                 if (!decode_stream_start(dg, dlen, &ss)) continue;
+                // Return routability first: until the sender echoes a token
+                // bound to its source address, it gets only a Retry, which
+                // is smaller than its StreamStart (no amplification) and
+                // commits nothing on our side.
+                const uint64_t want_token = address_token(token_secret, srcs[i], ss.nonce);
+                if (ss.token != want_token) {
+                    Retry r;
+                    r.stream_id = lane;
+                    r.nonce = ss.nonce;
+                    r.token = want_token;
+                    const size_t rn = encode_retry(r, tx.data(), tx.size());
+                    if (rn) sock.send_to(tx.data(), rn, srcs[i]);
+                    continue;
+                }
                 if (!have_start) {
-                    // Every size here is the sender's unauthenticated claim.
-                    // Ordered so nothing can overflow: the lane must fit
-                    // inside the transfer.
+                    // Authenticate first (v8 key confirmation): under a PSK
+                    // the StreamStart is signed with a key derived from its
+                    // own salt, so a sender holding a different key -- or
+                    // none, or a plaintext receiver facing an encrypting
+                    // sender -- is found out here, before anything is
+                    // allocated, rather than after 20 failed data blocks.
+                    bool salted = false;
+                    for (uint8_t b : ss.session_salt) salted |= (b != 0);
+                    uint8_t session_key[kSessionKeyLen] = {};
+                    std::unique_ptr<ControlAuth> trial;
+                    bool authentic = !want_crypto && !salted;
+                    if (want_crypto && salted) {
+                        const std::string &psk = cfg.pre_shared_key;
+                        trial = std::make_unique<ControlAuth>();
+                        authentic = derive_session_key(reinterpret_cast<const uint8_t *>(psk.data()),
+                                                       psk.size(), ss.session_salt,
+                                                       kSessionSaltLen, session_key) &&
+                                    trial->init(session_key, lane, /*local_dir=*/1) &&
+                                    trial->open(dg, dlen, nullptr);
+                    }
+                    if (!authentic) {
+                        ++bad_starts;
+                        // Tell the sender (unauthenticated: we share no key
+                        // with it), at most every 100 ms so this can't be
+                        // used to make us flood a spoofed address.
+                        const uint64_t t = now_ns();
+                        if (t - last_auth_reply_ns > 100'000'000ull) {
+                            last_auth_reply_ns = t;
+                            send_stream_close(sock, srcs[i], lane, ss.nonce, kStreamCloseAuthFailed,
+                                              nullptr);
+                        }
+                        continue;
+                    }
+                    // Every size here is the sender's claim (authenticated
+                    // under a PSK, not otherwise). Ordered so nothing can
+                    // overflow: the lane must fit inside the transfer.
                     if (ss.total_bytes > ss.file_total_bytes ||
                         ss.stream_base_offset > ss.file_total_bytes - ss.total_bytes) {
                         continue;
@@ -1012,14 +1199,9 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
 
                     if (want_crypto) {
                         LaneKey &k = p->keys[lane];
-                        const std::string &psk = cfg.pre_shared_key;
-                        if (!derive_session_key(reinterpret_cast<const uint8_t *>(psk.data()),
-                                                psk.size(), ss.session_salt, kSessionSaltLen,
-                                                k.key)) {
-                            res->status.store(static_cast<int>(TransferStatus::Unsupported));
-                            return;
-                        }
+                        std::memcpy(k.key, session_key, kSessionKeyLen);
                         k.ready.store(true, std::memory_order_release);
+                        auth = std::move(trial);
                     }
                     have_start = true;
                     peer_nonce = ss.nonce;
@@ -1037,19 +1219,18 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
                     coarsen_ranges(&want, kMaxResumeRanges);
                     expected_bytes = 0;
                     for (const ResumeRange &r : want) expected_bytes += r.length;
-                    resume_answer = encode_resume_answer(lane, peer_nonce, p->sink->resumed(), want);
+                    resume_answer = encode_resume_answer(lane, peer_nonce, p->sink->resumed(), want,
+                                                         auth.get());
                     send_resume_answer();
 
                     res->expected.store(expected_bytes, std::memory_order_relaxed);
                     res->started.store(true, std::memory_order_release);
-                } else if (ss.nonce == peer_nonce) {
+                } else if (ss.nonce == peer_nonce && ctl_authentic(auth.get(), dg, dlen)) {
                     // A retried StreamStart (our Ack or resume answer was
-                    // lost) carrying the same nonce we already accepted —
-                    // safe to treat as this session even if it now arrives
-                    // from a different address (the sender's NAT mapping may
-                    // have rotated). Answer it again.
-                    peer = srcs[i];
-                    have_peer = true;
+                    // lost) carrying the same nonce we already accepted.
+                    // From a new address (the sender's NAT mapping may have
+                    // rotated) it is answered once that address is validated.
+                    if (!(srcs[i] == peer)) probe_path(srcs[i]);
                     send_resume_answer();
                 }
                 continue;
@@ -1060,21 +1241,37 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
                 if (have_start) {
                     // Only this session's nonce counts once a session
                     // exists: a close left over from an earlier transfer on
-                    // this port must not end this one.
-                    if (sc.nonce != peer_nonce) continue;
+                    // this port must not end this one. Under a PSK it must
+                    // also be signed by the sender.
+                    if (sc.nonce != peer_nonce || !ctl_authentic(auth.get(), dg, dlen)) continue;
                     if (sc.reason == kStreamCloseAborted) {
                         peer_aborted = true;
                     } else {
                         peer_finished = true;
                     }
-                } else if (sc.reason == kStreamCloseAborted) {
+                } else if (sc.reason == kStreamCloseAborted && !want_crypto) {
                     // No session yet, so no nonce to check: a sender that is
                     // cancelled before its StreamStart reached us (e.g.
                     // Ctrl+C while it was still loading the file) can only
                     // say "I'm not coming". Accepting that is no weaker than
-                    // the pre-session state, where any first StreamStart
-                    // already claims the lane.
+                    // the plaintext pre-session state. Under a PSK there is
+                    // no key yet to check it against, so an unverifiable
+                    // abort is ignored rather than letting anyone end us.
                     peer_aborted = true;
+                }
+                continue;
+            }
+            if (type == MsgType::PathChallenge || type == MsgType::PathResponse) {
+                PathProbe pp;
+                if (!have_start || !decode_path_probe(type, dg, dlen, &pp) ||
+                    pp.nonce != peer_nonce || !ctl_authentic(auth.get(), dg, dlen)) {
+                    continue;
+                }
+                if (type == MsgType::PathChallenge) {
+                    send_path_probe(sock, srcs[i], MsgType::PathResponse, lane, peer_nonce,
+                                    pp.challenge, auth.get());
+                } else if (path.validated(srcs[i], pp.challenge)) {
+                    peer = srcs[i];
                 }
                 continue;
             }
@@ -1083,14 +1280,17 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
                 // will be verified against. Sent on lane 0 only.
                 DigestMessage dm;
                 if (lane != 0 || !have_start || !decode_digest(dg, dlen, &dm) ||
-                    dm.nonce != peer_nonce) {
+                    dm.nonce != peer_nonce || !ctl_authentic(auth.get(), dg, dlen)) {
                     continue;
                 }
                 if (!p->have_digest.load(std::memory_order_acquire)) {
                     std::memcpy(p->digest, dm.digest, kDigestLen);
                     p->have_digest.store(true, std::memory_order_release);
                 }
-                sock.send_to(dg, dlen, srcs[i]); // the echo is the sender's acknowledgement
+                // The echo is the sender's acknowledgement; signed by us.
+                const size_t en = seal_ctl(auth.get(), tx.data(),
+                                           encode_digest(dm, tx.data(), tx.size()), tx.size());
+                if (en) sock.send_to(tx.data(), en, srcs[i]);
                 continue;
             }
             if (type != MsgType::Data || !have_start) continue;
@@ -1148,12 +1348,20 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
         if (!have_peer || !have_start) continue;
 
         const uint64_t t = now_ns();
-        if (delivered - last_ack_blocks >= 8 || t - last_ack_ns > 200000) {
+        const bool heard_since_ack = last_rx_ns > last_ack_ns;
+        const uint32_t rwnd_now = receive_window();
+        const bool window_update = advertised_rwnd < kWindow / 4 && rwnd_now >= 2 * advertised_rwnd + 8;
+        if (delivered - last_ack_blocks >= 8 || window_update ||
+            (t - last_ack_ns > 200000 && (heard_since_ack || quiet_acks < kMaxQuietAcks))) {
+            quiet_acks = heard_since_ack ? 0 : quiet_acks + 1;
             last_ack_blocks = delivered;
             last_ack_ns = t;
             Ack ack = rx.build_ack();
             ack.nonce = peer_nonce;
-            const size_t n = encode_ack(ack, tx.data(), tx.size());
+            ack.rwnd = rwnd_now;
+            advertised_rwnd = rwnd_now;
+            const size_t n = seal_ctl(auth.get(), tx.data(), encode_ack(ack, tx.data(), tx.size()),
+                                      tx.size());
             if (n) sock.send_to(tx.data(), n, peer);
         }
 
@@ -1167,7 +1375,8 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
                                                                             20'000'000, 500'000'000);
         Nack nack;
         if (rx.collect_nacks(t, reorder_ns, renack_ns, &nack) > 0) {
-            const size_t n = encode_nack(nack, tx.data(), tx.size());
+            const size_t n = seal_ctl(auth.get(), tx.data(),
+                                      encode_nack(nack, tx.data(), tx.size()), tx.size());
             if (n) sock.send_to(tx.data(), n, peer);
             nack_sent_ns = t;
         }
@@ -1200,7 +1409,9 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
     for (int i = 0; !peer_finished && i < 8; ++i) {
         Ack ack = rx.build_ack();
         ack.nonce = peer_nonce;
-        const size_t n = encode_ack(ack, tx.data(), tx.size());
+        ack.rwnd = receive_window();
+        const size_t n = seal_ctl(auth.get(), tx.data(), encode_ack(ack, tx.data(), tx.size()),
+                                  tx.size());
         if (n) sock.send_to(tx.data(), n, peer);
     }
 
@@ -1221,28 +1432,45 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                const uint8_t *whole, uint64_t file_id, LaneResult *res,
                std::atomic<bool> *stop_all) {
     UdpSocket sock;
-    if (!sock.open("0.0.0.0", 0)) {
-        res->status.store(static_cast<int>(TransferStatus::SocketError));
-        return;
-    }
-    set_bufs(sock.fd(), 32 << 20);
-    set_timeout_us(sock.fd(), 200);
-
     PeerAddr dst;
     if (!UdpSocket::resolve(cfg.host.c_str(), static_cast<uint16_t>(cfg.base_port + lane),
                             &dst)) {
         res->status.store(static_cast<int>(TransferStatus::ConfigError));
         return;
     }
+    // The local socket must be of the destination's family: it used to be
+    // IPv4 always, so an IPv6 host could never be reached.
+    if (!sock.open(wildcard_for(dst), 0)) {
+        res->status.store(static_cast<int>(TransferStatus::SocketError));
+        return;
+    }
+    set_bufs(sock.fd(), 32 << 20);
+    set_timeout_us(sock.fd(), 200);
 
     SenderRegistry reg(lane, kWindow);
-    CongestionController cc(kWindow, true, 1, 16);
 
-    LaneCipher cipher;
+    LaneKeySchedule cipher;
     std::vector<uint8_t> sealed(kMaxPayloadSize + kAeadTagLen);
-    if (keys.enabled && !cipher.init(keys.key)) {
+    // Seals block `seq` under the key of its epoch (see kKeyEpochShift).
+    const auto seal = [&](uint64_t seq, const uint8_t *aad, size_t aad_len, const uint8_t *pt,
+                          uint16_t len, uint8_t *out) {
+        const LaneCipher *c = cipher.cipher_for(seq);
+        return c != nullptr && c->seal(lane, seq, aad, aad_len, pt, len, out);
+    };
+    if (keys.enabled && !cipher.init(keys.key, lane)) {
         res->status.store(static_cast<int>(TransferStatus::Unsupported));
         return;
+    }
+    // Signs every control datagram we send and verifies the receiver's
+    // (v8). nullptr in plaintext mode.
+    std::unique_ptr<ControlAuth> auth;
+    PathValidator path; // see recv_lane: migrations of `dst` are validated
+    if (keys.enabled) {
+        auth = std::make_unique<ControlAuth>();
+        if (!auth->init(keys.key, lane, /*local_dir=*/0)) {
+            res->status.store(static_cast<int>(TransferStatus::Unsupported));
+            return;
+        }
     }
 
     std::vector<uint8_t> staging(kGsoBudget + kMaxDatagramSize);
@@ -1293,7 +1521,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             // whose Ack we just haven't seen yet — or never seen one at all
             // (it accepts a pre-session abort too): either way, tell it
             // we're leaving so it doesn't wait out its own timeout.
-            send_stream_close(sock, dst, lane, ss.nonce, kStreamCloseAborted);
+            send_stream_close(sock, dst, lane, ss.nonce, kStreamCloseAborted, auth.get());
             res->status.store(static_cast<int>(cancelled         ? TransferStatus::Cancelled
                                                : sibling_stopped ? TransferStatus::PeerAborted
                                                                  : TransferStatus::Timeout));
@@ -1301,18 +1529,49 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             return;
         }
         if (t >= next_send_ns) {
-            const size_t n = encode_stream_start(ss, ctl.data(), ctl.size());
-            sock.send_to(ctl.data(), n, dst);
+            const size_t n = seal_ctl(auth.get(), ctl.data(),
+                                      encode_stream_start(ss, ctl.data(), ctl.size()), ctl.size());
+            if (n) sock.send_to(ctl.data(), n, dst);
             next_send_ns = t + resend_every_ns;
             resend_every_ns = std::min<uint64_t>(resend_every_ns * 2, 200'000'000ull);
         }
         size_t got = 0;
-        if (sock.recv_from(ctl.data(), ctl.size(), &got, nullptr)) {
-            MsgType mt;
-            if (peek_msg_type(ctl.data(), got, &mt) && mt == MsgType::Ack) {
+        MsgType mt;
+        const bool received = sock.recv_from(ctl.data(), ctl.size(), &got, nullptr);
+        uint8_t peer_version = 0;
+        if (received && decode_version_mismatch(ctl.data(), got, &peer_version)) {
+            res->status.store(static_cast<int>(TransferStatus::VersionMismatch));
+            stop_all->store(true, std::memory_order_release);
+            return;
+        }
+        if (received && peek_msg_type(ctl.data(), got, &mt)) {
+            const bool authentic = ctl_authentic(auth.get(), ctl.data(), got);
+            if (mt == MsgType::StreamClose) {
+                // The receiver could not authenticate our StreamStart: the
+                // keys differ. Unsigned by necessity (it has no key it
+                // shares with us), so only its nonce ties it to us; at worst
+                // a forged one ends a handshake an on-path attacker could
+                // block anyway.
+                StreamClose sc;
+                if (decode_stream_close(ctl.data(), got, &sc) && sc.nonce == ss.nonce &&
+                    sc.reason == kStreamCloseAuthFailed) {
+                    res->status.store(static_cast<int>(TransferStatus::AuthFailed));
+                    stop_all->store(true, std::memory_order_release);
+                    return;
+                }
+            } else if (mt == MsgType::Retry) {
+                // Address validation: echo the receiver's token in our next
+                // StreamStart, right away. (Unsigned: a forged Retry can
+                // only make the token wrong, and the receiver retries.)
+                Retry r;
+                if (decode_retry(ctl.data(), got, &r) && r.nonce == ss.nonce && r.token != ss.token) {
+                    ss.token = r.token;
+                    next_send_ns = 0;
+                }
+            } else if (mt == MsgType::Ack && authentic) {
                 Ack ack;
                 if (decode_ack(ctl.data(), got, &ack) && ack.nonce == ss.nonce) acked = true;
-            } else if (mt == MsgType::ResumeRanges) {
+            } else if (mt == MsgType::ResumeRanges && authentic) {
                 ResumeRanges rr;
                 if (decode_resume_ranges(ctl.data(), got, &rr) && rr.nonce == ss.nonce) {
                     if (parts_expected == 0) {
@@ -1392,6 +1651,57 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     const uint16_t block_ceiling =
         keys.enabled ? static_cast<uint16_t>(kMaxPayloadSize - kAeadTagLen) : kMaxPayloadSize;
     uint16_t block = std::min<uint16_t>(cfg.block_size, block_ceiling);
+    // The congestion window counts blocks of this, the configured size: the
+    // bytes in flight are limited to window x base_block whatever size
+    // blocks have grown to (ROADMAP #8). Counting blocks of the current
+    // size let one window grow up to 13x in bytes as blocks grew.
+    const uint64_t base_block = block;
+    // ROADMAP #7: how far the block may grow. Never past what one datagram
+    // of the route MTU holds, as the kernel reports it (loopback reports
+    // 64 KiB, so growth to 16 KiB stays allowed there; a 1500-byte path
+    // stops at about 1450). Unknown MTU means no growth at all. On top of
+    // that, a loss right after a growth step makes the previous size a
+    // ceiling: on a path that fragments or drops large datagrams the size
+    // settles instead of sawtoothing between "grow" and "reset". As in
+    // DPLPMTUD (RFC 8899) the larger size is re-probed later, after a clean
+    // stretch that doubles with every failed probe, so one transient loss
+    // (a full socket buffer, say) doesn't cap the lane for good.
+    uint16_t growth_ceiling = block;
+    {
+        const size_t mtu = path_mtu(dst);
+        const size_t overhead = ip_udp_overhead(dst) + kDataPrefixSize + (keys.enabled ? kAeadTagLen : 0);
+        if (mtu > overhead) {
+            growth_ceiling = static_cast<uint16_t>(
+                std::max<size_t>(block, std::min<size_t>(block_ceiling, mtu - overhead)));
+        }
+    }
+    uint16_t pre_growth_block = 0; // size before the latest growth step (0 = none pending)
+    uint32_t clean_since_growth = 0;
+    uint16_t mtu_ceiling = growth_ceiling;      // the route-MTU bound computed above
+    // Congestion window in units of base_block bytes (ROADMAP #8). Its cap
+    // is what kWindow blocks of the largest size this path allows would
+    // hold, so a long fat path can still fill its pipe -- but only by
+    // earning the window through slow start and AIMD, never instantly
+    // because blocks grew.
+    const uint64_t max_units = std::min<uint64_t>(
+        65535, std::max<uint64_t>(kWindow, uint64_t{kWindow} * mtu_ceiling / base_block));
+    CongestionController cc(static_cast<uint16_t>(max_units), true, 1, 16);
+    // 128 units = the 150 KB a lane always started with, now as the slow-start
+    // floor rather than a fixed window.
+    cc.enable_slow_start(128);
+    uint32_t reprobe_after = 64, clean_at_ceiling = 0;
+    uint64_t sent_bytes = 0; // new payload bytes sent (not retransmissions)
+    // Pacing (ROADMAP #22): earliest time the next batch of new data may go.
+    uint64_t next_batch_ns = 0;
+    // What goes in DATA's send_time_ns: our clock plus a random offset, so
+    // the wire never shows the host's uptime (ROADMAP #31).
+    const uint64_t clock_offset = secure_random_u64();
+    const auto wire_now = [clock_offset] { return now_ns() + clock_offset; };
+    // The receiver's advertised window in blocks (ROADMAP #9).
+    uint32_t peer_rwnd = kRwndUnlimited;
+    // One past the highest block the receiver is known to hold: unacked
+    // blocks below it are lost, blocks above it may just be in flight.
+    uint64_t received_end = 0;
 
     uint32_t clean_batches = 0;
     uint64_t base = 0, next_seq = 0, retransmits = 0;
@@ -1416,9 +1726,37 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     // Every early exit tells the receiver, so it stops at once instead of
     // waiting out its own idle timeout.
     const auto give_up = [&](TransferStatus st, bool tell_peer) {
-        if (tell_peer) send_stream_close(sock, dst, lane, ss.nonce, kStreamCloseAborted);
+        if (tell_peer) send_stream_close(sock, dst, lane, ss.nonce, kStreamCloseAborted, auth.get());
         res->retransmits.store(retransmits);
         res->status.store(static_cast<int>(st));
+    };
+
+    // Resends block `seq` from the registry (NACK and RTO paths). False if it
+    // is no longer held (already acknowledged) or the send was refused.
+    const auto resend = [&](uint64_t seq) {
+        const RegistrySlot *sl = reg.lookup(seq);
+        if (!sl) return false;
+        BlockHeader hdr;
+        hdr.stream_id = lane;
+        hdr.seq_no = seq;
+        // OR, not overwrite: a retransmitted last block is still the last
+        // block, and the receiver has no other way to learn a stream
+        // finished if this bit is dropped here.
+        hdr.flags = sl->flags | kFlagRetransmission;
+        hdr.payload_len = sl->payload_len;
+        hdr.offset = sl->offset;
+        const uint8_t *body = sl->payload;
+        if (keys.enabled) {
+            uint8_t aad[19];
+            const size_t al = build_aad(aad, lane, seq, hdr.offset, hdr.flags);
+            if (!seal(seq, aad, al, sl->payload, sl->payload_len, sealed.data())) return false;
+            body = sealed.data();
+            hdr.payload_len = static_cast<uint16_t>(sl->payload_len + kAeadTagLen);
+        }
+        const size_t n = encode_data_datagram(hdr, wire_now(), body, rtx.data(), rtx.size());
+        if (n == 0 || !sock.send_to(rtx.data(), n, dst)) return false;
+        ++retransmits;
+        return true;
     };
 
     res->start_ns.store(t0);
@@ -1436,7 +1774,14 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             return;
         }
         cc.poll(now_ns());
-        const uint64_t window = std::min<uint64_t>(kWindow, std::max<uint32_t>(4, cc.window()));
+        const uint64_t window = std::max<uint32_t>(4, cc.window()); // in base_block units
+        // Never more in flight than the receiver said it can hold either (at
+        // least 4 blocks, so the flow can never wedge on a zero window).
+        const uint64_t rwnd_bytes = peer_rwnd == kRwndUnlimited
+                                        ? UINT64_MAX
+                                        : static_cast<uint64_t>(std::max<uint32_t>(peer_rwnd, 4)) * block;
+        const uint64_t window_bytes = std::min<uint64_t>(window * base_block, rwnd_bytes);
+        const uint64_t inflight = sent_bytes - acked_bytes;
         bool did_work = false;
 
         // Nothing to send (an empty send_buffer call, an uneven split
@@ -1445,11 +1790,19 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
         // empty block carrying LastBlock. Without it `sent_last` is never
         // set and the lane spins until timeout instead of completing.
         const bool need_empty_last = (ranges.empty() && next_seq == 0);
-        if ((ri < ranges.size() || need_empty_last) && next_seq < base + window) {
+        // Two limits: the registry holds at most kWindow blocks, and the
+        // bytes in flight stay within the congestion window.
+        if ((ri < ranges.size() || need_empty_last) && next_seq < base + kWindow &&
+            inflight < window_bytes && now_ns() >= next_batch_ns) {
             const uint16_t seg = static_cast<uint16_t>(kDataPrefixSize + block +
                                                        (keys.enabled ? kAeadTagLen : 0));
-            const size_t max_segs = std::min<size_t>(
-                {kGsoBudget / seg, window - (next_seq - base), kMaxGsoSegments});
+            const uint64_t byte_room = (window_bytes - inflight + block - 1) / block;
+            // On a path with real RTT, smaller bursts: a 64-datagram GSO
+            // batch at line rate is what overflows shallow router buffers.
+            const uint64_t burst_cap = cc.rtt_ns() > 1'000'000ull ? 16 : kMaxGsoSegments;
+            const size_t max_segs = static_cast<size_t>(std::min<uint64_t>(
+                {kGsoBudget / seg, kWindow - (next_seq - base), byte_room, burst_cap}));
+            const uint64_t sent_before = sent_bytes;
             size_t packed = 0, bytes_in_batch = 0;
 
             while (packed < max_segs && (ri < ranges.size() || need_empty_last)) {
@@ -1474,7 +1827,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 if (keys.enabled) {
                     uint8_t aad[19];
                     const size_t al = build_aad(aad, lane, next_seq, next_offset, hdr.flags);
-                    if (!cipher.seal(lane, next_seq, aad, al, data + next_offset, len,
+                    if (!seal(next_seq, aad, al, data + next_offset, len,
                                      sealed.data())) {
                         break; // fail closed rather than emit plaintext
                     }
@@ -1482,7 +1835,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                     hdr.payload_len = static_cast<uint16_t>(len + kAeadTagLen);
                 }
 
-                const size_t n = encode_data_datagram(hdr, now_ns(), body,
+                const size_t n = encode_data_datagram(hdr, wire_now(), body,
                                                       staging.data() + bytes_in_batch,
                                                       staging.size() - bytes_in_batch);
                 if (n == 0) break;
@@ -1490,6 +1843,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 ++packed;
                 ++next_seq;
                 next_offset += len;
+                sent_bytes += len;
                 if (ri < ranges.size() && next_offset >= range_end) {
                     // This range is done; the next one starts elsewhere.
                     if (++ri < ranges.size()) next_offset = ranges[ri].offset;
@@ -1500,6 +1854,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
 
             if (packed > 0) {
                 did_work = true;
+                next_batch_ns = now_ns() + cc.pacing_interval_ns(sent_bytes - sent_before, window_bytes);
                 if (packed == 1 ||
                     !sock.send_segmented(staging.data(), bytes_in_batch, seg, dst)) {
                     size_t off = 0;
@@ -1520,31 +1875,30 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             did_work = true;
             MsgType type;
             if (!peek_msg_type(ctl.data(), got, &type)) continue;
+            // Under a PSK nothing unsigned is acted on: a forged Ack would
+            // claim delivery of data the receiver never got, a forged Nack
+            // would halve the window, a forged close would end the lane.
+            if (!ctl_authentic(auth.get(), ctl.data(), got)) continue;
 
             if (type == MsgType::Ack) {
                 Ack ack;
                 if (!decode_ack(ctl.data(), got, &ack)) continue;
                 if (ack.nonce != ss.nonce) continue; // not this session
-                // The Ack proved it holds this session's nonce, so its
-                // source is safe to trust even if it differs from `dst` —
-                // this is what lets a transfer survive the receiver's NAT
-                // mapping changing mid-flight, symmetric to the migration
-                // recv_lane does for the sender's address.
-                dst = src;
-                if (ack.base_seq_no > base) {
-                    // Acks are unauthenticated even under PSK (only the
-                    // nonce above is checked), so base_seq_no is untrusted
-                    // input: clamp to what has actually been sent, or a
-                    // forged huge value spins this loop ~2^64 times.
-                    const uint64_t new_base = std::min(ack.base_seq_no, next_seq);
-                    for (uint64_t s = base; s < new_base; ++s) {
-                        // Count the block before confirm() frees its slot.
-                        if (const RegistrySlot *sl = reg.lookup(s)) acked_bytes += sl->payload_len;
-                        reg.confirm(s);
+                // An Ack for this session from a new source is how the
+                // receiver's NAT rebinding shows up. It is adopted only once
+                // that source answers a path challenge (symmetric to what
+                // recv_lane does for the sender's address).
+                if (!(src == dst)) {
+                    uint64_t challenge = 0;
+                    if (path.want_probe(src, now_ns(), &challenge)) {
+                        send_path_probe(sock, src, MsgType::PathChallenge, lane, ss.nonce,
+                                        challenge, auth.get());
                     }
-                    base = new_base;
-                    res->bytes.store(acked_bytes, std::memory_order_relaxed);
                 }
+                // Cumulative base plus the selective bitmask (see apply_ack).
+                acked_bytes += apply_ack(reg, ack, &base, next_seq, &received_end);
+                peer_rwnd = ack.rwnd;
+                res->bytes.store(acked_bytes, std::memory_order_relaxed);
                 // The receiver only updates its echoed send-time when a new
                 // highest-seq block arrives (receiver.cpp) — every
                 // periodic/final Ack in between repeats the same value.
@@ -1554,41 +1908,22 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 // epochs right when they need to stay responsive.
                 if (ack.echoed_send_time > 0 && ack.echoed_send_time != last_rtt_echo) {
                     last_rtt_echo = ack.echoed_send_time;
-                    const uint64_t t = now_ns();
-                    if (t > ack.echoed_send_time) cc.on_rtt_sample(t - ack.echoed_send_time);
+                    cc.on_rtt_sample(rtt_sample_from_echo(wire_now(), ack.echoed_send_time));
                 }
             } else if (type == MsgType::Nack) {
                 Nack nack;
                 if (!decode_nack(ctl.data(), got, &nack)) continue;
                 cc.on_loss();
                 loss_seen = true;
-                for (uint16_t i = 0; i < nack.count; ++i) {
-                    const uint64_t seq = nack.missing[i];
-                    const RegistrySlot *sl = reg.lookup(seq);
-                    if (!sl) continue;
-                    BlockHeader hdr;
-                    hdr.stream_id = lane;
-                    hdr.seq_no = seq;
-                    // OR, not overwrite: a retransmitted last block is still
-                    // the last block, and the receiver has no other way to
-                    // learn a stream finished if this bit is dropped here.
-                    hdr.flags = sl->flags | kFlagRetransmission;
-                    hdr.payload_len = sl->payload_len;
-                    hdr.offset = sl->offset;
-                    const uint8_t *body = sl->payload;
-                    if (keys.enabled) {
-                        uint8_t aad[19];
-                        const size_t al = build_aad(aad, lane, seq, hdr.offset, hdr.flags);
-                        if (!cipher.seal(lane, seq, aad, al, sl->payload, sl->payload_len,
-                                         sealed.data())) {
-                            continue;
-                        }
-                        body = sealed.data();
-                        hdr.payload_len = static_cast<uint16_t>(sl->payload_len + kAeadTagLen);
-                    }
-                    const size_t n =
-                        encode_data_datagram(hdr, now_ns(), body, rtx.data(), rtx.size());
-                    if (n && sock.send_to(rtx.data(), n, dst)) ++retransmits;
+                for (uint16_t i = 0; i < nack.count; ++i) resend(nack.missing[i]);
+            } else if (type == MsgType::PathChallenge || type == MsgType::PathResponse) {
+                PathProbe pp;
+                if (!decode_path_probe(type, ctl.data(), got, &pp) || pp.nonce != ss.nonce) continue;
+                if (type == MsgType::PathChallenge) {
+                    send_path_probe(sock, src, MsgType::PathResponse, lane, ss.nonce, pp.challenge,
+                                    auth.get());
+                } else if (path.validated(src, pp.challenge)) {
+                    dst = src;
                 }
             } else if (type == MsgType::StreamClose) {
                 StreamClose sc;
@@ -1604,16 +1939,11 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             }
         }
 
-        // Retransmission timeout, adaptive to the measured RTT. A fixed 5 ms
-        // is right for loopback but catastrophic on any real path: it fires
-        // ~RTT/5ms times before the ACK can arrive, so the sender retransmits
-        // every in-flight block many times over. The congestion controller
-        // already smooths an RTT estimate from the ACK echo; the RTO is
-        // ~2*RTT, with a 1 s default until the first sample lands.
-        const uint64_t srtt = cc.rtt_ns();
-        const uint64_t rto_ns =
-            srtt ? std::clamp<uint64_t>(srtt * 2, 5'000'000ull, 1'000'000'000ull)
-                 : 1'000'000'000ull;
+        // Retransmission timeout (ROADMAP #23): SRTT + 4·RTTVAR, at least
+        // 5 ms, at most 1 s, 1 s before any sample, doubling on consecutive
+        // timeouts. A fixed multiple of SRTT fired spuriously under jitter,
+        // and with no backoff a dead path was retried at a constant rate.
+        const uint64_t rto_ns = cc.rto_ns(5'000'000ull, 1'000'000'000ull, 1'000'000'000ull);
 
         const uint64_t t = now_ns();
         const bool base_advanced = (base != last_base);
@@ -1621,39 +1951,37 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             last_base = base;
             last_progress = t;
             last_real_progress = t;
+            cc.on_progress();
         } else if (t - last_progress > rto_ns) {
-            cc.on_loss();
-            const RegistrySlot *sl = reg.lookup(base);
-            if (sl) {
-                BlockHeader hdr;
-                hdr.stream_id = lane;
-                hdr.seq_no = base;
-                hdr.flags = sl->flags | kFlagRetransmission; // see the NACK path's comment above
-                hdr.payload_len = sl->payload_len;
-                hdr.offset = sl->offset;
-                const uint8_t *body = sl->payload;
-                if (keys.enabled) {
-                    uint8_t aad[19];
-                    const size_t al = build_aad(aad, lane, base, hdr.offset, hdr.flags);
-                    if (cipher.seal(lane, base, aad, al, sl->payload, sl->payload_len,
-                                    sealed.data())) {
-                        body = sealed.data();
-                        hdr.payload_len = static_cast<uint16_t>(sl->payload_len + kAeadTagLen);
-                    }
-                }
-                const size_t n =
-                    encode_data_datagram(hdr, now_ns(), body, rtx.data(), rtx.size());
-                // A refused send (buffer full) must not count as progress, or
-                // the block is never retransmitted and the transfer stalls.
-                if (n && sock.send_to(rtx.data(), n, dst)) {
-                    ++retransmits;
-                    last_progress = t;
+            // Resend the base and the first few known holes: blocks below
+            // the highest one the receiver SACKed that it still lacks. After
+            // a burst loss the rest of the burst is repaired in one RTO
+            // instead of one per RTO, without resending blocks that are only
+            // still in flight.
+            constexpr unsigned kRtoHoles = 8;
+            unsigned holes = 0;
+            bool sent = false, refused = false;
+            for (uint64_t s = base; s < next_seq && holes < kRtoHoles; ++s) {
+                if (s != base && s >= received_end) break;
+                if (!reg.lookup(s)) continue;
+                ++holes;
+                if (resend(s)) {
+                    sent = true;
                 } else {
-                    timespec nap{0, 200000};
-                    nanosleep(&nap, nullptr);
+                    refused = true;
+                    break;
                 }
-            } else {
+            }
+            if (holes == 0) {
                 last_progress = t;
+            } else if (sent && !refused) {
+                cc.on_timeout(); // one halving per run of timeouts, then backoff
+                last_progress = t;
+            } else {
+                // A refused send (buffer full) must not count as progress,
+                // or the block is never retransmitted and the transfer stalls.
+                timespec nap{0, 200000};
+                nanosleep(&nap, nullptr);
             }
         }
 
@@ -1663,13 +1991,31 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
         // has even had time to arrive — growing past path MTU and
         // fragmenting on an ordinary network, the opposite of wire.hpp's
         // intent).
+        if (base_advanced) {
+            ++clean_since_growth;
+            // Long enough clean at a lowered ceiling: probe above it again.
+            if (growth_ceiling < mtu_ceiling && ++clean_at_ceiling >= reprobe_after) {
+                growth_ceiling = mtu_ceiling;
+                clean_at_ceiling = 0;
+            }
+        }
         if (loss_seen) {
+            clean_at_ceiling = 0;
+            if (pre_growth_block != 0 && clean_since_growth < kCleanBatchesToGrow) {
+                // Lost right after growing: that size may not survive this
+                // path. Hold below it, and wait longer before the next probe.
+                growth_ceiling = pre_growth_block;
+                reprobe_after = std::min<uint32_t>(reprobe_after * 2, 4096);
+            }
+            pre_growth_block = 0;
             block = std::min<uint16_t>(cfg.block_size, block_ceiling);
             clean_batches = 0;
         } else if (base_advanced && ++clean_batches >= kCleanBatchesToGrow &&
-                  block < block_ceiling) {
+                   block < growth_ceiling) {
             clean_batches = 0;
-            block = static_cast<uint16_t>(std::min<uint32_t>(block_ceiling, block * 2u));
+            pre_growth_block = block;
+            clean_since_growth = 0;
+            block = static_cast<uint16_t>(std::min<uint32_t>(growth_ceiling, block * 2u));
         }
 
         res->retransmits.store(retransmits, std::memory_order_relaxed);
@@ -1697,7 +2043,8 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     // receiver echoes it back.
     if (resumed && lane == 0) {
         digester.join(); // started right after the handshake
-        const size_t dn = encode_digest(dm, rtx.data(), rtx.size());
+        const size_t dn = seal_ctl(auth.get(), rtx.data(), encode_digest(dm, rtx.data(), rtx.size()),
+                                   rtx.size());
         const uint64_t begin = now_ns();
         uint64_t next_send = 0;
         for (bool echoed = false; !echoed;) {
@@ -1723,6 +2070,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             while (!echoed && sock.recv_from(ctl.data(), ctl.size(), &got, nullptr)) {
                 MsgType type;
                 if (!peek_msg_type(ctl.data(), got, &type)) continue;
+                if (!ctl_authentic(auth.get(), ctl.data(), got)) continue;
                 if (type == MsgType::FileDigest) {
                     DigestMessage echo;
                     echoed = decode_digest(ctl.data(), got, &echo) && echo.nonce == ss.nonce &&
@@ -1746,7 +2094,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
 
     // Everything is acknowledged: let the receiver leave now instead of
     // lingering to re-send Acks we no longer need.
-    send_stream_close(sock, dst, lane, ss.nonce, kStreamCloseFinished);
+    send_stream_close(sock, dst, lane, ss.nonce, kStreamCloseFinished, auth.get());
     res->bytes.store(session_bytes);
     res->retransmits.store(retransmits);
     res->final_block.store(block);
@@ -1775,8 +2123,9 @@ int severity(TransferStatus s) {
         case TransferStatus::ResourceLimit: return 7;
         case TransferStatus::IoError: return 8;
         case TransferStatus::SocketError: return 9;
-        case TransferStatus::ConfigError: return 10;
-        case TransferStatus::Unsupported: return 10;
+        case TransferStatus::VersionMismatch: return 10;
+        case TransferStatus::ConfigError: return 11;
+        case TransferStatus::Unsupported: return 11;
     }
     return 0;
 }
@@ -1959,8 +2308,26 @@ TransferStatus receive_to_sink(const TransferConfig &cfg, Sink *sink, TransferSt
     return status;
 }
 
+// The PSK is HKDF input, not a password: there is no stretching, so one
+// captured handshake or block lets an attacker test guesses offline at
+// full speed (ROADMAP #19). A short key is almost certainly a human-chosen
+// password, and is refused rather than silently protecting nothing.
+constexpr size_t kMinPreSharedKeyLen = 16;
+
+// Lane i uses base_port + i; the last lane's port must still be a port
+// (ROADMAP #25: the sum was cast to uint16_t and wrapped to ports near 0).
+bool ports_overflow(const TransferConfig &cfg) {
+    return static_cast<uint32_t>(cfg.base_port) + cfg.lanes - 1 > 65535u;
+}
+
+bool psk_too_short(const TransferConfig &cfg) {
+    return !cfg.pre_shared_key.empty() && cfg.pre_shared_key.size() < kMinPreSharedKeyLen;
+}
+
 TransferStatus check_receive_config(const TransferConfig &cfg) {
-    if (cfg.lanes == 0 || cfg.base_port == 0) return TransferStatus::ConfigError;
+    if (cfg.lanes == 0 || cfg.base_port == 0 || ports_overflow(cfg) || psk_too_short(cfg)) {
+        return TransferStatus::ConfigError;
+    }
     if (!cfg.pre_shared_key.empty() && !session_crypto_available()) {
         return TransferStatus::Unsupported;
     }
@@ -1984,6 +2351,8 @@ const char *to_string(TransferStatus s) {
         case TransferStatus::IoError: return "could not write the output";
         case TransferStatus::VerifyFailed:
             return "resumed file failed verification (partial copy discarded; run again)";
+        case TransferStatus::VersionMismatch:
+            return "the peer speaks a different Fuse protocol version";
     }
     return "unknown";
 }
@@ -1996,7 +2365,8 @@ namespace {
 // of that file resume it.
 TransferStatus send_impl(const TransferConfig &cfg, const uint8_t *data, size_t len,
                          uint64_t file_id, TransferStats *stats) {
-    if (cfg.lanes == 0 || cfg.base_port == 0 || cfg.block_size == 0 ||
+    if (cfg.lanes == 0 || cfg.base_port == 0 || ports_overflow(cfg) || cfg.block_size == 0 ||
+        psk_too_short(cfg) ||
         (data == nullptr && len > 0)) {
         return TransferStatus::ConfigError;
     }
@@ -2041,18 +2411,31 @@ TransferStatus send_impl(const TransferConfig &cfg, const uint8_t *data, size_t 
 
 // Identifies a file for resume by its name, size and modification time: a
 // receiver's partial copy is only reused for the very same file. Never 0.
+//
+// ROADMAP #15: name, size and mtime alone miss a file rewritten in place
+// with the same size and its mtime set back (touch -r, a restore tool):
+// a resume would then stitch stale bytes into it. The inode change time
+// (ctime) moves on every write and cannot be set back by user code, and the
+// device + inode pin the identity to this very file, so they are hashed
+// too. (Renaming also moves ctime, which just means a fresh transfer.)
 uint64_t file_identity(const std::string &path, const struct stat &st) {
     const std::string name = path.substr(path.find_last_of('/') + 1);
 #ifdef __APPLE__
     const auto mtime = st.st_mtimespec;
+    const auto ctime = st.st_ctimespec;
 #else
     const auto mtime = st.st_mtim;
+    const auto ctime = st.st_ctim;
 #endif
     std::vector<uint8_t> buf(name.begin(), name.end());
-    uint8_t num[24];
+    uint8_t num[56];
     put_u64(num, static_cast<uint64_t>(st.st_size));
     put_u64(num + 8, static_cast<uint64_t>(mtime.tv_sec));
     put_u64(num + 16, static_cast<uint64_t>(mtime.tv_nsec));
+    put_u64(num + 24, static_cast<uint64_t>(ctime.tv_sec));
+    put_u64(num + 32, static_cast<uint64_t>(ctime.tv_nsec));
+    put_u64(num + 40, static_cast<uint64_t>(st.st_ino));
+    put_u64(num + 48, static_cast<uint64_t>(st.st_dev));
     buf.insert(buf.end(), num, num + sizeof(num));
     const uint64_t id = hash64(buf.data(), buf.size());
     return id != 0 ? id : 1;

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "fuse/mux_transfer.hpp"
+#include "test_ports.hpp"
 #include "fuse/proto/block.hpp"
 #include "fuse/proto/control.hpp"
 #include "fuse/proto/hash.hpp"
@@ -21,10 +22,7 @@ namespace {
 // Ports are picked per-test to avoid collisions between concurrently
 // running cases; the range must be free for one socket (mux_transfer uses
 // one socket per side, not one per lane).
-uint16_t next_port() {
-    static std::atomic<uint16_t> p{45000};
-    return p.fetch_add(4);
-}
+uint16_t next_port() { return fuse_test::free_port_block(1); }
 
 std::vector<uint8_t> make_payload(size_t n) {
     std::vector<uint8_t> v(n);

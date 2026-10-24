@@ -28,9 +28,9 @@ int main(int argc, char **argv) {
         char src_addr[64];
         uint16_t src_port = 0;
 
-        fuse_status status = fuse_socket_recv_from(sock, buf, sizeof(buf), &received, src_addr,
+        fuse_result status = fuse_socket_recv_from(sock, buf, sizeof(buf), &received, src_addr,
                                                     sizeof(src_addr), &src_port);
-        if (status != FUSE_OK) {
+        if (status != FUSE_RESULT_OK) {
             fprintf(stderr, "recv failed\n");
             break;
         }
@@ -38,7 +38,7 @@ int main(int argc, char **argv) {
         printf("received %zu bytes from %s:%u\n", received, src_addr, src_port);
 
         status = fuse_socket_send_to(sock, buf, received, src_addr, src_port);
-        if (status != FUSE_OK) {
+        if (status != FUSE_RESULT_OK) {
             fprintf(stderr, "send failed\n");
             break;
         }

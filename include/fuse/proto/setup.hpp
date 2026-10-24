@@ -15,8 +15,14 @@
 // Wire formats (each prefixed by the 2-byte outer header from wire.hpp):
 //   SetupData      : [protocol_version:1][num_workers:2][num_streams:2]
 //                    [ stream_id:2 worker_id:2 flags:1 block_size:2 window_size:2 ]*num_streams
-//   SetupHashReply : [hash:8]
-//   SetupFinAck    : [hash:8]
+//                    [ext_len:2][extensions]   (v8, see wire.hpp)
+//   SetupHashReply : [hash:8][responder_nonce:8]
+//   SetupFinAck    : [hash:8][responder_nonce:8]
+//
+// The responder nonce (v8) is fresh for every handshake the responder
+// takes part in, and the FINACK must echo it: a recorded DATA + FINACK pair
+// replayed later cannot complete a new handshake, because the replayed
+// FINACK carries the old nonce (ROADMAP #5).
 
 #include <cstddef>
 #include <cstdint>
@@ -53,6 +59,9 @@ struct SetupPayload {
     uint16_t num_workers = 0;
     uint16_t num_streams = 0;
     StreamConfig streams[kMaxStreams] = {};
+    // v8 extension area (see wire.hpp); covered by the handshake hash.
+    uint16_t ext_len = 0;
+    uint8_t  ext[kMaxExtensionBytes] = {};
 
     bool operator==(const SetupPayload &o) const {
         if (protocol_version != o.protocol_version || num_workers != o.num_workers ||
@@ -62,6 +71,10 @@ struct SetupPayload {
         for (uint16_t i = 0; i < num_streams; ++i) {
             if (!(streams[i] == o.streams[i])) return false;
         }
+        if (ext_len != o.ext_len) return false;
+        for (uint16_t i = 0; i < ext_len; ++i) {
+            if (ext[i] != o.ext[i]) return false;
+        }
         return true;
     }
 };
@@ -69,8 +82,15 @@ struct SetupPayload {
 // Largest a SETUP datagram can be: outer + fixed prefix + full stream table.
 // Each stream entry is 9 bytes: stream_id(2) + worker_id(2) + flags(1) +
 // block_size(2) + window_size(2).
+// Plus, since v8, the extension area: ext_len(2) + up to kMaxExtensionBytes.
 inline constexpr size_t kMaxSetupDatagramSize =
-    kOuterHeaderSize + 1 + 2 + 2 + static_cast<size_t>(kMaxStreams) * 9;
+    kOuterHeaderSize + 1 + 2 + 2 + static_cast<size_t>(kMaxStreams) * 9 + 2 + kMaxExtensionBytes;
+
+// True if a decoded SETUP is one this version can run (ROADMAP #30):
+// protocol_version is ours, and every stream has a unique id, a block size
+// in 1..kMaxPayloadSize and a window in 1..kMaxWindow. SetupResponder
+// silently ignores (never confirms) a SETUP that fails this.
+bool setup_payload_valid(const SetupPayload &p);
 
 // Serializes just the SETUP payload body (everything after the outer
 // header) into `out`. Returns the byte count, or 0 on overflow / an
@@ -87,8 +107,10 @@ size_t encode_setup_data(const SetupPayload &p, uint8_t *out, size_t out_cap);
 bool decode_setup_data(const uint8_t *in, size_t in_len, SetupPayload *p,
                        const uint8_t **raw_body, size_t *raw_body_len);
 
-size_t encode_setup_hash(MsgType type, uint64_t hash, uint8_t *out, size_t out_cap);
-bool   decode_setup_hash(MsgType expected, const uint8_t *in, size_t in_len, uint64_t *hash);
+size_t encode_setup_hash(MsgType type, uint64_t hash, uint64_t responder_nonce, uint8_t *out,
+                         size_t out_cap);
+bool   decode_setup_hash(MsgType expected, const uint8_t *in, size_t in_len, uint64_t *hash,
+                         uint64_t *responder_nonce);
 
 // --- Handshake state machines -------------------------------------------
 //
@@ -131,6 +153,7 @@ public:
 private:
     SetupPayload payload_;
     uint64_t my_hash_ = 0;
+    uint64_t responder_nonce_ = 0; // from the matching HASH-REPLY, echoed in FINACK
     uint64_t timeout_ns_;
     uint8_t  max_retries_;
     uint64_t last_send_ns_ = 0;
@@ -167,6 +190,7 @@ public:
 private:
     SetupPayload config_;
     uint64_t my_hash_ = 0;
+    uint64_t nonce_ = 0; // fresh per handshake; the FINACK must echo it
     uint64_t timeout_ns_;
     uint8_t  max_retries_;
     uint64_t last_send_ns_ = 0;

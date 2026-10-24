@@ -13,7 +13,7 @@ extern "C" {
 
 /* Built with FUSE_WITH_CRYPTO=1 unless the project was configured with
  * -DFUSE_WITH_CRYPTO=OFF, in which case every function below returns
- * FUSE_ERR_NOT_SUPPORTED. Check this macro to detect the build's
+ * FUSE_RESULT_NOT_SUPPORTED. Check this macro to detect the build's
  * capability at compile time; see also fuse_crypto_available() for a
  * runtime check against the linked library. */
 #ifndef FUSE_WITH_CRYPTO
@@ -31,7 +31,7 @@ FUSE_EXPORT int fuse_crypto_available(void);
 /* HKDF-Extract (RFC 5869): condenses `ikm` (keyed by `salt`) into a
  * pseudorandom key of the hash's digest length. `prk_out_len` must
  * equal the digest length for `alg` (32 for FUSE_HASH_SHA256). */
-FUSE_EXPORT fuse_status fuse_crypto_hkdf_extract(fuse_hash_algorithm alg,
+FUSE_EXPORT fuse_result fuse_crypto_hkdf_extract(fuse_hash_algorithm alg,
                                                   const uint8_t *salt, size_t salt_len,
                                                   const uint8_t *ikm, size_t ikm_len,
                                                   uint8_t *prk_out, size_t prk_out_len);
@@ -42,7 +42,7 @@ FUSE_EXPORT fuse_status fuse_crypto_hkdf_extract(fuse_hash_algorithm alg,
  * "protocol" prefix (e.g. "tls13 ") and the label that follows it, so
  * this same primitive can reproduce published TLS 1.3/QUIC test
  * vectors as well as derive fuse's own labeled secrets. */
-FUSE_EXPORT fuse_status fuse_crypto_hkdf_expand_label(fuse_hash_algorithm alg,
+FUSE_EXPORT fuse_result fuse_crypto_hkdf_expand_label(fuse_hash_algorithm alg,
                                                        const uint8_t *prk, size_t prk_len,
                                                        const char *protocol, size_t protocol_len,
                                                        const char *label, size_t label_len,
@@ -62,7 +62,7 @@ FUSE_EXPORT fuse_status fuse_crypto_hkdf_expand_label(fuse_hash_algorithm alg,
  *
  * `client_secret_out` and `server_secret_out` must each be at least
  * FUSE_SHA256_LEN bytes. */
-FUSE_EXPORT fuse_status fuse_crypto_derive_initial_secrets(const fuse_connection_id *dst_cid,
+FUSE_EXPORT fuse_result fuse_crypto_derive_initial_secrets(const fuse_connection_id *dst_cid,
                                                             uint8_t *client_secret_out, size_t client_secret_len,
                                                             uint8_t *server_secret_out, size_t server_secret_len);
 

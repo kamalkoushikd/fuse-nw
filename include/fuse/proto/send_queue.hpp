@@ -22,8 +22,10 @@ namespace fuse::proto {
 
 class SendQueue {
 public:
+    // A capacity of 0 is treated as 1 (it used to divide by zero).
     SendQueue(size_t capacity, bool coalesce)
-        : buffer_(capacity), cap_(capacity), coalesce_(coalesce) {}
+        : buffer_(capacity == 0 ? 1 : capacity), cap_(capacity == 0 ? 1 : capacity),
+          coalesce_(coalesce) {}
 
     bool coalesce() const { return coalesce_; }
     size_t size() const { return size_; }

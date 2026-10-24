@@ -2,14 +2,32 @@
 
 #include "fuse/proto/block.hpp" // peek_msg_type
 #include "fuse/proto/hash.hpp"
+#include "fuse/proto/session_crypto.hpp" // secure_random_u64
 
 namespace fuse::proto {
 
+bool setup_payload_valid(const SetupPayload &p) {
+    if (p.protocol_version != kProtocolVersion || p.num_streams > kMaxStreams) {
+        return false;
+    }
+    for (uint16_t i = 0; i < p.num_streams; ++i) {
+        const StreamConfig &s = p.streams[i];
+        if (s.block_size == 0 || s.block_size > kMaxPayloadSize || s.window_size == 0 ||
+            s.window_size > kMaxWindow) {
+            return false;
+        }
+        for (uint16_t j = 0; j < i; ++j) {
+            if (p.streams[j].stream_id == s.stream_id) return false; // duplicate id
+        }
+    }
+    return true;
+}
+
 size_t serialize_setup_payload(const SetupPayload &p, uint8_t *out, size_t out_cap) {
-    if (p.num_streams > kMaxStreams) {
+    if (p.num_streams > kMaxStreams || p.ext_len > kMaxExtensionBytes) {
         return 0;
     }
-    const size_t total = 1 + 2 + 2 + static_cast<size_t>(p.num_streams) * 9;
+    const size_t total = 1 + 2 + 2 + static_cast<size_t>(p.num_streams) * 9 + 2 + p.ext_len;
     if (out_cap < total) {
         return 0;
     }
@@ -26,7 +44,9 @@ size_t serialize_setup_payload(const SetupPayload &p, uint8_t *out, size_t out_c
         off += put_u16(out + off, s.block_size);
         off += put_u16(out + off, s.window_size);
     }
-    return off;
+    off += put_u16(out + off, p.ext_len);
+    for (uint16_t i = 0; i < p.ext_len; ++i) out[off + i] = p.ext[i];
+    return off + p.ext_len;
 }
 
 size_t encode_setup_data(const SetupPayload &p, uint8_t *out, size_t out_cap) {
@@ -69,8 +89,8 @@ bool decode_setup_data(const uint8_t *in, size_t in_len, SetupPayload *p,
     if (p->num_streams > kMaxStreams) {
         return false;
     }
-    const size_t expected = 1 + 2 + 2 + static_cast<size_t>(p->num_streams) * 9;
-    if (body_len != expected) {
+    const size_t fixed = 1 + 2 + 2 + static_cast<size_t>(p->num_streams) * 9;
+    if (body_len < fixed + 2) {
         return false;
     }
 
@@ -82,17 +102,24 @@ bool decode_setup_data(const uint8_t *in, size_t in_len, SetupPayload *p,
         off += get_u16(body + off, &s.block_size);
         off += get_u16(body + off, &s.window_size);
     }
+    off += get_u16(body + off, &p->ext_len);
+    if (p->ext_len > kMaxExtensionBytes || body_len != fixed + 2 + p->ext_len ||
+        !extensions_acceptable(body + off, p->ext_len)) {
+        return false;
+    }
+    for (uint16_t i = 0; i < p->ext_len; ++i) p->ext[i] = body[off + i];
 
     if (raw_body) *raw_body = body;
     if (raw_body_len) *raw_body_len = body_len;
     return true;
 }
 
-size_t encode_setup_hash(MsgType type, uint64_t hash, uint8_t *out, size_t out_cap) {
+size_t encode_setup_hash(MsgType type, uint64_t hash, uint64_t responder_nonce, uint8_t *out,
+                         size_t out_cap) {
     if (type != MsgType::SetupHashReply && type != MsgType::SetupFinAck) {
         return 0;
     }
-    const size_t total = kOuterHeaderSize + 8;
+    const size_t total = kOuterHeaderSize + 8 + 8;
     if (out_cap < total) {
         return 0;
     }
@@ -100,17 +127,20 @@ size_t encode_setup_hash(MsgType type, uint64_t hash, uint8_t *out, size_t out_c
     off += put_u8(out + off, kProtocolVersion);
     off += put_u8(out + off, static_cast<uint8_t>(type));
     off += put_u64(out + off, hash);
+    off += put_u64(out + off, responder_nonce);
     return off;
 }
 
-bool decode_setup_hash(MsgType expected, const uint8_t *in, size_t in_len, uint64_t *hash) {
-    if (in_len != kOuterHeaderSize + 8) {
+bool decode_setup_hash(MsgType expected, const uint8_t *in, size_t in_len, uint64_t *hash,
+                       uint64_t *responder_nonce) {
+    if (in_len != kOuterHeaderSize + 8 + 8) {
         return false;
     }
     if (in[0] != kProtocolVersion || static_cast<MsgType>(in[1]) != expected) {
         return false;
     }
     get_u64(in + kOuterHeaderSize, hash);
+    get_u64(in + kOuterHeaderSize + 8, responder_nonce);
     return true;
 }
 
@@ -141,8 +171,8 @@ size_t SetupInitiator::on_datagram(const uint8_t *in, size_t in_len, uint8_t *ou
     if (!peek_msg_type(in, in_len, &type) || type != MsgType::SetupHashReply) {
         return 0;
     }
-    uint64_t their_hash = 0;
-    if (!decode_setup_hash(MsgType::SetupHashReply, in, in_len, &their_hash)) {
+    uint64_t their_hash = 0, their_nonce = 0;
+    if (!decode_setup_hash(MsgType::SetupHashReply, in, in_len, &their_hash, &their_nonce)) {
         return 0;
     }
     if (their_hash != my_hash_) {
@@ -154,8 +184,9 @@ size_t SetupInitiator::on_datagram(const uint8_t *in, size_t in_len, uint8_t *ou
     // Match (possibly a duplicate HASH-REPLY after a lost FINACK): (re)emit
     // FINACK carrying our hash so the responder can complete.
     matched_ = true;
+    responder_nonce_ = their_nonce;
     last_send_ns_ = now_ns;
-    return encode_setup_hash(MsgType::SetupFinAck, my_hash_, out, out_cap);
+    return encode_setup_hash(MsgType::SetupFinAck, my_hash_, responder_nonce_, out, out_cap);
 }
 
 size_t SetupInitiator::on_timeout(uint8_t *out, size_t out_cap, uint64_t now_ns) {
@@ -198,23 +229,28 @@ size_t SetupResponder::on_datagram(const uint8_t *in, size_t in_len, uint8_t *ou
         const uint8_t *body = nullptr;
         size_t body_len = 0;
         SetupPayload decoded;
-        if (!decode_setup_data(in, in_len, &decoded, &body, &body_len)) {
-            return 0; // malformed; ignore and let the initiator resend
+        if (!decode_setup_data(in, in_len, &decoded, &body, &body_len) ||
+            !setup_payload_valid(decoded)) {
+            return 0; // malformed or unusable; never confirm it
         }
+        const uint64_t h = hash64(body, body_len); // hash exactly what arrived
+        // A fresh nonce per configuration offered; a duplicate DATA (the
+        // initiator retrying) gets the same one back, so either reply works.
+        if (!reply_sent_ || h != my_hash_) nonce_ = secure_random_u64();
         config_ = decoded;
         has_config_ = true;
-        my_hash_ = hash64(body, body_len); // hash exactly what arrived
+        my_hash_ = h;
         reply_sent_ = true;
         last_send_ns_ = now_ns;
-        return encode_setup_hash(MsgType::SetupHashReply, my_hash_, out, out_cap);
+        return encode_setup_hash(MsgType::SetupHashReply, my_hash_, nonce_, out, out_cap);
     }
 
     if (type == MsgType::SetupFinAck) {
-        uint64_t their_hash = 0;
-        if (!decode_setup_hash(MsgType::SetupFinAck, in, in_len, &their_hash)) {
+        uint64_t their_hash = 0, their_nonce = 0;
+        if (!decode_setup_hash(MsgType::SetupFinAck, in, in_len, &their_hash, &their_nonce)) {
             return 0;
         }
-        if (reply_sent_ && their_hash == my_hash_) {
+        if (reply_sent_ && their_hash == my_hash_ && their_nonce == nonce_) {
             complete_ = true; // this is where workers would be started
         }
         return 0;
@@ -238,7 +274,7 @@ size_t SetupResponder::on_timeout(uint8_t *out, size_t out_cap, uint64_t now_ns)
     last_send_ns_ = now_ns;
     // Resend HASH-REPLY only — the responder's copy of the data is fine; it
     // just needs to prompt the initiator for a FINACK again.
-    return encode_setup_hash(MsgType::SetupHashReply, my_hash_, out, out_cap);
+    return encode_setup_hash(MsgType::SetupHashReply, my_hash_, nonce_, out, out_cap);
 }
 
 } // namespace fuse::proto

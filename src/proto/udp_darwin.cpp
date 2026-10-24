@@ -28,6 +28,10 @@ namespace {
 struct BatchScratch {};
 } // namespace
 
+// No portable way to ask for the route MTU here; 0 means "unknown", and
+// callers then don't grow blocks beyond their configured size.
+uint16_t path_mtu(const PeerAddr &) { return 0; }
+
 UdpSocket::~UdpSocket() {
     close();
     delete static_cast<BatchScratch *>(batch_scratch_);

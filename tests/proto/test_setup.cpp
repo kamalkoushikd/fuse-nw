@@ -108,13 +108,38 @@ TEST(Setup, DecodeRejectsTooManyStreams) {
 }
 
 TEST(Setup, HashMessagesRoundTrip) {
-    uint8_t buf[kOuterHeaderSize + 8];
-    ASSERT_GT(encode_setup_hash(MsgType::SetupHashReply, 0xABCDEF12ULL, buf, sizeof(buf)), 0u);
-    uint64_t h = 0;
-    ASSERT_TRUE(decode_setup_hash(MsgType::SetupHashReply, buf, sizeof(buf), &h));
+    uint8_t buf[kOuterHeaderSize + 16];
+    ASSERT_GT(encode_setup_hash(MsgType::SetupHashReply, 0xABCDEF12ULL, 0x55ULL, buf, sizeof(buf)),
+              0u);
+    uint64_t h = 0, nonce = 0;
+    ASSERT_TRUE(decode_setup_hash(MsgType::SetupHashReply, buf, sizeof(buf), &h, &nonce));
     EXPECT_EQ(h, 0xABCDEF12ULL);
+    EXPECT_EQ(nonce, 0x55ULL);
     // A HASH-REPLY must not decode as a FINACK.
-    EXPECT_FALSE(decode_setup_hash(MsgType::SetupFinAck, buf, sizeof(buf), &h));
+    EXPECT_FALSE(decode_setup_hash(MsgType::SetupFinAck, buf, sizeof(buf), &h, &nonce));
+}
+
+// ROADMAP #5: a recorded DATA + FINACK pair replayed to a responder later
+// must not complete a handshake. The responder's fresh nonce, which the
+// FINACK must echo, makes the old FINACK useless.
+TEST(Setup, ReplayedHandshakeDoesNotComplete) {
+    SetupInitiator init(sample_payload());
+    SetupResponder first;
+    uint8_t data[kMaxSetupDatagramSize], reply[kMaxSetupDatagramSize], finack[kMaxSetupDatagramSize];
+    const size_t dn = init.start(data, sizeof(data), 0);
+    ASSERT_GT(dn, 0u);
+    const size_t rn = first.on_datagram(data, dn, reply, sizeof(reply), 0);
+    ASSERT_GT(rn, 0u);
+    const size_t fn = init.on_datagram(reply, rn, finack, sizeof(finack), 0);
+    ASSERT_GT(fn, 0u);
+    first.on_datagram(finack, fn, reply, sizeof(reply), 0);
+    ASSERT_TRUE(first.is_complete());
+
+    SetupResponder later;
+    uint8_t scratch[kMaxSetupDatagramSize];
+    ASSERT_GT(later.on_datagram(data, dn, scratch, sizeof(scratch), 0), 0u);
+    later.on_datagram(finack, fn, scratch, sizeof(scratch), 0);
+    EXPECT_FALSE(later.is_complete()) << "a replayed FINACK completed a new handshake";
 }
 
 // --- In-process handshake harness with loss / corruption injection -------
@@ -325,4 +350,49 @@ TEST(Setup, CompletesOverRealUdpLoopback) {
 
     ASSERT_TRUE(resp.has_config());
     EXPECT_TRUE(resp.config() == payload);
+}
+
+// ROADMAP #24: SETUP carries an extension area too, covered by the hash.
+TEST(Setup, ExtensionsRoundTripAndCriticalOnesAreRefused) {
+    SetupPayload p = sample_payload();
+    const uint8_t v[2] = {9, 9};
+    p.ext_len = static_cast<uint16_t>(append_extension(p.ext, sizeof(p.ext), 0, 0x0042, v, 2));
+    uint8_t buf[kMaxSetupDatagramSize];
+    size_t n = encode_setup_data(p, buf, sizeof(buf));
+    ASSERT_GT(n, 0u);
+    SetupPayload back;
+    ASSERT_TRUE(decode_setup_data(buf, n, &back, nullptr, nullptr));
+    EXPECT_TRUE(back == p);
+
+    p.ext_len = static_cast<uint16_t>(
+        append_extension(p.ext, sizeof(p.ext), 0, kExtensionCritical | 0x0042, v, 2));
+    n = encode_setup_data(p, buf, sizeof(buf));
+    EXPECT_FALSE(decode_setup_data(buf, n, &back, nullptr, nullptr));
+}
+
+// ROADMAP #30: a SETUP this version can't run is never confirmed.
+TEST(Setup, InvalidConfigurationsAreRefused) {
+    EXPECT_TRUE(setup_payload_valid(sample_payload()));
+    const auto refused = [](SetupPayload p) {
+        EXPECT_FALSE(setup_payload_valid(p));
+        uint8_t data[kMaxSetupDatagramSize], reply[kMaxSetupDatagramSize];
+        const size_t n = encode_setup_data(p, data, sizeof(data));
+        SetupResponder r;
+        EXPECT_EQ(r.on_datagram(data, n, reply, sizeof(reply), 0), 0u);
+    };
+    SetupPayload p = sample_payload();
+    p.streams[3].stream_id = p.streams[1].stream_id;
+    refused(p);
+    p = sample_payload();
+    p.streams[0].block_size = kMaxPayloadSize + 1;
+    refused(p);
+    p = sample_payload();
+    p.streams[0].window_size = 0;
+    refused(p);
+    p = sample_payload();
+    p.streams[0].window_size = kMaxWindow + 1;
+    refused(p);
+    p = sample_payload();
+    p.protocol_version = static_cast<uint8_t>(kProtocolVersion - 1);
+    refused(p);
 }

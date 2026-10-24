@@ -13,18 +13,18 @@ namespace fuse {
 
 class error : public std::runtime_error {
 public:
-    explicit error(fuse_status status, const std::string &what)
+    explicit error(fuse_result status, const std::string &what)
         : std::runtime_error(what), status_(status) {}
 
-    fuse_status status() const noexcept { return status_; }
+    fuse_result status() const noexcept { return status_; }
 
 private:
-    fuse_status status_;
+    fuse_result status_;
 };
 
 namespace detail {
-inline void check(fuse_status status, const char *what) {
-    if (status != FUSE_OK) {
+inline void check(fuse_result status, const char *what) {
+    if (status != FUSE_RESULT_OK) {
         throw error(status, what);
     }
 }
@@ -34,7 +34,7 @@ inline std::vector<uint8_t> encode_varint(uint64_t value) {
     std::vector<uint8_t> out(8);
     size_t written = fuse_varint_encode(value, out.data(), out.size());
     if (written == 0) {
-        throw error(FUSE_ERR_INVALID_ARGUMENT, "encode_varint: value out of range");
+        throw error(FUSE_RESULT_INVALID_ARGUMENT, "encode_varint: value out of range");
     }
     out.resize(written);
     return out;
@@ -44,7 +44,7 @@ inline std::pair<uint64_t, size_t> decode_varint(const uint8_t *data, size_t len
     uint64_t value = 0;
     size_t consumed = fuse_varint_decode(data, len, &value);
     if (consumed == 0) {
-        throw error(FUSE_ERR_BUFFER_TOO_SMALL, "decode_varint: truncated input");
+        throw error(FUSE_RESULT_BUFFER_TOO_SMALL, "decode_varint: truncated input");
     }
     return {value, consumed};
 }
@@ -56,7 +56,7 @@ public:
     socket(const std::string &local_addr, uint16_t local_port) {
         sock_ = fuse_socket_open(local_addr.empty() ? nullptr : local_addr.c_str(), local_port);
         if (!sock_) {
-            throw error(FUSE_ERR_SOCKET, "fuse_socket_open failed");
+            throw error(FUSE_RESULT_SOCKET, "fuse_socket_open failed");
         }
     }
 
@@ -93,7 +93,7 @@ public:
     }
 
     /* Returns the received datagram; on a non-blocking socket with
-     * nothing pending, throws with status FUSE_ERR_SOCKET (check
+     * nothing pending, throws with status FUSE_RESULT_SOCKET (check
      * errno for EAGAIN/EWOULDBLOCK, matching the C API). */
     std::vector<uint8_t> recv_from(size_t max_len = 65535) {
         std::vector<uint8_t> buf(max_len);
@@ -115,7 +115,7 @@ class connection {
 public:
     connection() : conn_(fuse_connection_new()) {
         if (!conn_) {
-            throw error(FUSE_ERR_INVALID_ARGUMENT, "fuse_connection_new failed");
+            throw error(FUSE_RESULT_INVALID_ARGUMENT, "fuse_connection_new failed");
         }
     }
 

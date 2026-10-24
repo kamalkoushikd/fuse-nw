@@ -52,8 +52,15 @@ bool decode_heartbeat(const uint8_t *in, size_t in_len, Heartbeat *hb) {
     return true;
 }
 
+namespace {
+constexpr size_t kStreamStartFixed = kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8 + 8 + 8 + 8 + 8;
+}
+
 size_t encode_stream_start(const StreamStart &ss, uint8_t *out, size_t out_cap) {
-    const size_t total = kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8 + 8 + 8 + 8;
+    if (ss.ext_len > kMaxExtensionBytes) {
+        return 0;
+    }
+    const size_t total = kStreamStartFixed + 2 + ss.ext_len;
     if (out_cap < total) {
         return 0;
     }
@@ -68,12 +75,15 @@ size_t encode_stream_start(const StreamStart &ss, uint8_t *out, size_t out_cap) 
     off += put_u64(out + off, ss.stream_base_offset);
     off += put_u64(out + off, ss.file_total_bytes);
     off += put_u64(out + off, ss.file_id);
-    return off;
+    off += put_u64(out + off, ss.token);
+    off += put_u16(out + off, ss.ext_len);
+    std::memcpy(out + off, ss.ext, ss.ext_len);
+    return off + ss.ext_len;
 }
 
 bool decode_stream_start(const uint8_t *in, size_t in_len, StreamStart *ss) {
     size_t off = check_outer(in, in_len, MsgType::StreamStart);
-    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8 + 2 + 8 + 16 + 8 + 8 + 8 + 8) {
+    if (off == 0 || in_len < kStreamStartFixed + 2) {
         return false;
     }
     off += get_u16(in + off, &ss->stream_id);
@@ -86,11 +96,18 @@ bool decode_stream_start(const uint8_t *in, size_t in_len, StreamStart *ss) {
     off += get_u64(in + off, &ss->stream_base_offset);
     off += get_u64(in + off, &ss->file_total_bytes);
     off += get_u64(in + off, &ss->file_id);
+    off += get_u64(in + off, &ss->token);
+    off += get_u16(in + off, &ss->ext_len);
+    if (ss->ext_len > kMaxExtensionBytes || ss->ext_len > in_len - off ||
+        !extensions_acceptable(in + off, ss->ext_len)) {
+        return false;
+    }
+    std::memcpy(ss->ext, in + off, ss->ext_len);
     return true;
 }
 
 size_t encode_ack(const Ack &ack, uint8_t *out, size_t out_cap) {
-    const size_t total = kOuterHeaderSize + 2 + 8 + kMaskWords * 8 + 8 + 8;
+    const size_t total = kOuterHeaderSize + 2 + 8 + kMaskWords * 8 + 8 + 8 + 4;
     if (out_cap < total) {
         return 0;
     }
@@ -102,12 +119,13 @@ size_t encode_ack(const Ack &ack, uint8_t *out, size_t out_cap) {
     }
     off += put_u64(out + off, ack.echoed_send_time);
     off += put_u64(out + off, ack.nonce);
+    off += put_u32(out + off, ack.rwnd);
     return off;
 }
 
 bool decode_ack(const uint8_t *in, size_t in_len, Ack *ack) {
     size_t off = check_outer(in, in_len, MsgType::Ack);
-    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8 + kMaskWords * 8 + 8 + 8) {
+    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8 + kMaskWords * 8 + 8 + 8 + 4) {
         return false;
     }
     off += get_u16(in + off, &ack->stream_id);
@@ -117,6 +135,7 @@ bool decode_ack(const uint8_t *in, size_t in_len, Ack *ack) {
     }
     off += get_u64(in + off, &ack->echoed_send_time);
     off += get_u64(in + off, &ack->nonce);
+    off += get_u32(in + off, &ack->rwnd);
     return true;
 }
 
@@ -247,6 +266,52 @@ bool decode_digest(const uint8_t *in, size_t in_len, DigestMessage *dm) {
     off += get_u16(in + off, &dm->stream_id);
     off += get_u64(in + off, &dm->nonce);
     std::memcpy(dm->digest, in + off, kDigestLen);
+    return true;
+}
+
+size_t encode_retry(const Retry &r, uint8_t *out, size_t out_cap) {
+    const size_t total = kOuterHeaderSize + 2 + 8 + 8;
+    if (out_cap < total) {
+        return 0;
+    }
+    size_t off = put_outer(out, MsgType::Retry);
+    off += put_u16(out + off, r.stream_id);
+    off += put_u64(out + off, r.nonce);
+    off += put_u64(out + off, r.token);
+    return off;
+}
+
+bool decode_retry(const uint8_t *in, size_t in_len, Retry *r) {
+    size_t off = check_outer(in, in_len, MsgType::Retry);
+    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8 + 8) {
+        return false;
+    }
+    off += get_u16(in + off, &r->stream_id);
+    off += get_u64(in + off, &r->nonce);
+    off += get_u64(in + off, &r->token);
+    return true;
+}
+
+size_t encode_path_probe(MsgType type, const PathProbe &pp, uint8_t *out, size_t out_cap) {
+    const size_t total = kOuterHeaderSize + 2 + 8 + 8;
+    if ((type != MsgType::PathChallenge && type != MsgType::PathResponse) || out_cap < total) {
+        return 0;
+    }
+    size_t off = put_outer(out, type);
+    off += put_u16(out + off, pp.stream_id);
+    off += put_u64(out + off, pp.nonce);
+    off += put_u64(out + off, pp.challenge);
+    return off;
+}
+
+bool decode_path_probe(MsgType type, const uint8_t *in, size_t in_len, PathProbe *pp) {
+    size_t off = check_outer(in, in_len, type);
+    if (off == 0 || in_len < kOuterHeaderSize + 2 + 8 + 8) {
+        return false;
+    }
+    off += get_u16(in + off, &pp->stream_id);
+    off += get_u64(in + off, &pp->nonce);
+    off += get_u64(in + off, &pp->challenge);
     return true;
 }
 

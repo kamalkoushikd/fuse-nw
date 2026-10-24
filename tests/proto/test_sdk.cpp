@@ -11,15 +11,13 @@
 #include "fuse/proto/block.hpp"
 #include "fuse/proto/udp.hpp"
 #include "fuse/sdk.h"
+#include "test_ports.hpp"
 
 namespace {
 
 // Each test takes its own port so cases can run back to back without
 // tripping over a lingering socket.
-uint16_t next_port() {
-    static std::atomic<uint16_t> p{38000};
-    return p.fetch_add(4);
-}
+uint16_t next_port() { return fuse_test::free_port_block(4); }
 
 std::string make_payload(size_t n) {
     std::string s(n, '\0');

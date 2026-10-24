@@ -205,3 +205,66 @@ TEST(SessionCrypto, FailsClosedWithoutBackend) {
 }
 
 #endif
+
+// Protocol nonces must come from a secure source in every build, not a
+// seeded PRNG (ROADMAP #20). Collisions among a few thousand draws from a
+// real 64-bit source are vanishingly unlikely.
+TEST(SessionCrypto, SecureRandomIsAvailableAndVaries) {
+    std::set<uint64_t> seen;
+    for (int i = 0; i < 4096; ++i) seen.insert(secure_random_u64());
+    EXPECT_EQ(seen.size(), 4096u);
+}
+
+// A pre-shared key longer than 256 bytes used to fail key derivation (and
+// surface as "Unsupported") because it was copied into a fixed buffer.
+TEST(SessionCrypto, LongPreSharedKeyDerives) {
+    if (!session_crypto_available()) GTEST_SKIP() << "built without crypto";
+    std::vector<uint8_t> psk(4096);
+    for (size_t i = 0; i < psk.size(); ++i) psk[i] = static_cast<uint8_t>(i * 13);
+    uint8_t salt[kSessionSaltLen] = {1, 2, 3};
+    uint8_t a[kSessionKeyLen], b[kSessionKeyLen];
+    ASSERT_TRUE(derive_session_key(psk.data(), psk.size(), salt, sizeof(salt), a));
+    ASSERT_TRUE(derive_session_key(psk.data(), psk.size(), salt, sizeof(salt), b));
+    EXPECT_EQ(std::memcmp(a, b, sizeof(a)), 0);
+    psk.back() ^= 1;
+    ASSERT_TRUE(derive_session_key(psk.data(), psk.size(), salt, sizeof(salt), b));
+    EXPECT_NE(std::memcmp(a, b, sizeof(a)), 0);
+}
+
+// Key epochs (ROADMAP #21): a lane switches to a freshly derived key every
+// 2^kKeyEpochShift blocks, identically on both ends, with nothing on the wire.
+TEST(SessionCrypto, KeyEpochsRotateDeterministically) {
+    if (!session_crypto_available()) GTEST_SKIP() << "built without crypto";
+    uint8_t key[kSessionKeyLen];
+    for (size_t i = 0; i < sizeof(key); ++i) key[i] = static_cast<uint8_t>(i);
+    LaneKeySchedule tx, rx;
+    ASSERT_TRUE(tx.init(key, 3));
+    ASSERT_TRUE(rx.init(key, 3));
+    EXPECT_FALSE(tx.init(key, 3)) << "a schedule must not be re-keyed";
+
+    const uint8_t pt[16] = {'e', 'p', 'o', 'c', 'h'};
+    const uint64_t last_of_0 = (1ull << kKeyEpochShift) - 1, first_of_1 = 1ull << kKeyEpochShift;
+    for (uint64_t seq : {uint64_t{0}, last_of_0, first_of_1, uint64_t{5} << kKeyEpochShift}) {
+        uint8_t ct[sizeof(pt) + kAeadTagLen], back[sizeof(pt)];
+        const LaneCipher *c = tx.cipher_for(seq);
+        ASSERT_NE(c, nullptr);
+        ASSERT_TRUE(c->seal(3, seq, nullptr, 0, pt, sizeof(pt), ct));
+        const LaneCipher *d = rx.cipher_for(seq);
+        ASSERT_NE(d, nullptr);
+        ASSERT_TRUE(d->open(3, seq, nullptr, 0, ct, sizeof(ct), back)) << "seq " << seq;
+        EXPECT_EQ(std::memcmp(back, pt, sizeof(pt)), 0);
+    }
+
+    // Different epochs really use different keys: epoch 1's cipher cannot
+    // open a block sealed under epoch 0's key, even at the same nonce.
+    uint8_t ct[sizeof(pt) + kAeadTagLen], back[sizeof(pt)];
+    ASSERT_TRUE(tx.cipher_for(0)->seal(3, 0, nullptr, 0, pt, sizeof(pt), ct));
+    EXPECT_FALSE(rx.cipher_for(first_of_1)->open(3, 0, nullptr, 0, ct, sizeof(ct), back));
+
+    uint8_t k0[kSessionKeyLen], k1[kSessionKeyLen], other_lane[kSessionKeyLen];
+    ASSERT_TRUE(derive_lane_epoch_key(key, 3, 0, k0));
+    ASSERT_TRUE(derive_lane_epoch_key(key, 3, 1, k1));
+    ASSERT_TRUE(derive_lane_epoch_key(key, 4, 0, other_lane));
+    EXPECT_NE(std::memcmp(k0, k1, sizeof(k0)), 0);
+    EXPECT_NE(std::memcmp(k0, other_lane, sizeof(k0)), 0);
+}

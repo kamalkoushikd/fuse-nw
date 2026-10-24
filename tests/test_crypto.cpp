@@ -32,7 +32,7 @@ TEST(Crypto, MatchesRfc9001InitialSecretVectors) {
     uint8_t initial_secret[FUSE_SHA256_LEN];
     ASSERT_EQ(fuse_crypto_hkdf_extract(FUSE_HASH_SHA256, salt.data(), salt.size(), cid.data(),
                                        cid.size(), initial_secret, sizeof(initial_secret)),
-              FUSE_OK);
+              FUSE_RESULT_OK);
 
     const auto expected_initial_secret =
         hex_to_bytes("7db5df06e7a69e432496adedb008519"
@@ -46,7 +46,7 @@ TEST(Crypto, MatchesRfc9001InitialSecretVectors) {
     ASSERT_EQ(fuse_crypto_hkdf_expand_label(FUSE_HASH_SHA256, initial_secret, sizeof(initial_secret),
                                             "tls13 ", 6, "client in", 9, nullptr, 0, client_secret,
                                             sizeof(client_secret)),
-              FUSE_OK);
+              FUSE_RESULT_OK);
     const auto expected_client_secret =
         hex_to_bytes("c00cf151ca5be075ed0ebfb5c80323c4"
                      "2d6b7db67881289af4008f1f6c357aea");
@@ -56,7 +56,7 @@ TEST(Crypto, MatchesRfc9001InitialSecretVectors) {
     ASSERT_EQ(fuse_crypto_hkdf_expand_label(FUSE_HASH_SHA256, initial_secret, sizeof(initial_secret),
                                             "tls13 ", 6, "server in", 9, nullptr, 0, server_secret,
                                             sizeof(server_secret)),
-              FUSE_OK);
+              FUSE_RESULT_OK);
     const auto expected_server_secret =
         hex_to_bytes("3c199828fd139efd216c155ad844cc81"
                      "fb82fa8d7446fa7d78be803acdda951b");
@@ -73,10 +73,10 @@ TEST(Crypto, DeriveInitialSecretsIsDeterministicAndDistinct) {
 
     ASSERT_EQ(fuse_crypto_derive_initial_secrets(&cid, client_a, sizeof(client_a), server_a,
                                                  sizeof(server_a)),
-              FUSE_OK);
+              FUSE_RESULT_OK);
     ASSERT_EQ(fuse_crypto_derive_initial_secrets(&cid, client_b, sizeof(client_b), server_b,
                                                  sizeof(server_b)),
-              FUSE_OK);
+              FUSE_RESULT_OK);
 
     EXPECT_EQ(0, std::memcmp(client_a, client_b, FUSE_SHA256_LEN));
     EXPECT_EQ(0, std::memcmp(server_a, server_b, FUSE_SHA256_LEN));
@@ -90,7 +90,7 @@ TEST(Crypto, RejectsWrongOutputLength) {
     uint8_t ok_len[FUSE_SHA256_LEN];
     EXPECT_EQ(fuse_crypto_derive_initial_secrets(&cid, too_short, sizeof(too_short), ok_len,
                                                  sizeof(ok_len)),
-              FUSE_ERR_INVALID_ARGUMENT);
+              FUSE_RESULT_INVALID_ARGUMENT);
 }
 
 #else // !FUSE_WITH_CRYPTO
@@ -103,7 +103,7 @@ TEST(Crypto, ReportsUnavailableWhenBuiltWithoutCrypto) {
     uint8_t server_secret[FUSE_SHA256_LEN];
     EXPECT_EQ(fuse_crypto_derive_initial_secrets(&cid, client_secret, sizeof(client_secret),
                                                  server_secret, sizeof(server_secret)),
-              FUSE_ERR_NOT_SUPPORTED);
+              FUSE_RESULT_NOT_SUPPORTED);
 }
 
 #endif // FUSE_WITH_CRYPTO
