@@ -976,6 +976,7 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
     // that is still talking, and an endless Ack stream to an address that
     // never answers is a reflection vector (ROADMAP #18).
     unsigned quiet_acks = 0;
+    uint64_t last_version_reply_ns = 0;
     constexpr unsigned kMaxQuietAcks = 3;
     const auto send_resume_answer = [&] {
         for (const auto &m : resume_answer) sock.send_to(m.data(), m.size(), peer);
@@ -1088,7 +1089,18 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
             const uint8_t *dg = rx_buf.data() + i * slot;
             const size_t dlen = lens[i];
             MsgType type;
-            if (!peek_msg_type(dg, dlen, &type)) continue;
+            if (!peek_msg_type(dg, dlen, &type)) {
+                // A peer on another protocol version: tell it (at most every
+                // 100 ms, never more bytes than it sent) instead of leaving
+                // it to time out without knowing why.
+                const uint64_t t = now_ns();
+                if (is_foreign_version(dg, dlen) && t - last_version_reply_ns > 100'000'000ull) {
+                    last_version_reply_ns = t;
+                    const size_t vn = encode_version_mismatch(tx.data(), tx.size());
+                    if (vn) sock.send_to(tx.data(), vn, srcs[i]);
+                }
+                continue;
+            }
 
             if (type == MsgType::StreamStart) {
                 StreamStart ss;
@@ -1508,8 +1520,14 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
         }
         size_t got = 0;
         MsgType mt;
-        if (sock.recv_from(ctl.data(), ctl.size(), &got, nullptr) &&
-            peek_msg_type(ctl.data(), got, &mt)) {
+        const bool received = sock.recv_from(ctl.data(), ctl.size(), &got, nullptr);
+        uint8_t peer_version = 0;
+        if (received && decode_version_mismatch(ctl.data(), got, &peer_version)) {
+            res->status.store(static_cast<int>(TransferStatus::VersionMismatch));
+            stop_all->store(true, std::memory_order_release);
+            return;
+        }
+        if (received && peek_msg_type(ctl.data(), got, &mt)) {
             const bool authentic = ctl_authentic(auth.get(), ctl.data(), got);
             if (mt == MsgType::StreamClose) {
                 // The receiver could not authenticate our StreamStart: the
@@ -2019,8 +2037,9 @@ int severity(TransferStatus s) {
         case TransferStatus::ResourceLimit: return 7;
         case TransferStatus::IoError: return 8;
         case TransferStatus::SocketError: return 9;
-        case TransferStatus::ConfigError: return 10;
-        case TransferStatus::Unsupported: return 10;
+        case TransferStatus::VersionMismatch: return 10;
+        case TransferStatus::ConfigError: return 11;
+        case TransferStatus::Unsupported: return 11;
     }
     return 0;
 }
@@ -2240,6 +2259,8 @@ const char *to_string(TransferStatus s) {
         case TransferStatus::IoError: return "could not write the output";
         case TransferStatus::VerifyFailed:
             return "resumed file failed verification (partial copy discarded; run again)";
+        case TransferStatus::VersionMismatch:
+            return "the peer speaks a different Fuse protocol version";
     }
     return "unknown";
 }
