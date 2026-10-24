@@ -31,6 +31,31 @@ namespace {
 // Up to 16 lanes per test; see test_ports.hpp for why ports are probed.
 uint16_t next_port() { return fuse_test::free_port_block(16); }
 
+// Opens a lane on a real receiver the way a v8 sender does: a first
+// StreamStart, then the same StreamStart echoing the token from the
+// receiver's Retry (address validation). False if no Retry arrived.
+bool send_stream_start_v8(fuse::proto::UdpSocket &s, const fuse::proto::PeerAddr &to,
+                          fuse::proto::StreamStart ss) {
+    using namespace fuse::proto;
+    uint8_t buf[kMaxDatagramSize + 64];
+    ss.token = 0;
+    size_t n = encode_stream_start(ss, buf, sizeof(buf));
+    if (n == 0 || !s.send_to(buf, n, to)) return false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        pollfd pfd{s.fd(), POLLIN, 0};
+        if (::poll(&pfd, 1, 20) <= 0) continue;
+        size_t got = 0;
+        if (!s.recv_from(buf, sizeof(buf), &got, nullptr)) continue;
+        Retry r;
+        if (!decode_retry(buf, got, &r) || r.nonce != ss.nonce) continue;
+        ss.token = r.token;
+        n = encode_stream_start(ss, buf, sizeof(buf));
+        return n != 0 && s.send_to(buf, n, to);
+    }
+    return false;
+}
+
 std::vector<uint8_t> make_payload(size_t n) {
     std::vector<uint8_t> v(n);
     for (size_t i = 0; i < n; ++i) v[i] = static_cast<uint8_t>(i * 31 + (i >> 8));
@@ -249,10 +274,7 @@ TEST(Transfer, MaliciousOffsetIsRejectedNotWritten) {
     ss.total_bytes = payload.size();
     ss.file_total_bytes = ss.total_bytes; // single lane: the whole transfer
     ss.nonce = 0x1234;
-    uint8_t ssdg[256];
-    const size_t ssn = encode_stream_start(ss, ssdg, sizeof(ssdg));
-    ASSERT_GT(ssn, 0u);
-    ASSERT_TRUE(atk.send_to(ssdg, ssn, dst));
+    ASSERT_TRUE(send_stream_start_v8(atk, dst, ss));
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // The malicious block: in-window seq_no (so the receiver's window logic
@@ -320,10 +342,7 @@ TEST(Transfer, HugeStreamStartSizeFailsCleanlyInsteadOfCrashing) {
     ss.total_bytes = UINT64_MAX - 8; // exceeds any real allocator's max_size()
     ss.file_total_bytes = ss.total_bytes; // single lane: the whole transfer
     ss.nonce = 0x5;
-    uint8_t dg[256];
-    const size_t n = encode_stream_start(ss, dg, sizeof(dg));
-    ASSERT_GT(n, 0u);
-    ASSERT_TRUE(atk.send_to(dg, n, dst));
+    ASSERT_TRUE(send_stream_start_v8(atk, dst, ss));
 
     receiver.join(); // must return promptly, not crash the whole test binary
     EXPECT_EQ(rs, fuse::TransferStatus::ResourceLimit) << fuse::to_string(rs);
@@ -571,8 +590,7 @@ TEST(Transfer, ReceiverCancelTellsSenderAndReturnsPromptly) {
     ss.file_total_bytes = ss.total_bytes; // single lane: the whole transfer
     ss.nonce = 0x77;
     uint8_t buf[kMaxDatagramSize + 64];
-    const size_t n = encode_stream_start(ss, buf, sizeof(buf));
-    ASSERT_TRUE(fake_tx.send_to(buf, n, dst));
+    ASSERT_TRUE(send_stream_start_v8(fake_tx, dst, ss));
     ASSERT_GT(fakepeer::wait_for(fake_tx, MsgType::Ack, buf, sizeof(buf), 2000), 0u);
 
     const auto cancelled_at = fakepeer::Clock::now();
@@ -615,8 +633,7 @@ TEST(Transfer, PeerAbortEndsReceiverPromptly) {
     ss.file_total_bytes = ss.total_bytes; // single lane: the whole transfer
     ss.nonce = 0x99;
     uint8_t buf[kMaxDatagramSize + 64];
-    const size_t n = encode_stream_start(ss, buf, sizeof(buf));
-    ASSERT_TRUE(fake_tx.send_to(buf, n, dst));
+    ASSERT_TRUE(send_stream_start_v8(fake_tx, dst, ss));
     ASSERT_GT(fakepeer::wait_for(fake_tx, MsgType::Ack, buf, sizeof(buf), 2000), 0u);
 
     fakepeer::send_close(fake_tx, dst, 0x98, kStreamCloseAborted); // wrong session
@@ -1057,6 +1074,109 @@ TEST(Transfer, ForgedControlMessagesAreIgnoredUnderPsk) {
 
 #endif // FUSE_PROTO_WITH_DTLS
 
+// Return routability (ROADMAP #18, #5): a StreamStart from an address that
+// hasn't proved it can receive there (no valid token) is answered only with
+// a Retry no larger than itself, and claims nothing — so a spoofed source
+// neither hijacks the lane nor turns the receiver into an amplifier.
+TEST(Transfer, UnvalidatedStreamStartGetsOnlyARetry) {
+    using namespace fuse::proto;
+    const uint16_t port = next_port();
+    std::atomic<bool> cancel{false};
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = port;
+    rx.lanes = 1;
+    rx.timeout_ms = 20000;
+    rx.cancel = &cancel;
+    std::vector<uint8_t> got;
+    fuse::TransferStatus rs = fuse::TransferStatus::Ok;
+    std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    UdpSocket spoofer;
+    ASSERT_TRUE(spoofer.open("127.0.0.1", 0));
+    fakepeer::set_rcv_timeout_ms(spoofer, 50);
+    PeerAddr dst;
+    ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", port, &dst));
+    StreamStart ss;
+    ss.total_bytes = 1 << 20;
+    ss.file_total_bytes = ss.total_bytes;
+    ss.nonce = 0xBAD;
+    ss.token = 0x1234; // a guess
+    uint8_t buf[kMaxDatagramSize + 64];
+    const size_t req = encode_stream_start(ss, buf, sizeof(buf));
+    uint64_t replies = 0, reply_bytes = 0, non_retry = 0;
+    for (int i = 0; i < 20; ++i) {
+        ASSERT_TRUE(spoofer.send_to(buf, req, dst));
+        uint8_t in[kMaxDatagramSize + 64];
+        size_t n = 0;
+        while (spoofer.recv_from(in, sizeof(in), &n, nullptr)) {
+            ++replies;
+            reply_bytes += n;
+            MsgType t;
+            if (!peek_msg_type(in, n, &t) || t != MsgType::Retry) ++non_retry;
+        }
+    }
+    EXPECT_EQ(replies, 20u);
+    EXPECT_EQ(non_retry, 0u) << "nothing but a Retry before the address is validated";
+    EXPECT_LE(reply_bytes, 20 * req) << "the receiver must not amplify";
+
+    // The lane is still free: a real sender completes normally.
+    const auto payload = make_payload(256 * 1024);
+    fuse::TransferConfig tx = rx;
+    tx.host = "127.0.0.1";
+    tx.cancel = nullptr;
+    EXPECT_EQ(fuse::send_buffer(tx, payload.data(), payload.size()), fuse::TransferStatus::Ok);
+    receiver.join();
+    EXPECT_EQ(rs, fuse::TransferStatus::Ok) << fuse::to_string(rs);
+    EXPECT_EQ(got, payload);
+}
+
+// Once a sender goes silent, the receiver stops acknowledging after a few
+// timer-driven Acks instead of sending ~50 a second until its idle timeout.
+TEST(Transfer, ReceiverStopsAckingASilentPeer) {
+    using namespace fuse::proto;
+    const uint16_t port = next_port();
+    std::atomic<bool> cancel{false};
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = port;
+    rx.lanes = 1;
+    rx.timeout_ms = 20000;
+    rx.cancel = &cancel;
+    std::vector<uint8_t> got;
+    std::thread receiver([&] { fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    UdpSocket fake_tx;
+    ASSERT_TRUE(fake_tx.open("127.0.0.1", 0));
+    PeerAddr dst;
+    ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", port, &dst));
+    StreamStart ss;
+    ss.total_bytes = 1 << 20;
+    ss.file_total_bytes = ss.total_bytes;
+    ss.nonce = 0x51;
+    ASSERT_TRUE(send_stream_start_v8(fake_tx, dst, ss));
+
+    // Count everything the receiver sends us over one second of silence.
+    fakepeer::set_rcv_timeout_ms(fake_tx, 50);
+    uint64_t acks = 0;
+    const auto until = fakepeer::Clock::now() + std::chrono::seconds(1);
+    while (fakepeer::Clock::now() < until) {
+        uint8_t in[kMaxDatagramSize + 64];
+        size_t n = 0;
+        MsgType t;
+        if (fake_tx.recv_from(in, sizeof(in), &n, nullptr) && peek_msg_type(in, n, &t) &&
+            t == MsgType::Ack) {
+            ++acks;
+        }
+    }
+    cancel.store(true);
+    receiver.join();
+    EXPECT_GE(acks, 1u);
+    EXPECT_LE(acks, 5u) << "the receiver kept acknowledging a silent peer";
+}
+
 // StreamStart sizes are unauthenticated claims: a lane that doesn't fit
 // inside its own transfer, or a lane that disagrees with the others about
 // the transfer's size, must not be accepted (no Ack, no allocation).
@@ -1094,8 +1214,7 @@ TEST(Transfer, InconsistentStreamStartIsRejected) {
         ss.stream_base_offset = base;
         ss.total_bytes = total;
         ss.file_total_bytes = file_total;
-        const size_t n = encode_stream_start(ss, buf, sizeof(buf));
-        ASSERT_TRUE(from.send_to(buf, n, to));
+        ASSERT_TRUE(send_stream_start_v8(from, to, ss));
     };
 
     // Lane that would reach past the end of its own transfer (and whose

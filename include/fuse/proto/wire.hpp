@@ -106,6 +106,15 @@ enum class MsgType : uint8_t {
     // kept from an earlier session match. The receiver echoes it back as the
     // acknowledgement.
     FileDigest     = 13,
+    // Address validation (v8). Receiver -> sender, answering a StreamStart
+    // that did not carry a valid token: "prove you can receive at this
+    // address by echoing this token". Never larger than the StreamStart it
+    // answers, so a spoofed source address gains no amplification.
+    Retry          = 14,
+    // Path validation (v8), either direction: before a peer address is
+    // replaced by a new source, the new source must echo a random challenge.
+    PathChallenge  = 15,
+    PathResponse   = 16,
 };
 
 // Block header flag bits (Stage 1.1).
