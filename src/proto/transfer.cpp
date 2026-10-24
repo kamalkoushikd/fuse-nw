@@ -2392,18 +2392,31 @@ TransferStatus send_impl(const TransferConfig &cfg, const uint8_t *data, size_t 
 
 // Identifies a file for resume by its name, size and modification time: a
 // receiver's partial copy is only reused for the very same file. Never 0.
+//
+// ROADMAP #15: name, size and mtime alone miss a file rewritten in place
+// with the same size and its mtime set back (touch -r, a restore tool):
+// a resume would then stitch stale bytes into it. The inode change time
+// (ctime) moves on every write and cannot be set back by user code, and the
+// device + inode pin the identity to this very file, so they are hashed
+// too. (Renaming also moves ctime, which just means a fresh transfer.)
 uint64_t file_identity(const std::string &path, const struct stat &st) {
     const std::string name = path.substr(path.find_last_of('/') + 1);
 #ifdef __APPLE__
     const auto mtime = st.st_mtimespec;
+    const auto ctime = st.st_ctimespec;
 #else
     const auto mtime = st.st_mtim;
+    const auto ctime = st.st_ctim;
 #endif
     std::vector<uint8_t> buf(name.begin(), name.end());
-    uint8_t num[24];
+    uint8_t num[56];
     put_u64(num, static_cast<uint64_t>(st.st_size));
     put_u64(num + 8, static_cast<uint64_t>(mtime.tv_sec));
     put_u64(num + 16, static_cast<uint64_t>(mtime.tv_nsec));
+    put_u64(num + 24, static_cast<uint64_t>(ctime.tv_sec));
+    put_u64(num + 32, static_cast<uint64_t>(ctime.tv_nsec));
+    put_u64(num + 40, static_cast<uint64_t>(st.st_ino));
+    put_u64(num + 48, static_cast<uint64_t>(st.st_dev));
     buf.insert(buf.end(), num, num + sizeof(num));
     const uint64_t id = hash64(buf.data(), buf.size());
     return id != 0 ? id : 1;
