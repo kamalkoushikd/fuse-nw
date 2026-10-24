@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "fuse/proto/control.hpp"
 #include "fuse/proto/wire.hpp"
 
 namespace fuse::proto {
@@ -85,6 +86,16 @@ private:
     uint16_t window_size_;
     std::vector<RegistrySlot> slots_;
 };
+
+// Applies one ACK to a sender's registry (ROADMAP #10): advances *base to
+// min(ack.base_seq_no, next_seq) -- the clamp matters, since an ACK is
+// untrusted input in plaintext mode -- confirming every slot below it, and
+// also confirms every slot the ACK's selective bitmask reports received
+// above the base. Returns the payload bytes newly confirmed. A block
+// confirmed this way is never resent by a NACK or the RTO, which used to
+// happen because senders ignored the bitmask and recovered burst losses
+// by NACKs alone.
+uint64_t apply_ack(SenderRegistry &reg, const Ack &ack, uint64_t *base, uint64_t next_seq);
 
 } // namespace fuse::proto
 

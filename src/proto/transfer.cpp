@@ -1810,20 +1810,9 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                                         challenge, auth.get());
                     }
                 }
-                if (ack.base_seq_no > base) {
-                    // Acks are unauthenticated even under PSK (only the
-                    // nonce above is checked), so base_seq_no is untrusted
-                    // input: clamp to what has actually been sent, or a
-                    // forged huge value spins this loop ~2^64 times.
-                    const uint64_t new_base = std::min(ack.base_seq_no, next_seq);
-                    for (uint64_t s = base; s < new_base; ++s) {
-                        // Count the block before confirm() frees its slot.
-                        if (const RegistrySlot *sl = reg.lookup(s)) acked_bytes += sl->payload_len;
-                        reg.confirm(s);
-                    }
-                    base = new_base;
-                    res->bytes.store(acked_bytes, std::memory_order_relaxed);
-                }
+                // Cumulative base plus the selective bitmask (see apply_ack).
+                acked_bytes += apply_ack(reg, ack, &base, next_seq);
+                res->bytes.store(acked_bytes, std::memory_order_relaxed);
                 // The receiver only updates its echoed send-time when a new
                 // highest-seq block arrives (receiver.cpp) — every
                 // periodic/final Ack in between repeats the same value.
@@ -1879,9 +1868,25 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             last_real_progress = t;
             cc.on_progress();
         } else if (t - last_progress > rto_ns) {
-            if (!reg.lookup(base)) {
+            // Resend the first few holes, not just the base: after a burst
+            // loss every block the receiver SACKed is skipped, and the rest
+            // of the burst is repaired in one RTO instead of one per RTO.
+            constexpr unsigned kRtoHoles = 8;
+            unsigned holes = 0;
+            bool sent = false, refused = false;
+            for (uint64_t s = base; s < next_seq && holes < kRtoHoles; ++s) {
+                if (!reg.lookup(s)) continue;
+                ++holes;
+                if (resend(s)) {
+                    sent = true;
+                } else {
+                    refused = true;
+                    break;
+                }
+            }
+            if (holes == 0) {
                 last_progress = t;
-            } else if (resend(base)) {
+            } else if (sent && !refused) {
                 cc.on_timeout(); // one halving per run of timeouts, then backoff
                 last_progress = t;
             } else {
