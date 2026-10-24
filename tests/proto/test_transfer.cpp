@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <string>
 #include <numeric>
 #include <thread>
@@ -718,6 +719,12 @@ public:
         thread_.join();
     }
     uint64_t dropped() const { return dropped_.load(); }
+    // Blocks seen more than once (a retransmission of an earlier seq), and
+    // how many of those carried different payload bytes than the first copy.
+    // Under encryption a resend must be the identical ciphertext and tag: a
+    // second, different tag under the same nonce is the GCM nonce-reuse flaw.
+    uint64_t resends() const { return resends_.load(); }
+    uint64_t changed_resends() const { return changed_resends_.load(); }
 
 private:
     void run() {
@@ -736,6 +743,20 @@ private:
                 sender = from;
                 have_sender = true;
                 MsgType t;
+                BlockHeader h;
+                uint64_t st = 0;
+                const uint8_t *pl = nullptr;
+                if (peek_msg_type(buf.data(), got, &t) && t == MsgType::Data &&
+                    decode_data_datagram(buf.data(), got, &h, &st, &pl)) {
+                    std::vector<uint8_t> body(pl, pl + h.payload_len);
+                    auto it = first_copy_.find(h.seq_no);
+                    if (it == first_copy_.end()) {
+                        first_copy_.emplace(h.seq_no, std::move(body));
+                    } else {
+                        resends_.fetch_add(1);
+                        if (it->second != body) changed_resends_.fetch_add(1);
+                    }
+                }
                 if (peek_msg_type(buf.data(), got, &t) && t == MsgType::Data && got > 20 &&
                     (buf[12] & kFlagRetransmission) == 0 && ++data_seen % drop_every_ == 0) {
                     dropped_.fetch_add(1);
@@ -755,6 +776,8 @@ private:
     int drop_every_;
     std::atomic<bool> stop_{false};
     std::atomic<uint64_t> dropped_{0};
+    std::atomic<uint64_t> resends_{0}, changed_resends_{0};
+    std::map<uint64_t, std::vector<uint8_t>> first_copy_;
     std::thread thread_;
 };
 
@@ -889,6 +912,9 @@ TEST(Transfer, LossyLinkRecoversThroughRetransmitThread) {
             ASSERT_EQ(rs, fuse::TransferStatus::Ok) << fuse::to_string(rs);
             EXPECT_GT(relay.dropped(), 0u);
             EXPECT_GT(st.retransmits, 0u);
+            EXPECT_GT(relay.resends(), 0u);
+            EXPECT_EQ(relay.changed_resends(), 0u)
+                << "a retransmit must resend the identical (cipher)text";
             EXPECT_EQ(pipeline_test::read_all(out), payload);
             fs::remove(out);
         }
