@@ -1448,8 +1448,6 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     set_timeout_us(sock.fd(), 200);
 
     SenderRegistry reg(lane, kWindow);
-    CongestionController cc(kWindow, true, 1, 16);
-    cc.enable_slow_start(32); // ROADMAP #8: reach the path's rate in a few RTTs
 
     LaneKeySchedule cipher;
     std::vector<uint8_t> sealed(kMaxPayloadSize + kAeadTagLen);
@@ -1680,6 +1678,17 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     uint16_t pre_growth_block = 0; // size before the latest growth step (0 = none pending)
     uint32_t clean_since_growth = 0;
     uint16_t mtu_ceiling = growth_ceiling;      // the route-MTU bound computed above
+    // Congestion window in units of base_block bytes (ROADMAP #8). Its cap
+    // is what kWindow blocks of the largest size this path allows would
+    // hold, so a long fat path can still fill its pipe -- but only by
+    // earning the window through slow start and AIMD, never instantly
+    // because blocks grew.
+    const uint64_t max_units = std::min<uint64_t>(
+        65535, std::max<uint64_t>(kWindow, uint64_t{kWindow} * mtu_ceiling / base_block));
+    CongestionController cc(static_cast<uint16_t>(max_units), true, 1, 16);
+    // 128 units = the 150 KB a lane always started with, now as the slow-start
+    // floor rather than a fixed window.
+    cc.enable_slow_start(128);
     uint32_t reprobe_after = 64, clean_at_ceiling = 0;
     uint64_t sent_bytes = 0; // new payload bytes sent (not retransmissions)
     // Pacing (ROADMAP #22): earliest time the next batch of new data may go.
@@ -1690,6 +1699,9 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     const auto wire_now = [clock_offset] { return now_ns() + clock_offset; };
     // The receiver's advertised window in blocks (ROADMAP #9).
     uint32_t peer_rwnd = kRwndUnlimited;
+    // One past the highest block the receiver is known to hold: unacked
+    // blocks below it are lost, blocks above it may just be in flight.
+    uint64_t received_end = 0;
 
     uint32_t clean_batches = 0;
     uint64_t base = 0, next_seq = 0, retransmits = 0;
@@ -1762,7 +1774,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             return;
         }
         cc.poll(now_ns());
-        const uint64_t window = std::min<uint64_t>(kWindow, std::max<uint32_t>(4, cc.window()));
+        const uint64_t window = std::max<uint32_t>(4, cc.window()); // in base_block units
         // Never more in flight than the receiver said it can hold either (at
         // least 4 blocks, so the flow can never wedge on a zero window).
         const uint64_t rwnd_bytes = peer_rwnd == kRwndUnlimited
@@ -1884,7 +1896,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                     }
                 }
                 // Cumulative base plus the selective bitmask (see apply_ack).
-                acked_bytes += apply_ack(reg, ack, &base, next_seq);
+                acked_bytes += apply_ack(reg, ack, &base, next_seq, &received_end);
                 peer_rwnd = ack.rwnd;
                 res->bytes.store(acked_bytes, std::memory_order_relaxed);
                 // The receiver only updates its echoed send-time when a new
@@ -1941,13 +1953,16 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
             last_real_progress = t;
             cc.on_progress();
         } else if (t - last_progress > rto_ns) {
-            // Resend the first few holes, not just the base: after a burst
-            // loss every block the receiver SACKed is skipped, and the rest
-            // of the burst is repaired in one RTO instead of one per RTO.
+            // Resend the base and the first few known holes: blocks below
+            // the highest one the receiver SACKed that it still lacks. After
+            // a burst loss the rest of the burst is repaired in one RTO
+            // instead of one per RTO, without resending blocks that are only
+            // still in flight.
             constexpr unsigned kRtoHoles = 8;
             unsigned holes = 0;
             bool sent = false, refused = false;
             for (uint64_t s = base; s < next_seq && holes < kRtoHoles; ++s) {
+                if (s != base && s >= received_end) break;
                 if (!reg.lookup(s)) continue;
                 ++holes;
                 if (resend(s)) {

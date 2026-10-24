@@ -118,6 +118,7 @@ struct SenderStreamState {
 
     uint64_t nonce = 0;
     uint64_t clock_offset = 0; // added to send_time_ns on the wire (ROADMAP #31)
+    uint64_t received_end = 0; // one past the highest seq the receiver holds
     bool start_acked = false;
     uint64_t last_start_send_ns = 0;
 
@@ -353,6 +354,7 @@ bool MuxSender::try_send_one(SenderStreamState &s) {
         unsigned holes = 0;
         bool sent = false;
         for (uint64_t q = s.tx_base; q < s.tx_next_seq && holes < 8; ++q) {
+            if (q != s.tx_base && q >= s.received_end) break; // beyond: maybe in flight
             if (!s.reg.lookup(q)) continue;
             ++holes;
             sent |= resend(s, q);
@@ -407,7 +409,7 @@ void MuxSender::dispatch_incoming(const uint8_t *dg, size_t dlen) {
         s.start_acked = true;
         const uint64_t old_base = s.tx_base;
         // Cumulative base (clamped to what was sent) plus the SACK bitmask.
-        apply_ack(s.reg, ack, &s.tx_base, s.tx_next_seq);
+        apply_ack(s.reg, ack, &s.tx_base, s.tx_next_seq, &s.received_end);
         if (s.tx_base > old_base) {
             s.cc.on_progress();
             const uint64_t t = now_ns();

@@ -95,7 +95,11 @@ private:
 // confirmed this way is never resent by a NACK or the RTO, which used to
 // happen because senders ignored the bitmask and recovered burst losses
 // by NACKs alone.
-uint64_t apply_ack(SenderRegistry &reg, const Ack &ack, uint64_t *base, uint64_t next_seq);
+// If `received_end` is non-null it is raised to one past the highest seq the
+// ACK shows as received (cumulatively or selectively): blocks below it that
+// are still unacknowledged are genuinely missing, not merely in flight.
+uint64_t apply_ack(SenderRegistry &reg, const Ack &ack, uint64_t *base, uint64_t next_seq,
+                   uint64_t *received_end = nullptr);
 
 } // namespace fuse::proto
 
