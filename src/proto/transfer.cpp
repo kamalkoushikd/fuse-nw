@@ -72,6 +72,27 @@ void set_timeout_us(int fd, long us) {
 // several control messages, so it must not be predictable from earlier ones.
 uint64_t random_nonce() { return secure_random_u64(); }
 
+// Address-validation token (v8): a keyed PRF of the peer's address and the
+// lane nonce under a secret only this receiver lane knows. A sender can
+// only echo it back if it really receives at that address, which is what
+// keeps a spoofed StreamStart from claiming a lane or from making us send
+// anything bigger than the request to a victim (ROADMAP #18, #5).
+uint64_t address_token(const uint8_t secret[16], const PeerAddr &a, uint64_t nonce) {
+    uint8_t buf[2 + 2 + 16 + 8] = {};
+    size_t n = put_u16(buf, static_cast<uint16_t>(a.addr.ss_family));
+    n += put_u16(buf + n, peer_port(a));
+    if (a.addr.ss_family == AF_INET6) {
+        std::memcpy(buf + n, &reinterpret_cast<const sockaddr_in6 &>(a.addr).sin6_addr, 16);
+        n += 16;
+    } else {
+        std::memcpy(buf + n, &reinterpret_cast<const sockaddr_in &>(a.addr).sin_addr, 4);
+        n += 4;
+    }
+    n += put_u64(buf + n, nonce);
+    const uint64_t t = siphash24(secret, buf, n);
+    return t != 0 ? t : 1; // 0 means "no token" on the wire
+}
+
 // Associated data binds a block to its identity so a valid block cannot be
 // replayed at another position.
 
@@ -890,6 +911,16 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
     // evidence of a key mismatch, reported as AuthFailed if nothing else
     // ever succeeds on this lane.
     uint64_t bad_starts = 0, last_auth_reply_ns = 0;
+    // Keys this lane's address-validation tokens (see address_token).
+    uint8_t token_secret[16];
+    put_u64(token_secret, secure_random_u64());
+    put_u64(token_secret + 8, secure_random_u64());
+    // Timer-driven Acks sent since the peer was last heard from. Once the
+    // peer has been silent for a few, stop: Acks are only owed to a peer
+    // that is still talking, and an endless Ack stream to an address that
+    // never answers is a reflection vector (ROADMAP #18).
+    unsigned quiet_acks = 0;
+    constexpr unsigned kMaxQuietAcks = 3;
     const auto send_resume_answer = [&] {
         for (const auto &m : resume_answer) sock.send_to(m.data(), m.size(), peer);
     };
@@ -1008,6 +1039,20 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
             if (type == MsgType::StreamStart) {
                 StreamStart ss;
                 if (!decode_stream_start(dg, dlen, &ss)) continue;
+                // Return routability first: until the sender echoes a token
+                // bound to its source address, it gets only a Retry, which
+                // is smaller than its StreamStart (no amplification) and
+                // commits nothing on our side.
+                const uint64_t want_token = address_token(token_secret, srcs[i], ss.nonce);
+                if (ss.token != want_token) {
+                    Retry r;
+                    r.stream_id = lane;
+                    r.nonce = ss.nonce;
+                    r.token = want_token;
+                    const size_t rn = encode_retry(r, tx.data(), tx.size());
+                    if (rn) sock.send_to(tx.data(), rn, srcs[i]);
+                    continue;
+                }
                 if (!have_start) {
                     // Authenticate first (v8 key confirmation): under a PSK
                     // the StreamStart is signed with a key derived from its
@@ -1213,7 +1258,10 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
         if (!have_peer || !have_start) continue;
 
         const uint64_t t = now_ns();
-        if (delivered - last_ack_blocks >= 8 || t - last_ack_ns > 200000) {
+        const bool heard_since_ack = last_rx_ns > last_ack_ns;
+        if (delivered - last_ack_blocks >= 8 ||
+            (t - last_ack_ns > 200000 && (heard_since_ack || quiet_acks < kMaxQuietAcks))) {
+            quiet_acks = heard_since_ack ? 0 : quiet_acks + 1;
             last_ack_blocks = delivered;
             last_ack_ns = t;
             Ack ack = rx.build_ack();
@@ -1408,6 +1456,15 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                     res->status.store(static_cast<int>(TransferStatus::AuthFailed));
                     stop_all->store(true, std::memory_order_release);
                     return;
+                }
+            } else if (mt == MsgType::Retry) {
+                // Address validation: echo the receiver's token in our next
+                // StreamStart, right away. (Unsigned: a forged Retry can
+                // only make the token wrong, and the receiver retries.)
+                Retry r;
+                if (decode_retry(ctl.data(), got, &r) && r.nonce == ss.nonce && r.token != ss.token) {
+                    ss.token = r.token;
+                    next_send_ns = 0;
                 }
             } else if (mt == MsgType::Ack && authentic) {
                 Ack ack;

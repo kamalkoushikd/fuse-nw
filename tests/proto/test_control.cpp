@@ -216,3 +216,38 @@ TEST(Aux, DigestMessageRoundTrip) {
     EXPECT_EQ(0, std::memcmp(got.digest, dm.digest, kDigestLen));
     EXPECT_FALSE(decode_digest(buf, len - 1, &got));
 }
+
+TEST(Aux, RetryAndPathProbesRoundTrip) {
+    uint8_t buf[64];
+    Retry r;
+    r.stream_id = 3;
+    r.nonce = 0xA1A2A3A4A5A6A7A8ULL;
+    r.token = 0x0102030405060708ULL;
+    const size_t n = encode_retry(r, buf, sizeof(buf));
+    ASSERT_EQ(n, 20u);
+    Retry back;
+    ASSERT_TRUE(decode_retry(buf, n, &back));
+    EXPECT_EQ(back.stream_id, 3);
+    EXPECT_EQ(back.nonce, r.nonce);
+    EXPECT_EQ(back.token, r.token);
+
+    StreamStart ss;
+    uint8_t sbuf[128];
+    EXPECT_LE(n, encode_stream_start(ss, sbuf, sizeof(sbuf)))
+        << "a Retry must never be larger than the StreamStart it answers";
+
+    PathProbe pp;
+    pp.stream_id = 1;
+    pp.nonce = 7;
+    pp.challenge = 0xDEADBEEFCAFEF00DULL;
+    for (MsgType t : {MsgType::PathChallenge, MsgType::PathResponse}) {
+        const size_t m = encode_path_probe(t, pp, buf, sizeof(buf));
+        ASSERT_EQ(m, 20u);
+        PathProbe got;
+        ASSERT_TRUE(decode_path_probe(t, buf, m, &got));
+        EXPECT_EQ(got.challenge, pp.challenge);
+        const MsgType other = t == MsgType::PathChallenge ? MsgType::PathResponse : MsgType::PathChallenge;
+        EXPECT_FALSE(decode_path_probe(other, buf, m, &got));
+    }
+    EXPECT_EQ(encode_path_probe(MsgType::Ack, pp, buf, sizeof(buf)), 0u);
+}
