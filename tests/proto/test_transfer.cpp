@@ -20,15 +20,14 @@
 #include "fuse/proto/control.hpp"
 #include "fuse/proto/udp.hpp"
 #include "fuse/transfer.hpp"
+#include "test_ports.hpp"
 
 namespace {
 
 // Ports are picked per-test to avoid collisions between concurrently
 // running cases; the range must be free for `lanes` consecutive ports.
-uint16_t next_port() {
-    static std::atomic<uint16_t> p{41000};
-    return p.fetch_add(64);
-}
+// Up to 16 lanes per test; see test_ports.hpp for why ports are probed.
+uint16_t next_port() { return fuse_test::free_port_block(16); }
 
 std::vector<uint8_t> make_payload(size_t n) {
     std::vector<uint8_t> v(n);
@@ -286,6 +285,14 @@ namespace fakepeer {
 using namespace fuse::proto;
 using Clock = std::chrono::steady_clock;
 
+// A fake peer that only reads now and then must not lose the one message a
+// test is waiting for because a burst of data blocks filled its socket
+// buffer first (the sender's abort is sent three times, unacknowledged).
+void big_buffers(UdpSocket &s) {
+    int bytes = 16 << 20;
+    setsockopt(s.fd(), SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes));
+}
+
 void set_rcv_timeout_ms(UdpSocket &s, int ms) {
     timeval tv{};
     tv.tv_sec = ms / 1000;
@@ -452,6 +459,7 @@ TEST(Transfer, SenderCancelTellsReceiverAndReturnsPromptly) {
 
     UdpSocket fake_rx;
     ASSERT_TRUE(fake_rx.open("127.0.0.1", port));
+    fakepeer::big_buffers(fake_rx);
 
     std::atomic<bool> cancel{false};
     fuse::TransferConfig tx;
@@ -582,6 +590,7 @@ TEST(Transfer, SlowHandshakeSucceedsAndPeerAbortEndsSender) {
 
     UdpSocket fake_rx;
     ASSERT_TRUE(fake_rx.open("127.0.0.1", port));
+    fakepeer::big_buffers(fake_rx);
 
     fuse::TransferConfig tx;
     tx.host = "127.0.0.1";
@@ -989,13 +998,29 @@ Run transfer(const fs::path &in, const fs::path &out) {
 // about 30% has arrived, leaving a resumable <out>.part — exactly what a
 // Ctrl+C or a dropped connection mid-transfer leaves. False if the transfer
 // finished before the cancel could land (nothing to resume then).
+bool interrupt_once(const fs::path &in, const fs::path &out, uint64_t size, uint64_t at_bytes);
+
+// On a fast host a whole transfer can complete between two progress
+// callbacks, so retry with an ever earlier cancel point before giving up:
+// skipping a resume test should be the rare exception, not the norm.
 bool interrupt_midway(const fs::path &in, const fs::path &out, uint64_t size) {
+    uint64_t at = size * 3 / 10;
+    for (int attempt = 0; attempt < 5; ++attempt, at /= 4) {
+        std::error_code ec;
+        fs::remove(out.string() + ".part", ec);
+        if (interrupt_once(in, out, size, at == 0 ? 1 : at)) return true;
+    }
+    return false;
+}
+
+bool interrupt_once(const fs::path &in, const fs::path &out, uint64_t size, uint64_t at_bytes) {
+    (void)size;
     std::atomic<bool> cancel{false};
     fuse::TransferConfig rx = receiver_config(next_port());
     rx.cancel = &cancel;
     rx.progress_interval_ms = 10;
     rx.on_progress = [&](const fuse::TransferProgress &p) {
-        if (p.bytes_done >= size * 3 / 10) cancel.store(true);
+        if (p.bytes_done >= at_bytes) cancel.store(true);
     };
     fuse::TransferConfig tx = receiver_config(rx.base_port);
     tx.host = "127.0.0.1";
