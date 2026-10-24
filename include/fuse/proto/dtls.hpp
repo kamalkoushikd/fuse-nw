@@ -55,6 +55,11 @@ struct DtlsConfig {
     // cycle rather than reporting promptly.
     int handshake_timeout_init_sec = 1;
     int handshake_timeout_max_sec = 4;
+
+    // Test aid: keep a copy of the last datagram sent, for checking that
+    // what leaves the host is ciphertext (last_wire_datagram()). Off by
+    // default; it used to copy every outgoing record (ROADMAP #31).
+    bool record_wire = false;
 };
 
 enum class DtlsStatus {
@@ -97,7 +102,8 @@ public:
     DtlsStatus recv(uint8_t *buf, size_t buf_cap, size_t *out_len);
 
     // Bytes actually handed to / taken from the network, for verifying that
-    // what leaves the host is ciphertext rather than plaintext.
+    // what leaves the host is ciphertext rather than plaintext. The datagram
+    // itself is only kept when DtlsConfig::record_wire is set.
     uint64_t wire_bytes_sent() const { return wire_bytes_sent_; }
     const uint8_t *last_wire_datagram() const { return last_wire_.data; }
     size_t last_wire_datagram_len() const { return last_wire_.len; }
