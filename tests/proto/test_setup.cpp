@@ -108,13 +108,38 @@ TEST(Setup, DecodeRejectsTooManyStreams) {
 }
 
 TEST(Setup, HashMessagesRoundTrip) {
-    uint8_t buf[kOuterHeaderSize + 8];
-    ASSERT_GT(encode_setup_hash(MsgType::SetupHashReply, 0xABCDEF12ULL, buf, sizeof(buf)), 0u);
-    uint64_t h = 0;
-    ASSERT_TRUE(decode_setup_hash(MsgType::SetupHashReply, buf, sizeof(buf), &h));
+    uint8_t buf[kOuterHeaderSize + 16];
+    ASSERT_GT(encode_setup_hash(MsgType::SetupHashReply, 0xABCDEF12ULL, 0x55ULL, buf, sizeof(buf)),
+              0u);
+    uint64_t h = 0, nonce = 0;
+    ASSERT_TRUE(decode_setup_hash(MsgType::SetupHashReply, buf, sizeof(buf), &h, &nonce));
     EXPECT_EQ(h, 0xABCDEF12ULL);
+    EXPECT_EQ(nonce, 0x55ULL);
     // A HASH-REPLY must not decode as a FINACK.
-    EXPECT_FALSE(decode_setup_hash(MsgType::SetupFinAck, buf, sizeof(buf), &h));
+    EXPECT_FALSE(decode_setup_hash(MsgType::SetupFinAck, buf, sizeof(buf), &h, &nonce));
+}
+
+// ROADMAP #5: a recorded DATA + FINACK pair replayed to a responder later
+// must not complete a handshake. The responder's fresh nonce, which the
+// FINACK must echo, makes the old FINACK useless.
+TEST(Setup, ReplayedHandshakeDoesNotComplete) {
+    SetupInitiator init(sample_payload());
+    SetupResponder first;
+    uint8_t data[kMaxSetupDatagramSize], reply[kMaxSetupDatagramSize], finack[kMaxSetupDatagramSize];
+    const size_t dn = init.start(data, sizeof(data), 0);
+    ASSERT_GT(dn, 0u);
+    const size_t rn = first.on_datagram(data, dn, reply, sizeof(reply), 0);
+    ASSERT_GT(rn, 0u);
+    const size_t fn = init.on_datagram(reply, rn, finack, sizeof(finack), 0);
+    ASSERT_GT(fn, 0u);
+    first.on_datagram(finack, fn, reply, sizeof(reply), 0);
+    ASSERT_TRUE(first.is_complete());
+
+    SetupResponder later;
+    uint8_t scratch[kMaxSetupDatagramSize];
+    ASSERT_GT(later.on_datagram(data, dn, scratch, sizeof(scratch), 0), 0u);
+    later.on_datagram(finack, fn, scratch, sizeof(scratch), 0);
+    EXPECT_FALSE(later.is_complete()) << "a replayed FINACK completed a new handshake";
 }
 
 // --- In-process handshake harness with loss / corruption injection -------
