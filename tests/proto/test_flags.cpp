@@ -217,3 +217,14 @@ TEST(Flags, UnorderedDuplicateTrackingIsWindowBounded) {
     EXPECT_EQ(r.delivered_count(), 5000u);
     EXPECT_LE(r.delivery_order().size(), ReassemblyStream::kMaxDeliveryTrace);
 }
+
+// ROADMAP #30: a zero-capacity SendQueue used to divide by zero.
+TEST(Flags, ZeroCapacitySendQueueIsUsable) {
+    SendQueue q(0, /*coalesce=*/true);
+    EXPECT_EQ(q.capacity(), 1u);
+    EXPECT_TRUE(q.push(1));
+    EXPECT_TRUE(q.push(2)); // coalesces: drops 1
+    uint64_t v = 0;
+    ASSERT_TRUE(q.pop(v));
+    EXPECT_EQ(v, 2u);
+}

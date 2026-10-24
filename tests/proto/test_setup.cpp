@@ -369,3 +369,30 @@ TEST(Setup, ExtensionsRoundTripAndCriticalOnesAreRefused) {
     n = encode_setup_data(p, buf, sizeof(buf));
     EXPECT_FALSE(decode_setup_data(buf, n, &back, nullptr, nullptr));
 }
+
+// ROADMAP #30: a SETUP this version can't run is never confirmed.
+TEST(Setup, InvalidConfigurationsAreRefused) {
+    EXPECT_TRUE(setup_payload_valid(sample_payload()));
+    const auto refused = [](SetupPayload p) {
+        EXPECT_FALSE(setup_payload_valid(p));
+        uint8_t data[kMaxSetupDatagramSize], reply[kMaxSetupDatagramSize];
+        const size_t n = encode_setup_data(p, data, sizeof(data));
+        SetupResponder r;
+        EXPECT_EQ(r.on_datagram(data, n, reply, sizeof(reply), 0), 0u);
+    };
+    SetupPayload p = sample_payload();
+    p.streams[3].stream_id = p.streams[1].stream_id;
+    refused(p);
+    p = sample_payload();
+    p.streams[0].block_size = kMaxPayloadSize + 1;
+    refused(p);
+    p = sample_payload();
+    p.streams[0].window_size = 0;
+    refused(p);
+    p = sample_payload();
+    p.streams[0].window_size = kMaxWindow + 1;
+    refused(p);
+    p = sample_payload();
+    p.protocol_version = static_cast<uint8_t>(kProtocolVersion - 1);
+    refused(p);
+}

@@ -86,6 +86,12 @@ struct SetupPayload {
 inline constexpr size_t kMaxSetupDatagramSize =
     kOuterHeaderSize + 1 + 2 + 2 + static_cast<size_t>(kMaxStreams) * 9 + 2 + kMaxExtensionBytes;
 
+// True if a decoded SETUP is one this version can run (ROADMAP #30):
+// protocol_version is ours, and every stream has a unique id, a block size
+// in 1..kMaxPayloadSize and a window in 1..kMaxWindow. SetupResponder
+// silently ignores (never confirms) a SETUP that fails this.
+bool setup_payload_valid(const SetupPayload &p);
+
 // Serializes just the SETUP payload body (everything after the outer
 // header) into `out`. Returns the byte count, or 0 on overflow / an
 // out-of-range num_streams. Exposed so both sides hash the exact same

@@ -105,6 +105,9 @@ struct SenderStreamState {
     SenderRegistry reg;
     CongestionController cc;
     SendQueue retransmit_backlog; // NACK-driven; coalesce=false matches LOSSLESS
+    // queued[seq % window] == seq while seq sits in the backlog, so a gap
+    // NACKed again before its resend isn't queued twice (ROADMAP #30).
+    std::vector<uint64_t> queued;
 
     const uint8_t *data = nullptr; // points into the caller's buffer; not owned
     uint64_t shard_bytes = 0;
@@ -138,7 +141,8 @@ struct SenderStreamState {
           window_size(wsize),
           reg(id, wsize),
           cc(wsize, /*enabled=*/true, 1, 16),
-          retransmit_backlog(wsize, /*coalesce=*/false) {
+          retransmit_backlog(wsize, /*coalesce=*/false),
+          queued(wsize == 0 ? 1 : wsize, UINT64_MAX) {
         cc.enable_slow_start(16); // ROADMAP #8 (blocks are fixed-size here)
     }
 };
@@ -336,6 +340,8 @@ bool MuxSender::try_send_one(SenderStreamState &s) {
 
     uint64_t seq = 0;
     if (s.retransmit_backlog.pop(seq)) {
+        uint64_t &mark = s.queued[seq % s.queued.size()];
+        if (mark == seq) mark = UINT64_MAX;
         resend(s, seq);
         return true;
     }
@@ -423,7 +429,16 @@ void MuxSender::dispatch_incoming(const uint8_t *dg, size_t dlen) {
         if (s.done.load(std::memory_order_relaxed)) return;
         s.cc.on_loss();
         for (uint16_t i = 0; i < nack.count; ++i) {
-            s.retransmit_backlog.push(nack.missing[i]); // best-effort; a full push just isn't queued
+            const uint64_t seq = nack.missing[i];
+            uint64_t &mark = s.queued[seq % s.queued.size()];
+            if (mark == seq) continue; // already waiting for its resend
+            if (s.retransmit_backlog.push(seq)) {
+                mark = seq;
+            } else {
+                // Backlog full: resend right away rather than drop the
+                // request and leave the gap to the RTO.
+                resend(s, seq);
+            }
         }
     } else if (type == MsgType::SetupHashReply && init_) {
         // The receiver's own retry for a FINACK that never arrived (see
@@ -641,7 +656,10 @@ bool MuxReceiver::run_setup_handshake() {
                 }
                 continue;
             }
-            if (!have_peer_) {
+            // The peer is whoever sends the SETUP (not just any first
+            // datagram to arrive on the port).
+            MsgType type;
+            if (peek_msg_type(in, got, &type) && type == MsgType::SetupData) {
                 peer_ = from;
                 have_peer_ = true;
             }
@@ -649,10 +667,17 @@ bool MuxReceiver::run_setup_handshake() {
         } else {
             n = resp.on_timeout(out, sizeof(out), now_ns());
         }
-        if (n > 0) sock_.send_to(out, n, peer_);
+        if (n > 0 && have_peer_) sock_.send_to(out, n, peer_);
     }
     if (!resp.is_complete()) return false;
-    build_streams(resp.config());
+    // This receiver indexes its streams by id, so the ids must be exactly
+    // 0..n-1 (which is what MuxSender sends). Anything else is refused
+    // rather than mis-indexed (ROADMAP #30).
+    const SetupPayload &cfg = resp.config();
+    for (uint16_t i = 0; i < cfg.num_streams; ++i) {
+        if (cfg.streams[i].stream_id != i) return false;
+    }
+    build_streams(cfg);
     return true;
 }
 
