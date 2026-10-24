@@ -72,3 +72,35 @@ TEST(Registry, ValidCountTracksLiveSlots) {
     reg.confirm(1);
     EXPECT_EQ(reg.valid_count(), 2);
 }
+
+// ROADMAP #10: an ACK's selective bitmask confirms blocks above the base, so
+// they are never resent, and their bytes are counted exactly once.
+TEST(Registry, ApplyAckUsesSelectiveBitmask) {
+    SenderRegistry reg(1, 64);
+    uint8_t p[100] = {};
+    for (uint64_t s = 0; s < 10; ++s) reg.store(s, p, 100, 0, s * 100);
+    uint64_t base = 0;
+
+    Ack ack;
+    ack.base_seq_no = 2;                         // 0 and 1 delivered
+    ack.received_bitmask[0] = (1ull << 3) | (1ull << 5); // 5 and 7 too
+    EXPECT_EQ(apply_ack(reg, ack, &base, 10), 400u);
+    EXPECT_EQ(base, 2u);
+    EXPECT_NE(reg.lookup(2), nullptr);
+    EXPECT_EQ(reg.lookup(5), nullptr) << "SACKed block must not be resent";
+    EXPECT_EQ(reg.lookup(7), nullptr);
+    EXPECT_NE(reg.lookup(6), nullptr);
+
+    // The base later passes the SACKed blocks: they are not counted twice.
+    Ack later;
+    later.base_seq_no = 8;
+    EXPECT_EQ(apply_ack(reg, later, &base, 10), 400u); // 2, 3, 4, 6
+    EXPECT_EQ(base, 8u);
+
+    // A forged base far beyond what was sent is clamped.
+    Ack forged;
+    forged.base_seq_no = UINT64_MAX;
+    forged.received_bitmask[0] = ~0ull;
+    EXPECT_EQ(apply_ack(reg, forged, &base, 10), 200u);
+    EXPECT_EQ(base, 10u);
+}

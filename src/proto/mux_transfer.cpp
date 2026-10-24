@@ -181,6 +181,7 @@ private:
     bool run_setup_handshake();
     void build_streams();
     bool try_send_one(SenderStreamState &s);
+    bool resend(SenderStreamState &s, uint64_t seq);
     void dispatch_incoming(const uint8_t *dg, size_t dlen);
     bool worker_task(uint16_t);
     bool all_done() const;
@@ -279,6 +280,26 @@ void MuxSender::build_streams() {
     }
 }
 
+// Resends block `seq` of stream `s` from its registry (caller holds s.mu).
+bool MuxSender::resend(SenderStreamState &s, uint64_t seq) {
+    const RegistrySlot *slot = s.reg.lookup(seq);
+    if (slot == nullptr) return false;
+    BlockHeader hdr;
+    hdr.stream_id = s.stream_id;
+    hdr.seq_no = seq;
+    // OR, not overwrite: a retransmitted last block is still the last block,
+    // and the receiver has no other way to learn a stream finished if this
+    // bit is dropped here.
+    hdr.flags = slot->flags | kFlagRetransmission;
+    hdr.payload_len = slot->payload_len;
+    hdr.offset = slot->offset;
+    uint8_t dgram[kMaxDatagramSize];
+    const size_t n = encode_data_datagram(hdr, now_ns(), slot->payload, dgram, sizeof(dgram));
+    if (n == 0 || !sock_.send_to(dgram, n, dst_)) return false;
+    ++s.retransmit_count;
+    return true;
+}
+
 bool MuxSender::try_send_one(SenderStreamState &s) {
     std::lock_guard<std::mutex> lk(s.mu);
     if (s.done.load(std::memory_order_relaxed)) return false;
@@ -310,42 +331,22 @@ bool MuxSender::try_send_one(SenderStreamState &s) {
 
     uint64_t seq = 0;
     if (s.retransmit_backlog.pop(seq)) {
-        const RegistrySlot *slot = s.reg.lookup(seq);
-        if (slot != nullptr) {
-            BlockHeader hdr;
-            hdr.stream_id = s.stream_id;
-            hdr.seq_no = seq;
-            // OR, not overwrite: a retransmitted last block is still the
-            // last block, and the receiver has no other way to learn a
-            // stream finished if this bit is dropped here.
-            hdr.flags = slot->flags | kFlagRetransmission;
-            hdr.payload_len = slot->payload_len;
-            hdr.offset = slot->offset;
-            uint8_t dgram[kMaxDatagramSize];
-            const size_t n = encode_data_datagram(hdr, now_ns(), slot->payload, dgram, sizeof(dgram));
-            if (n && sock_.send_to(dgram, n, dst_)) ++s.retransmit_count;
-        }
+        resend(s, seq);
         return true;
     }
 
     // RFC 6298 RTO with backoff, as in transfer.cpp (ROADMAP #23).
     const uint64_t rto_ns = s.cc.rto_ns(5'000'000ull, 1'000'000'000ull, 1'000'000'000ull);
     if (s.tx_base < s.tx_next_seq && t > s.last_progress_ns + rto_ns) {
-        const RegistrySlot *slot = s.reg.lookup(s.tx_base);
-        if (slot != nullptr) {
-            BlockHeader hdr;
-            hdr.stream_id = s.stream_id;
-            hdr.seq_no = s.tx_base;
-            hdr.flags = slot->flags | kFlagRetransmission; // see the backlog path's comment above
-            hdr.payload_len = slot->payload_len;
-            hdr.offset = slot->offset;
-            uint8_t dgram[kMaxDatagramSize];
-            const size_t n = encode_data_datagram(hdr, now_ns(), slot->payload, dgram, sizeof(dgram));
-            if (n && sock_.send_to(dgram, n, dst_)) {
-                ++s.retransmit_count;
-                s.cc.on_timeout();
-            }
+        // The first few un-SACKed holes, not just the base (see transfer.cpp).
+        unsigned holes = 0;
+        bool sent = false;
+        for (uint64_t q = s.tx_base; q < s.tx_next_seq && holes < 8; ++q) {
+            if (!s.reg.lookup(q)) continue;
+            ++holes;
+            sent |= resend(s, q);
         }
+        if (sent) s.cc.on_timeout();
         s.last_progress_ns = t; // pacing clock: don't retry every call while waiting out the RTO
         return true;
     }
@@ -392,13 +393,10 @@ void MuxSender::dispatch_incoming(const uint8_t *dg, size_t dlen) {
         std::lock_guard<std::mutex> lk(s.mu);
         if (ack.nonce != s.nonce) return; // not this attempt's session
         s.start_acked = true;
-        if (ack.base_seq_no > s.tx_base) {
-            // Acks are unauthenticated (no crypto in this module at all):
-            // clamp to what was actually sent, mirroring the same fix
-            // applied to transfer.cpp/sdk.cpp this session.
-            const uint64_t new_base = std::min(ack.base_seq_no, s.tx_next_seq);
-            for (uint64_t seq = s.tx_base; seq < new_base; ++seq) s.reg.confirm(seq);
-            s.tx_base = new_base;
+        const uint64_t old_base = s.tx_base;
+        // Cumulative base (clamped to what was sent) plus the SACK bitmask.
+        apply_ack(s.reg, ack, &s.tx_base, s.tx_next_seq);
+        if (s.tx_base > old_base) {
             s.cc.on_progress();
             const uint64_t t = now_ns();
             s.last_progress_ns = t;
