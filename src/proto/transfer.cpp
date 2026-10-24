@@ -2065,8 +2065,20 @@ TransferStatus receive_to_sink(const TransferConfig &cfg, Sink *sink, TransferSt
     return status;
 }
 
+// The PSK is HKDF input, not a password: there is no stretching, so one
+// captured handshake or block lets an attacker test guesses offline at
+// full speed (ROADMAP #19). A short key is almost certainly a human-chosen
+// password, and is refused rather than silently protecting nothing.
+constexpr size_t kMinPreSharedKeyLen = 16;
+
+bool psk_too_short(const TransferConfig &cfg) {
+    return !cfg.pre_shared_key.empty() && cfg.pre_shared_key.size() < kMinPreSharedKeyLen;
+}
+
 TransferStatus check_receive_config(const TransferConfig &cfg) {
-    if (cfg.lanes == 0 || cfg.base_port == 0) return TransferStatus::ConfigError;
+    if (cfg.lanes == 0 || cfg.base_port == 0 || psk_too_short(cfg)) {
+        return TransferStatus::ConfigError;
+    }
     if (!cfg.pre_shared_key.empty() && !session_crypto_available()) {
         return TransferStatus::Unsupported;
     }
@@ -2102,7 +2114,7 @@ namespace {
 // of that file resume it.
 TransferStatus send_impl(const TransferConfig &cfg, const uint8_t *data, size_t len,
                          uint64_t file_id, TransferStats *stats) {
-    if (cfg.lanes == 0 || cfg.base_port == 0 || cfg.block_size == 0 ||
+    if (cfg.lanes == 0 || cfg.base_port == 0 || cfg.block_size == 0 || psk_too_short(cfg) ||
         (data == nullptr && len > 0)) {
         return TransferStatus::ConfigError;
     }

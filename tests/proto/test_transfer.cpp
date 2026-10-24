@@ -145,7 +145,7 @@ TEST(Transfer, WrongKeyDoesNotYieldData) {
 
     fuse::TransferConfig tx = rx;
     tx.host = "127.0.0.1";
-    tx.pre_shared_key = "sender-key";
+    tx.pre_shared_key = "sender-key-that-differs";
 
     std::vector<uint8_t> got;
     fuse::TransferStatus rs = fuse::TransferStatus::Ok;
@@ -171,6 +171,19 @@ TEST(Transfer, WrongKeyDoesNotYieldData) {
     // AuthFailed.
     EXPECT_EQ(rs, fuse::TransferStatus::AuthFailed) << fuse::to_string(rs);
     EXPECT_NE(got, payload) << "no plaintext may be recovered with the wrong key";
+}
+
+// A short pre-shared key is almost certainly a password, which this key
+// schedule cannot protect; it is refused up front on both ends (#19).
+TEST(Transfer, ShortPreSharedKeyIsRefused) {
+    fuse::TransferConfig cfg;
+    cfg.base_port = next_port();
+    cfg.lanes = 1;
+    cfg.pre_shared_key = "hunter2";
+    const uint8_t byte = 0;
+    EXPECT_EQ(fuse::send_buffer(cfg, &byte, 1), fuse::TransferStatus::ConfigError);
+    std::vector<uint8_t> out;
+    EXPECT_EQ(fuse::receive_buffer(cfg, &out), fuse::TransferStatus::ConfigError);
 }
 
 // Mismatched encryption settings fail closed at the handshake, in both
