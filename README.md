@@ -164,10 +164,10 @@ a distro's own repositories.
 
 ```sh
 # Debian/Ubuntu (needs dpkg-dev, normally already present)
-sudo dpkg -i fuse-0.1.0-Linux.deb
+sudo dpkg -i fuse-0.2.0-Linux.deb
 
 # Fedora/RHEL (needs rpm-build)
-sudo rpm -i fuse-0.1.0-1.x86_64.rpm
+sudo rpm -i fuse-0.2.0-1.x86_64.rpm
 ```
 
 Every push to `main` also builds these packages in CI and uploads them

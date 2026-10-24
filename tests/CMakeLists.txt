@@ -19,7 +19,7 @@ add_executable(fuse_tests
 target_link_libraries(fuse_tests PRIVATE fuse::fuse GTest::gtest_main)
 
 include(GoogleTest)
-gtest_discover_tests(fuse_tests)
+gtest_discover_tests(fuse_tests PROPERTIES TIMEOUT 120)
 
 # Stage 1 datagram-protocol tests (fuse_proto).
 add_executable(fuse_proto_tests
@@ -45,4 +45,5 @@ add_executable(fuse_proto_tests
 
 target_link_libraries(fuse_proto_tests PRIVATE fuse::proto fuse::sdk GTest::gtest_main)
 
-gtest_discover_tests(fuse_proto_tests)
+# A per-test TIMEOUT keeps one wedged transfer test from hanging the whole run.
+gtest_discover_tests(fuse_proto_tests PROPERTIES TIMEOUT 180)
