@@ -114,6 +114,7 @@ struct SenderStreamState {
     bool sent_last = false;
 
     uint64_t nonce = 0;
+    uint64_t clock_offset = 0; // added to send_time_ns on the wire (ROADMAP #31)
     bool start_acked = false;
     uint64_t last_start_send_ns = 0;
 
@@ -275,6 +276,7 @@ void MuxSender::build_streams() {
         s->data = data_ + off;
         s->shard_bytes = sz;
         s->nonce = random_nonce();
+        s->clock_offset = secure_random_u64();
         const uint64_t t = now_ns();
         s->last_progress_ns = t;
         s->last_real_progress_ns.store(t, std::memory_order_relaxed);
@@ -296,7 +298,8 @@ bool MuxSender::resend(SenderStreamState &s, uint64_t seq) {
     hdr.payload_len = slot->payload_len;
     hdr.offset = slot->offset;
     uint8_t dgram[kMaxDatagramSize];
-    const size_t n = encode_data_datagram(hdr, now_ns(), slot->payload, dgram, sizeof(dgram));
+    const size_t n =
+        encode_data_datagram(hdr, now_ns() + s.clock_offset, slot->payload, dgram, sizeof(dgram));
     if (n == 0 || !sock_.send_to(dgram, n, dst_)) return false;
     ++s.retransmit_count;
     return true;
@@ -371,7 +374,8 @@ bool MuxSender::try_send_one(SenderStreamState &s) {
 
         uint8_t dgram[kMaxDatagramSize];
         const size_t n =
-            encode_data_datagram(hdr, now_ns(), s.data + s.next_offset, dgram, sizeof(dgram));
+            encode_data_datagram(hdr, now_ns() + s.clock_offset, s.data + s.next_offset, dgram,
+                                 sizeof(dgram));
         if (n == 0) return false;
         sock_.send_to(dgram, n, dst_);
 
@@ -406,8 +410,7 @@ void MuxSender::dispatch_incoming(const uint8_t *dg, size_t dlen) {
         }
         if (ack.echoed_send_time > 0 && ack.echoed_send_time != s.last_rtt_echo_ns) {
             s.last_rtt_echo_ns = ack.echoed_send_time;
-            const uint64_t t = now_ns();
-            if (t > ack.echoed_send_time) s.cc.on_rtt_sample(t - ack.echoed_send_time);
+            s.cc.on_rtt_sample(rtt_sample_from_echo(now_ns() + s.clock_offset, ack.echoed_send_time));
         }
         if (s.tx_base >= s.tx_next_seq && s.sent_last) {
             s.done.store(true, std::memory_order_release);
