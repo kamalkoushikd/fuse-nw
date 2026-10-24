@@ -91,7 +91,8 @@ public:
     }
 
     // Retransmission timeout (ROADMAP #23), RFC 6298 style: SRTT + 4·RTTVAR
-    // (at least 1 ms of variance allowance), clamped to [min_ns, max_ns],
+    // (at least 1 ms of variance allowance, and never under 2·SRTT), clamped
+    // to [min_ns, max_ns],
     // `initial_ns` before any sample, and doubled for each consecutive
     // timeout without progress. A variance term keeps jitter from firing
     // spurious retransmits; the backoff keeps a dead or overloaded path
@@ -101,6 +102,10 @@ public:
         if (srtt_ns_ != 0) {
             const uint64_t var = rttvar_ns_ * 4 > 1'000'000ull ? rttvar_ns_ * 4 : 1'000'000ull;
             rto = srtt_ns_ + var;
+            // Never below 2 x SRTT: NACK-driven repair takes about half an
+            // RTT of reorder tolerance plus a round trip, and an RTO that
+            // fires first only duplicates that repair.
+            if (rto < 2 * srtt_ns_) rto = 2 * srtt_ns_;
         }
         rto = rto < min_ns ? min_ns : (rto > max_ns ? max_ns : rto);
         for (unsigned i = 0; i < backoff_ && rto < max_ns; ++i) rto *= 2;

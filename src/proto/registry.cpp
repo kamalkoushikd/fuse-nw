@@ -49,7 +49,8 @@ void SenderRegistry::confirm(uint64_t seq_no) {
     }
 }
 
-uint64_t apply_ack(SenderRegistry &reg, const Ack &ack, uint64_t *base, uint64_t next_seq) {
+uint64_t apply_ack(SenderRegistry &reg, const Ack &ack, uint64_t *base, uint64_t next_seq,
+                   uint64_t *received_end) {
     uint64_t bytes = 0;
     const auto take = [&](uint64_t seq) {
         if (const RegistrySlot *sl = reg.lookup(seq)) {
@@ -72,9 +73,11 @@ uint64_t apply_ack(SenderRegistry &reg, const Ack &ack, uint64_t *base, uint64_t
                 const uint64_t seq = ack.base_seq_no + 64 * w + b;
                 if (seq >= next_seq) break;
                 if (seq >= *base) take(seq);
+                if (received_end && seq + 1 > *received_end) *received_end = seq + 1;
             }
         }
     }
+    if (received_end && *base > *received_end) *received_end = *base;
     return bytes;
 }
 
