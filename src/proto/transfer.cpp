@@ -147,6 +147,52 @@ bool ctl_authentic(const ControlAuth *auth, const uint8_t *dg, size_t len) {
     return auth == nullptr || auth->open(dg, len, nullptr);
 }
 
+// Path validation (v8, ROADMAP #3). A peer's address is only replaced by a
+// new source after that source echoes a random challenge, so a datagram
+// with a spoofed or merely different source address cannot redirect where
+// this lane sends its traffic (no hijack, no reflection at a third party).
+// One candidate at a time; challenges are resent at most every 50 ms.
+class PathValidator {
+public:
+    // Authentic traffic arrived from `src`, which is not the current peer.
+    // Returns true (and fills *probe) if a challenge should be sent to it now.
+    bool want_probe(const PeerAddr &src, uint64_t now, uint64_t *challenge) {
+        if (!(active_ && candidate_ == src)) {
+            active_ = true;
+            candidate_ = src;
+            challenge_ = secure_random_u64();
+            sent_ns_ = 0;
+        }
+        if (sent_ns_ != 0 && now - sent_ns_ < 50'000'000ull) return false;
+        sent_ns_ = now;
+        *challenge = challenge_;
+        return true;
+    }
+    // A PathResponse arrived; true if it validates the candidate.
+    bool validated(const PeerAddr &src, uint64_t value) {
+        if (!active_ || !(src == candidate_) || value != challenge_) return false;
+        active_ = false;
+        return true;
+    }
+
+private:
+    PeerAddr candidate_{};
+    uint64_t challenge_ = 0, sent_ns_ = 0;
+    bool active_ = false;
+};
+
+// Sends a PathChallenge/PathResponse for `lane`, signed under a PSK.
+void send_path_probe(UdpSocket &sock, const PeerAddr &to, MsgType type, uint16_t lane,
+                     uint64_t nonce, uint64_t value, ControlAuth *auth) {
+    PathProbe pp;
+    pp.stream_id = lane;
+    pp.nonce = nonce;
+    pp.challenge = value;
+    uint8_t buf[64];
+    const size_t n = seal_ctl(auth, buf, encode_path_probe(type, pp, buf, sizeof(buf)), sizeof(buf));
+    if (n) sock.send_to(buf, n, to);
+}
+
 // Written by one lane thread, read by the calling thread for progress
 // reports (relaxed is enough for the counters: a progress snapshot only
 // needs each value to be one that was really stored, not a consistent cut
@@ -907,6 +953,16 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
     // Under a pre-shared key: this lane's control-plane signer/verifier,
     // created once a StreamStart authenticates. nullptr in plaintext mode.
     std::unique_ptr<ControlAuth> auth;
+    PathValidator path;
+    // Traffic for this session arrived from a source other than `peer`:
+    // challenge it rather than switching to it.
+    const auto probe_path = [&](const PeerAddr &src) {
+        uint64_t challenge = 0;
+        if (path.want_probe(src, now_ns(), &challenge)) {
+            send_path_probe(sock, src, MsgType::PathChallenge, lane, peer_nonce, challenge,
+                            auth.get());
+        }
+    };
     // StreamStarts that failed authentication before any session existed:
     // evidence of a key mismatch, reported as AuthFailed if nothing else
     // ever succeeds on this lane.
@@ -978,14 +1034,12 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
             if (c.flags & kFlagLastBlock) final_seq = c.seq;
 
             // `Accepted` means this block is both authentic (if encrypted)
-            // AND new, not a replay of something already delivered. Only
-            // then is its source trusted as where to send ACKs: that is
-            // what lets a transfer survive the sender's NAT mapping changing
-            // mid-flight, while an attacker resending a captured datagram
-            // from their own address still can't redirect the ACKs.
+            // AND new, not a replay of something already delivered. A new
+            // source on such a block is how a sender's NAT rebinding shows
+            // up, but it is only adopted once it answers a path challenge,
+            // so a spoofed or replayed datagram can't redirect the ACKs.
             if (rx.on_receive(c.seq, c.send_time, now_ns()) == ReceiveResult::Accepted) {
-                peer = c.src;
-                have_peer = true;
+                if (!(c.src == peer)) probe_path(c.src);
                 // A retransmission arriving after we NACK'd measures one RTT
                 // on the receiver's own clock (no cross-host comparison).
                 if ((c.flags & kFlagRetransmission) && nack_sent_ns != 0) {
@@ -1149,12 +1203,10 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
                     res->started.store(true, std::memory_order_release);
                 } else if (ss.nonce == peer_nonce && ctl_authentic(auth.get(), dg, dlen)) {
                     // A retried StreamStart (our Ack or resume answer was
-                    // lost) carrying the same nonce we already accepted —
-                    // safe to treat as this session even if it now arrives
-                    // from a different address (the sender's NAT mapping may
-                    // have rotated). Answer it again.
-                    peer = srcs[i];
-                    have_peer = true;
+                    // lost) carrying the same nonce we already accepted.
+                    // From a new address (the sender's NAT mapping may have
+                    // rotated) it is answered once that address is validated.
+                    if (!(srcs[i] == peer)) probe_path(srcs[i]);
                     send_resume_answer();
                 }
                 continue;
@@ -1182,6 +1234,20 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
                     // no key yet to check it against, so an unverifiable
                     // abort is ignored rather than letting anyone end us.
                     peer_aborted = true;
+                }
+                continue;
+            }
+            if (type == MsgType::PathChallenge || type == MsgType::PathResponse) {
+                PathProbe pp;
+                if (!have_start || !decode_path_probe(type, dg, dlen, &pp) ||
+                    pp.nonce != peer_nonce || !ctl_authentic(auth.get(), dg, dlen)) {
+                    continue;
+                }
+                if (type == MsgType::PathChallenge) {
+                    send_path_probe(sock, srcs[i], MsgType::PathResponse, lane, peer_nonce,
+                                    pp.challenge, auth.get());
+                } else if (path.validated(srcs[i], pp.challenge)) {
+                    peer = srcs[i];
                 }
                 continue;
             }
@@ -1369,6 +1435,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     // Signs every control datagram we send and verifies the receiver's
     // (v8). nullptr in plaintext mode.
     std::unique_ptr<ControlAuth> auth;
+    PathValidator path; // see recv_lane: migrations of `dst` are validated
     if (keys.enabled) {
         auth = std::make_unique<ControlAuth>();
         if (!auth->init(keys.key, lane, /*local_dir=*/0)) {
@@ -1686,12 +1753,17 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 Ack ack;
                 if (!decode_ack(ctl.data(), got, &ack)) continue;
                 if (ack.nonce != ss.nonce) continue; // not this session
-                // The Ack proved it holds this session's nonce, so its
-                // source is safe to trust even if it differs from `dst` —
-                // this is what lets a transfer survive the receiver's NAT
-                // mapping changing mid-flight, symmetric to the migration
-                // recv_lane does for the sender's address.
-                dst = src;
+                // An Ack for this session from a new source is how the
+                // receiver's NAT rebinding shows up. It is adopted only once
+                // that source answers a path challenge (symmetric to what
+                // recv_lane does for the sender's address).
+                if (!(src == dst)) {
+                    uint64_t challenge = 0;
+                    if (path.want_probe(src, now_ns(), &challenge)) {
+                        send_path_probe(sock, src, MsgType::PathChallenge, lane, ss.nonce,
+                                        challenge, auth.get());
+                    }
+                }
                 if (ack.base_seq_no > base) {
                     // Acks are unauthenticated even under PSK (only the
                     // nonce above is checked), so base_seq_no is untrusted
@@ -1750,6 +1822,15 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                     const size_t n =
                         encode_data_datagram(hdr, now_ns(), body, rtx.data(), rtx.size());
                     if (n && sock.send_to(rtx.data(), n, dst)) ++retransmits;
+                }
+            } else if (type == MsgType::PathChallenge || type == MsgType::PathResponse) {
+                PathProbe pp;
+                if (!decode_path_probe(type, ctl.data(), got, &pp) || pp.nonce != ss.nonce) continue;
+                if (type == MsgType::PathChallenge) {
+                    send_path_probe(sock, src, MsgType::PathResponse, lane, ss.nonce, pp.challenge,
+                                    auth.get());
+                } else if (path.validated(src, pp.challenge)) {
+                    dst = src;
                 }
             } else if (type == MsgType::StreamClose) {
                 StreamClose sc;
