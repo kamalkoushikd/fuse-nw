@@ -43,6 +43,19 @@ public:
         }
     }
 
+    // Slow start (ROADMAP #8), opt-in so existing users keep their exact
+    // behaviour. The window starts at `initial` and doubles every clean RTT
+    // epoch until the first loss (or the cap); the first loss sets the
+    // threshold to half the window and the controller continues in plain
+    // AIMD. Without it a window had to climb from max/8 by a few blocks per
+    // RTT, which takes many round trips on a long path.
+    void enable_slow_start(uint32_t initial) {
+        if (!enabled_) return;
+        slow_start_ = true;
+        window_ = initial < floor_ ? floor_ : (initial > max_window_ ? max_window_ : initial);
+    }
+    bool in_slow_start() const { return slow_start_; }
+
     bool enabled() const { return enabled_; }
     uint32_t window() const { return window_; }
     uint64_t rtt_ns() const { return srtt_ns_; }
@@ -121,6 +134,11 @@ public:
                 uint32_t halved = window_ / 2;
                 window_ = halved < floor_ ? floor_ : halved;
                 clean_streak_ = 0;
+                slow_start_ = false;
+            } else if (slow_start_) {
+                const uint32_t doubled = window_ * 2;
+                window_ = doubled > max_window_ ? max_window_ : doubled;
+                if (window_ == max_window_) slow_start_ = false;
             } else if (++clean_streak_ >= clean_windows_to_grow_) {
                 uint32_t grown = window_ + grow_step_;
                 window_ = grown > max_window_ ? max_window_ : grown;
@@ -145,6 +163,7 @@ private:
     unsigned backoff_ = 0;
     uint64_t window_start_ns_ = 0;
     bool loss_in_window_ = false;
+    bool slow_start_ = false;
 };
 
 } // namespace fuse::proto
