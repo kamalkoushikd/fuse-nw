@@ -328,9 +328,8 @@ bool MuxSender::try_send_one(SenderStreamState &s) {
         return true;
     }
 
-    const uint64_t srtt = s.cc.rtt_ns();
-    const uint64_t rto_ns = srtt ? std::clamp<uint64_t>(srtt * 2, 5'000'000ull, 1'000'000'000ull)
-                                  : 1'000'000'000ull;
+    // RFC 6298 RTO with backoff, as in transfer.cpp (ROADMAP #23).
+    const uint64_t rto_ns = s.cc.rto_ns(5'000'000ull, 1'000'000'000ull, 1'000'000'000ull);
     if (s.tx_base < s.tx_next_seq && t > s.last_progress_ns + rto_ns) {
         const RegistrySlot *slot = s.reg.lookup(s.tx_base);
         if (slot != nullptr) {
@@ -344,7 +343,7 @@ bool MuxSender::try_send_one(SenderStreamState &s) {
             const size_t n = encode_data_datagram(hdr, now_ns(), slot->payload, dgram, sizeof(dgram));
             if (n && sock_.send_to(dgram, n, dst_)) {
                 ++s.retransmit_count;
-                s.cc.on_loss();
+                s.cc.on_timeout();
             }
         }
         s.last_progress_ns = t; // pacing clock: don't retry every call while waiting out the RTO
@@ -400,6 +399,7 @@ void MuxSender::dispatch_incoming(const uint8_t *dg, size_t dlen) {
             const uint64_t new_base = std::min(ack.base_seq_no, s.tx_next_seq);
             for (uint64_t seq = s.tx_base; seq < new_base; ++seq) s.reg.confirm(seq);
             s.tx_base = new_base;
+            s.cc.on_progress();
             const uint64_t t = now_ns();
             s.last_progress_ns = t;
             s.last_real_progress_ns.store(t, std::memory_order_release);
