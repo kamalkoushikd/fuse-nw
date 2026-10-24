@@ -1,7 +1,14 @@
 #include "fuse/proto/session_crypto.hpp"
 
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <new>
+
+#include <unistd.h>
+#if defined(__linux__)
+#include <sys/random.h>
+#endif
 
 #if FUSE_PROTO_WITH_DTLS
 #include <wolfssl/options.h>
@@ -15,6 +22,32 @@ namespace fuse::proto {
 
 bool session_crypto_available() {
     return FUSE_PROTO_WITH_DTLS != 0;
+}
+
+uint64_t secure_random_u64() {
+    uint8_t b[8] = {};
+    bool ok = random_bytes(b, sizeof(b));
+#if defined(__linux__)
+    for (size_t got = 0; !ok && got < sizeof(b);) {
+        const ssize_t n = ::getrandom(b + got, sizeof(b) - got, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        got += static_cast<size_t>(n);
+        ok = got == sizeof(b);
+    }
+#endif
+    if (!ok) {
+        // getentropy is available on Linux and macOS alike.
+        ok = ::getentropy(b, sizeof(b)) == 0;
+    }
+    if (!ok) {
+        // No secure source at all is not something a caller can recover
+        // from; a predictable nonce would silently weaken every session.
+        std::abort();
+    }
+    uint64_t v = 0;
+    for (uint8_t x : b) v = (v << 8) | x;
+    return v;
 }
 
 #if !FUSE_PROTO_WITH_DTLS
