@@ -29,18 +29,18 @@ FUSE_EXPORT void fuse_socket_close(fuse_socket *sock);
  * caller's own poll/epoll event loop. */
 FUSE_EXPORT int fuse_socket_fd(const fuse_socket *sock);
 
-FUSE_EXPORT fuse_status fuse_socket_set_nonblocking(fuse_socket *sock, int nonblocking);
+FUSE_EXPORT fuse_result fuse_socket_set_nonblocking(fuse_socket *sock, int nonblocking);
 
-FUSE_EXPORT fuse_status fuse_socket_send_to(fuse_socket *sock,
+FUSE_EXPORT fuse_result fuse_socket_send_to(fuse_socket *sock,
                                              const uint8_t *data, size_t len,
                                              const char *dst_addr, uint16_t dst_port);
 
 /* Receives at most one datagram into `buf`. On success, *out_len holds
  * the number of bytes received and, if src_addr/src_port are non-NULL,
- * they describe the sender. Returns FUSE_ERR_SOCKET on error; for a
+ * they describe the sender. Returns FUSE_RESULT_SOCKET on error; for a
  * non-blocking socket with no datagram pending, errno is left as
  * EAGAIN/EWOULDBLOCK for the caller to check. */
-FUSE_EXPORT fuse_status fuse_socket_recv_from(fuse_socket *sock,
+FUSE_EXPORT fuse_result fuse_socket_recv_from(fuse_socket *sock,
                                                uint8_t *buf, size_t buf_len, size_t *out_len,
                                                char *src_addr, size_t src_addr_len,
                                                uint16_t *src_port);

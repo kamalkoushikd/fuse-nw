@@ -14,6 +14,7 @@ add_executable(fuse_tests
     test_varint.cpp
     test_packet.cpp
     test_crypto.cpp
+    test_headers.cpp
 )
 
 target_link_libraries(fuse_tests PRIVATE fuse::fuse GTest::gtest_main)
