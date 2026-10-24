@@ -659,22 +659,22 @@ constexpr uint64_t kRouteRun = kWriteBatch;
 // Per-consumer scratch, reused for every batch.
 struct ConsumerState {
     explicit ConsumerState(uint16_t lanes) : ciphers(lanes), plain(kWriteBatch * kMaxPayloadSize) {}
-    std::vector<std::unique_ptr<LaneCipher>> ciphers; // this thread's own, per lane
+    std::vector<std::unique_ptr<LaneKeySchedule>> ciphers; // this thread's own, per lane
     std::vector<uint8_t> plain;                       // decrypted blocks of one batch
     iovec iov[kWriteBatch];
 };
 
-// This thread's cipher for `lane`, created on first use (LaneCipher is
-// thread-confined, so each consumer keeps its own). nullptr if the lane's
-// key isn't available.
-LaneCipher *cipher_for(RxPipeline &p, ConsumerState &cs, uint16_t lane) {
+// This thread's cipher for block `seq` of `lane`, created on first use
+// (ciphers are thread-confined, so each consumer keeps its own key schedule
+// per lane). nullptr if the lane's key isn't available.
+const LaneCipher *cipher_for(RxPipeline &p, ConsumerState &cs, uint16_t lane, uint64_t seq) {
     if (!cs.ciphers[lane]) {
         if (!p.keys[lane].ready.load(std::memory_order_acquire)) return nullptr;
-        auto c = std::make_unique<LaneCipher>();
-        if (!c->init(p.keys[lane].key)) return nullptr;
+        auto c = std::make_unique<LaneKeySchedule>();
+        if (!c->init(p.keys[lane].key, lane)) return nullptr;
         cs.ciphers[lane] = std::move(c);
     }
-    return cs.ciphers[lane].get();
+    return cs.ciphers[lane]->cipher_for(seq);
 }
 
 // Processes up to one batch from a channel: authenticate/decrypt each block,
@@ -716,7 +716,7 @@ bool drain_channel(RxPipeline &p, ConsumerState &cs, Channel &ch, bool want_cryp
             // `flags` rides in the AAD (not just lane/seq/offset) so
             // LastBlock can't be flipped on an otherwise-authentic block to
             // end the lane early.
-            LaneCipher *cipher = cipher_for(p, cs, ch.lane);
+            const LaneCipher *cipher = cipher_for(p, cs, ch.lane, hdr.seq_no);
             uint8_t aad[19];
             const size_t al = build_aad(aad, ch.lane, hdr.seq_no, hdr.offset, hdr.flags);
             uint8_t *out = cs.plain.data() + i * kMaxPayloadSize;
@@ -1242,9 +1242,15 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     SenderRegistry reg(lane, kWindow);
     CongestionController cc(kWindow, true, 1, 16);
 
-    LaneCipher cipher;
+    LaneKeySchedule cipher;
     std::vector<uint8_t> sealed(kMaxPayloadSize + kAeadTagLen);
-    if (keys.enabled && !cipher.init(keys.key)) {
+    // Seals block `seq` under the key of its epoch (see kKeyEpochShift).
+    const auto seal = [&](uint64_t seq, const uint8_t *aad, size_t aad_len, const uint8_t *pt,
+                          uint16_t len, uint8_t *out) {
+        const LaneCipher *c = cipher.cipher_for(seq);
+        return c != nullptr && c->seal(lane, seq, aad, aad_len, pt, len, out);
+    };
+    if (keys.enabled && !cipher.init(keys.key, lane)) {
         res->status.store(static_cast<int>(TransferStatus::Unsupported));
         return;
     }
@@ -1478,7 +1484,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 if (keys.enabled) {
                     uint8_t aad[19];
                     const size_t al = build_aad(aad, lane, next_seq, next_offset, hdr.flags);
-                    if (!cipher.seal(lane, next_seq, aad, al, data + next_offset, len,
+                    if (!seal(next_seq, aad, al, data + next_offset, len,
                                      sealed.data())) {
                         break; // fail closed rather than emit plaintext
                     }
@@ -1583,7 +1589,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                     if (keys.enabled) {
                         uint8_t aad[19];
                         const size_t al = build_aad(aad, lane, seq, hdr.offset, hdr.flags);
-                        if (!cipher.seal(lane, seq, aad, al, sl->payload, sl->payload_len,
+                        if (!seal(seq, aad, al, sl->payload, sl->payload_len,
                                          sealed.data())) {
                             continue;
                         }
@@ -1639,7 +1645,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 if (keys.enabled) {
                     uint8_t aad[19];
                     const size_t al = build_aad(aad, lane, base, hdr.offset, hdr.flags);
-                    if (cipher.seal(lane, base, aad, al, sl->payload, sl->payload_len,
+                    if (seal(base, aad, al, sl->payload, sl->payload_len,
                                     sealed.data())) {
                         body = sealed.data();
                         hdr.payload_len = static_cast<uint16_t>(sl->payload_len + kAeadTagLen);
