@@ -6,6 +6,23 @@
 
 namespace fuse::proto {
 
+bool setup_payload_valid(const SetupPayload &p) {
+    if (p.protocol_version != kProtocolVersion || p.num_streams > kMaxStreams) {
+        return false;
+    }
+    for (uint16_t i = 0; i < p.num_streams; ++i) {
+        const StreamConfig &s = p.streams[i];
+        if (s.block_size == 0 || s.block_size > kMaxPayloadSize || s.window_size == 0 ||
+            s.window_size > kMaxWindow) {
+            return false;
+        }
+        for (uint16_t j = 0; j < i; ++j) {
+            if (p.streams[j].stream_id == s.stream_id) return false; // duplicate id
+        }
+    }
+    return true;
+}
+
 size_t serialize_setup_payload(const SetupPayload &p, uint8_t *out, size_t out_cap) {
     if (p.num_streams > kMaxStreams || p.ext_len > kMaxExtensionBytes) {
         return 0;
@@ -212,8 +229,9 @@ size_t SetupResponder::on_datagram(const uint8_t *in, size_t in_len, uint8_t *ou
         const uint8_t *body = nullptr;
         size_t body_len = 0;
         SetupPayload decoded;
-        if (!decode_setup_data(in, in_len, &decoded, &body, &body_len)) {
-            return 0; // malformed; ignore and let the initiator resend
+        if (!decode_setup_data(in, in_len, &decoded, &body, &body_len) ||
+            !setup_payload_valid(decoded)) {
+            return 0; // malformed or unusable; never confirm it
         }
         const uint64_t h = hash64(body, body_len); // hash exactly what arrived
         // A fresh nonce per configuration offered; a duplicate DATA (the
