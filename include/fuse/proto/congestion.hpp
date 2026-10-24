@@ -102,6 +102,17 @@ public:
         if (backoff_ < kMaxBackoff) ++backoff_;
     }
 
+    // Pacing (ROADMAP #22): how long to wait after sending `bytes` so that,
+    // on average, a window of `window_bytes` is spread over one SRTT rather
+    // than leaving in one line-rate burst. Paced at 1.25x the window rate
+    // (as is usual) so pacing itself never becomes the bottleneck. 0 before
+    // any RTT sample.
+    uint64_t pacing_interval_ns(uint64_t bytes, uint64_t window_bytes) const {
+        if (srtt_ns_ == 0 || window_bytes == 0) return 0;
+        const long double ns = static_cast<long double>(bytes) * srtt_ns_ * 4 / 5 / window_bytes;
+        return static_cast<uint64_t>(ns);
+    }
+
     // The peer acknowledged something new: the path works, reset backoff.
     void on_progress() { backoff_ = 0; }
     unsigned backoff() const { return backoff_; }

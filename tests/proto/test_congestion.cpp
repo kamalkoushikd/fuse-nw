@@ -185,3 +185,13 @@ TEST(Congestion, SlowStartDoublesUntilFirstLoss) {
     EXPECT_EQ(capped.window(), 100u);
     EXPECT_FALSE(capped.in_slow_start());
 }
+
+// ROADMAP #22: pacing spreads a window over (4/5 of) one SRTT.
+TEST(Congestion, PacingSpreadsTheWindowOverAnRtt) {
+    CongestionController cc(1024);
+    EXPECT_EQ(cc.pacing_interval_ns(60000, 1200000), 0u) << "no pacing before an RTT sample";
+    cc.on_rtt_sample(10'000'000); // 10 ms
+    // A 60 KB batch of a 1.2 MB window is 1/20 of the window: 1/20 of 8 ms.
+    EXPECT_EQ(cc.pacing_interval_ns(60000, 1200000), 400'000u);
+    EXPECT_EQ(cc.pacing_interval_ns(1200000, 1200000), 8'000'000u);
+}

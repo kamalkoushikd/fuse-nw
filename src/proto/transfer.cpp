@@ -1641,6 +1641,8 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     // size let one window grow up to 13x in bytes as blocks grew.
     const uint64_t base_block = block;
     uint64_t sent_bytes = 0; // new payload bytes sent (not retransmissions)
+    // Pacing (ROADMAP #22): earliest time the next batch of new data may go.
+    uint64_t next_batch_ns = 0;
 
     uint32_t clean_batches = 0;
     uint64_t base = 0, next_seq = 0, retransmits = 0;
@@ -1727,12 +1729,16 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
         // Two limits: the registry holds at most kWindow blocks, and the
         // bytes in flight stay within the congestion window.
         if ((ri < ranges.size() || need_empty_last) && next_seq < base + kWindow &&
-            inflight < window_bytes) {
+            inflight < window_bytes && now_ns() >= next_batch_ns) {
             const uint16_t seg = static_cast<uint16_t>(kDataPrefixSize + block +
                                                        (keys.enabled ? kAeadTagLen : 0));
             const uint64_t byte_room = (window_bytes - inflight + block - 1) / block;
+            // On a path with real RTT, smaller bursts: a 64-datagram GSO
+            // batch at line rate is what overflows shallow router buffers.
+            const uint64_t burst_cap = cc.rtt_ns() > 1'000'000ull ? 16 : kMaxGsoSegments;
             const size_t max_segs = static_cast<size_t>(std::min<uint64_t>(
-                {kGsoBudget / seg, kWindow - (next_seq - base), byte_room, kMaxGsoSegments}));
+                {kGsoBudget / seg, kWindow - (next_seq - base), byte_room, burst_cap}));
+            const uint64_t sent_before = sent_bytes;
             size_t packed = 0, bytes_in_batch = 0;
 
             while (packed < max_segs && (ri < ranges.size() || need_empty_last)) {
@@ -1784,6 +1790,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
 
             if (packed > 0) {
                 did_work = true;
+                next_batch_ns = now_ns() + cc.pacing_interval_ns(sent_bytes - sent_before, window_bytes);
                 if (packed == 1 ||
                     !sock.send_segmented(staging.data(), bytes_in_batch, seg, dst)) {
                     size_t off = 0;
