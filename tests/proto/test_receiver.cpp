@@ -1,5 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <set>
+#include <string>
+#include <vector>
+
 #include "fuse/proto/receiver.hpp"
 
 using namespace fuse::proto;
@@ -117,4 +122,64 @@ TEST(Receiver, MultipleGapsAllNacked) {
     EXPECT_EQ(nack.missing[0], 2u);
     EXPECT_EQ(nack.missing[1], 3u);
     EXPECT_EQ(nack.missing[2], 4u);
+}
+
+// ROADMAP #16: the ring-indexed receiver must behave exactly like the
+// straightforward model it replaced -- same base, same received set, same
+// ACK bitmask, same NACK list -- under heavy reordering and duplication.
+TEST(Receiver, RingMatchesReferenceModelUnderRandomReordering) {
+    for (uint16_t window : {uint16_t{1}, uint16_t{7}, uint16_t{64}, uint16_t{100}, kMaxWindow}) {
+        SCOPED_TRACE("window " + std::to_string(window));
+        ReceiverStream rx(1, window, true);
+        std::set<uint64_t> got;
+        uint64_t base = 0, highest = 0;
+        bool any = false;
+        uint64_t rng = 0x9E3779B97F4A7C15ull * (window + 1);
+        const auto next = [&] {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            return rng;
+        };
+        for (uint64_t now = 1; now < 20000; ++now) {
+            // Mostly near the front of the window, sometimes far ahead (out of
+            // window), sometimes behind (duplicates).
+            const uint64_t span = static_cast<uint64_t>(window) + window / 4 + 2;
+            const uint64_t seq = base + next() % span - (next() % 4 == 0 ? std::min<uint64_t>(base, 3) : 0);
+            const ReceiveResult r = rx.on_receive(seq, now * 10, now);
+            ReceiveResult want;
+            if (seq < base || got.count(seq)) {
+                want = ReceiveResult::Duplicate;
+            } else if (seq - base >= window) {
+                want = ReceiveResult::OutOfWindow;
+            } else {
+                want = ReceiveResult::Accepted;
+                got.insert(seq);
+                if (!any || seq > highest) highest = seq;
+                any = true;
+                while (got.count(base)) got.erase(base++);
+            }
+            ASSERT_EQ(static_cast<int>(r), static_cast<int>(want)) << "seq " << seq;
+            ASSERT_EQ(rx.base_seq_no(), base);
+
+            const Ack ack = rx.build_ack();
+            for (uint64_t rel = 0; rel < window; ++rel) {
+                const bool have = got.count(base + rel) != 0;
+                ASSERT_EQ(rx.is_received(rel), have);
+                ASSERT_EQ(((ack.received_bitmask[rel / 64] >> (rel % 64)) & 1) != 0, have);
+            }
+            if (now % 7 == 0) {
+                Nack nack;
+                rx.collect_nacks(now, 0, 0, &nack);
+                std::vector<uint64_t> want_missing;
+                if (any) {
+                    for (uint64_t s = base; s <= highest; ++s) {
+                        if (!got.count(s)) want_missing.push_back(s);
+                    }
+                }
+                ASSERT_EQ(std::vector<uint64_t>(nack.missing, nack.missing + nack.count),
+                          want_missing);
+            }
+        }
+    }
 }

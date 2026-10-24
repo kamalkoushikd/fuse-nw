@@ -2,28 +2,6 @@
 
 namespace fuse::proto {
 
-namespace {
-
-bool test_bit(const std::array<uint64_t, kMaskWords> &mask, uint64_t rel) {
-    return (mask[rel / 64] & (1ull << (rel % 64))) != 0;
-}
-
-void set_bit(std::array<uint64_t, kMaskWords> &mask, uint64_t rel) {
-    mask[rel / 64] |= (1ull << (rel % 64));
-}
-
-// Shifts the whole multi-word mask right by one bit (bit 0 of word i+1
-// becomes the new top bit of word i), matching what a single uint64 >>= 1
-// used to do before the window widened past 64.
-void shift_right_one(std::array<uint64_t, kMaskWords> &mask) {
-    for (size_t i = 0; i + 1 < kMaskWords; ++i) {
-        mask[i] = (mask[i] >> 1) | (mask[i + 1] << 63);
-    }
-    mask[kMaskWords - 1] >>= 1;
-}
-
-} // namespace
-
 ReceiverStream::ReceiverStream(uint16_t stream_id, uint16_t window_size, bool lossless)
     : stream_id_(stream_id), lossless_(lossless) {
     if (window_size < 1) {
@@ -34,28 +12,29 @@ ReceiverStream::ReceiverStream(uint16_t stream_id, uint16_t window_size, bool lo
     window_size_ = window_size;
 }
 
-bool ReceiverStream::is_expected(uint64_t rel) const {
-    if (!have_any_ || highest_received_ < base_seq_no_) {
-        return false;
-    }
-    uint64_t rel_high = highest_received_ - base_seq_no_;
-    return rel <= rel_high;
+uint64_t ReceiverStream::relative_word(size_t w) const {
+    const size_t start = slot(base_seq_no_ + 64 * static_cast<uint64_t>(w));
+    const size_t q = start / 64, r = start % 64;
+    uint64_t v = ring_[q] >> r;
+    if (r != 0) v |= ring_[(q + 1) % kMaskWords] << (64 - r);
+    // Ring positions past the window alias sequence numbers below the base
+    // (always clear) or beyond the window (never set), so no masking is
+    // needed for correctness; trim to the window anyway for a tidy ACK.
+    const uint64_t first = 64 * static_cast<uint64_t>(w);
+    if (first >= window_size_) return 0;
+    if (window_size_ - first < 64) v &= (1ull << (window_size_ - first)) - 1;
+    return v;
 }
 
 void ReceiverStream::slide_base_over_contiguous_prefix() {
-    // Advance base across every contiguously-received low bit. Each step
-    // shifts the received bitmask and the two gap-timing arrays down by
-    // one so index i keeps meaning "seq base_seq_no_ + i".
-    while (test_bit(received_mask_, 0)) {
-        shift_right_one(received_mask_);
-        base_seq_no_ += 1;
-
-        for (uint16_t i = 0; i + 1 < window_size_; ++i) {
-            first_missing_ns_[i] = first_missing_ns_[i + 1];
-            last_nack_ns_[i] = last_nack_ns_[i + 1];
-        }
-        first_missing_ns_[window_size_ - 1] = 0;
-        last_nack_ns_[window_size_ - 1] = 0;
+    // Each delivered position is cleared exactly once as the base passes it,
+    // which keeps the "below base is clear" invariant the ring relies on.
+    while (ring_test(base_seq_no_)) {
+        const size_t i = slot(base_seq_no_);
+        ring_[i / 64] &= ~(1ull << (i % 64));
+        first_missing_ns_[i] = 0;
+        last_nack_ns_[i] = 0;
+        ++base_seq_no_;
     }
 }
 
@@ -65,38 +44,34 @@ ReceiveResult ReceiverStream::on_receive(uint64_t seq_no, uint64_t send_time_ns,
     // NOT be anchored to whichever datagram happens to arrive first, since
     // that first arrival may be reordered ahead of lower seq_nos that are
     // still in flight. Anything below base has already been delivered.
-    // (A future stage can make the initial base configurable via SETUP.)
     if (seq_no < base_seq_no_) {
         return ReceiveResult::Duplicate;
     }
-
-    uint64_t rel = seq_no - base_seq_no_;
-    if (rel >= window_size_) {
+    if (seq_no - base_seq_no_ >= window_size_) {
         ++window_overflow_count_;
         return ReceiveResult::OutOfWindow;
     }
-
-    if (test_bit(received_mask_, rel)) {
+    if (ring_test(seq_no)) {
         return ReceiveResult::Duplicate;
     }
-    set_bit(received_mask_, rel);
+    const size_t i = slot(seq_no);
+    ring_[i / 64] |= 1ull << (i % 64);
 
     if (!have_any_ || seq_no > highest_received_) {
+        // Every position between the previous highest and this block is now
+        // a genuine gap (a higher block arrived without it). None of them
+        // can have arrived yet -- they are above the old highest -- and each
+        // is stamped exactly once, when it first becomes a gap.
+        uint64_t from = have_any_ ? highest_received_ + 1 : base_seq_no_;
+        if (from < base_seq_no_) from = base_seq_no_;
+        for (uint64_t gap = from; gap < seq_no; ++gap) {
+            uint64_t &first = first_missing_ns_[slot(gap)];
+            if (first == 0) first = now_ns;
+        }
         highest_received_ = seq_no;
         last_send_time_ = send_time_ns;
     }
     have_any_ = true;
-
-    // Any lower position still unset is now a genuine gap (a higher block
-    // arrived without it). Timestamp each newly-exposed gap once.
-    for (uint16_t gap_rel = 0; gap_rel < window_size_; ++gap_rel) {
-        if (!is_expected(gap_rel) || test_bit(received_mask_, gap_rel)) {
-            continue;
-        }
-        if (first_missing_ns_[gap_rel] == 0) {
-            first_missing_ns_[gap_rel] = now_ns;
-        }
-    }
 
     slide_base_over_contiguous_prefix();
     return ReceiveResult::Accepted;
@@ -106,8 +81,8 @@ Ack ReceiverStream::build_ack() const {
     Ack ack;
     ack.stream_id = stream_id_;
     ack.base_seq_no = base_seq_no_;
-    for (size_t i = 0; i < kMaskWords; ++i) {
-        ack.received_bitmask[i] = received_mask_[i];
+    for (size_t w = 0; w < kMaskWords; ++w) {
+        ack.received_bitmask[w] = relative_word(w);
     }
     ack.echoed_send_time = last_send_time_;
     return ack;
@@ -120,27 +95,34 @@ uint16_t ReceiverStream::collect_nacks(uint64_t now_ns, uint64_t reorder_delay_n
 
     // A loss-tolerant stream (LOSSLESS=0) never retransmits: gaps are an
     // acceptable drop, so no NACK is ever emitted for it.
-    if (!lossless_) {
+    if (!lossless_ || !have_any_ || highest_received_ < base_seq_no_) {
         return 0;
     }
 
-    for (uint16_t rel = 0; rel < window_size_; ++rel) {
-        if (!is_expected(rel) || test_bit(received_mask_, rel)) {
-            continue;
-        }
-
-        uint64_t first = first_missing_ns_[rel];
-        if (first == 0 || now_ns - first < reorder_delay_ns) {
-            continue; // still within reorder tolerance
-        }
-        uint64_t last = last_nack_ns_[rel];
-        if (last != 0 && now_ns - last < renack_interval_ns) {
-            continue; // rate-limit repeated NACKs of the same gap
-        }
-
-        if (out->count < kMaxWindow) {
-            out->missing[out->count++] = base_seq_no_ + static_cast<uint64_t>(rel);
-            last_nack_ns_[rel] = now_ns;
+    // Only positions up to the highest block seen can be missing. Walk the
+    // unset bits of that range a word at a time.
+    const uint64_t span = highest_received_ - base_seq_no_; // positions 0..span
+    for (size_t w = 0; w * 64 <= span && w < kMaskWords; ++w) {
+        uint64_t missing = ~relative_word(w);
+        const uint64_t first = 64 * static_cast<uint64_t>(w);
+        if (span - first < 63) missing &= (2ull << (span - first)) - 1;
+        while (missing != 0) {
+            const unsigned b = static_cast<unsigned>(__builtin_ctzll(missing));
+            missing &= missing - 1;
+            const uint64_t seq = base_seq_no_ + first + b;
+            const size_t i = slot(seq);
+            const uint64_t first_ns = first_missing_ns_[i];
+            if (first_ns == 0 || now_ns - first_ns < reorder_delay_ns) {
+                continue; // still within reorder tolerance
+            }
+            const uint64_t last = last_nack_ns_[i];
+            if (last != 0 && now_ns - last < renack_interval_ns) {
+                continue; // rate-limit repeated NACKs of the same gap
+            }
+            if (out->count < kMaxWindow) {
+                out->missing[out->count++] = seq;
+                last_nack_ns_[i] = now_ns;
+            }
         }
     }
     return out->count;

@@ -3,12 +3,16 @@
 
 // Stage 1.3 / 1.4 receiver-side tracking for one stream.
 //
-// State is a multi-word (kMaskWords x uint64) received-bitmask plus a base
-// sequence number: bit i of word i/64 set means (base_seq_no + i) has
-// arrived. Missing-block detection is one bitwise op per word — expected &
-// ~received — with set bits enumerated via __builtin_ctzll, so it stays
-// O(popcount) with no hashing and no allocation, just spread across
-// kMaskWords words instead of one.
+// State is a received-bitmask plus a base sequence number. The bitmask and
+// the per-position gap timers are *rings* indexed by seq % kMaxWindow, so
+// sliding the base clears one bit and two timers per delivered block
+// instead of shifting whole arrays, and a block only stamps the gaps it
+// newly exposes (positions between the previous highest and itself). Each
+// position is touched a constant number of times over its life, so
+// on_receive is O(1) amortised (ROADMAP #16). The relative view an ACK needs
+// (bit i = base_seq_no + i) is assembled from the ring word by word.
+// Missing-block detection is a bitwise op per word, with set bits
+// enumerated via __builtin_ctzll.
 //
 // A gap is not NACKed the instant it is noticed: a block that is merely
 // reordered (slightly late but still arriving) must not be mistaken for a
@@ -40,14 +44,13 @@ public:
     uint16_t stream_id() const { return stream_id_; }
     uint16_t window_size() const { return window_size_; }
     uint64_t base_seq_no() const { return base_seq_no_; }
-    // Word 0 of the received-set (positions base_seq_no()..+63) — enough for
-    // any window_size <= 64, which covers every existing caller/test; use
+    // Word 0 of the received-set relative to the base (positions
+    // base_seq_no()..+63) — enough for any window_size <= 64; use
     // is_received() for positions in wider windows.
-    uint64_t received_bitmask() const { return received_mask_[0]; }
-    // Bit `rel` (0-based, relative to base_seq_no()) lives in word rel/64,
-    // bit rel%64 of that word.
+    uint64_t received_bitmask() const { return relative_word(0); }
+    // Whether base_seq_no() + rel has arrived.
     bool is_received(uint64_t rel) const {
-        return rel < kMaxWindow && (received_mask_[rel / 64] & (1ull << (rel % 64))) != 0;
+        return rel < window_size_ && ring_test(base_seq_no_ + rel);
     }
     uint64_t window_overflow_count() const { return window_overflow_count_; }
 
@@ -66,9 +69,12 @@ public:
                            uint64_t renack_interval_ns, Nack *out);
 
 private:
-    // True iff relative position `rel` should have arrived by now (at or
-    // below the highest block seen).
-    bool is_expected(uint64_t rel) const;
+    static size_t slot(uint64_t seq) { return static_cast<size_t>(seq % kMaxWindow); }
+    bool ring_test(uint64_t seq) const {
+        return (ring_[slot(seq) / 64] & (1ull << (slot(seq) % 64))) != 0;
+    }
+    // 64 bits of the received-set starting at base_seq_no() + 64 * w.
+    uint64_t relative_word(size_t w) const;
 
     void slide_base_over_contiguous_prefix();
 
@@ -77,14 +83,17 @@ private:
     bool     lossless_;
 
     uint64_t base_seq_no_ = 0;
-    std::array<uint64_t, kMaskWords> received_mask_{};
+    // Ring of received bits, bit seq % kMaxWindow. Bits of sequence numbers
+    // below the base are always clear, so a bit belongs to exactly one seq
+    // in [base, base + window).
+    std::array<uint64_t, kMaskWords> ring_{};
     uint64_t highest_received_ = 0;
     bool     have_any_ = false;
 
     uint64_t last_send_time_ = 0;        // send_time of the highest block seen
     uint64_t window_overflow_count_ = 0; // metric: blocks dropped as untrackable
 
-    // Per-relative-position gap timing (index i tracks seq base_seq_no_+i).
+    // Per-position gap timing, indexed by seq % kMaxWindow like the ring.
     std::array<uint64_t, kMaxWindow> first_missing_ns_{};
     std::array<uint64_t, kMaxWindow> last_nack_ns_{};
 };
