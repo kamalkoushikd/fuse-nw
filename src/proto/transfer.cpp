@@ -1431,6 +1431,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
 
     SenderRegistry reg(lane, kWindow);
     CongestionController cc(kWindow, true, 1, 16);
+    cc.enable_slow_start(32); // ROADMAP #8: reach the path's rate in a few RTTs
 
     LaneKeySchedule cipher;
     std::vector<uint8_t> sealed(kMaxPayloadSize + kAeadTagLen);
@@ -1634,6 +1635,12 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     const uint16_t block_ceiling =
         keys.enabled ? static_cast<uint16_t>(kMaxPayloadSize - kAeadTagLen) : kMaxPayloadSize;
     uint16_t block = std::min<uint16_t>(cfg.block_size, block_ceiling);
+    // The congestion window counts blocks of this, the configured size: the
+    // bytes in flight are limited to window x base_block whatever size
+    // blocks have grown to (ROADMAP #8). Counting blocks of the current
+    // size let one window grow up to 13x in bytes as blocks grew.
+    const uint64_t base_block = block;
+    uint64_t sent_bytes = 0; // new payload bytes sent (not retransmissions)
 
     uint32_t clean_batches = 0;
     uint64_t base = 0, next_seq = 0, retransmits = 0;
@@ -1707,6 +1714,8 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
         }
         cc.poll(now_ns());
         const uint64_t window = std::min<uint64_t>(kWindow, std::max<uint32_t>(4, cc.window()));
+        const uint64_t window_bytes = window * base_block;
+        const uint64_t inflight = sent_bytes - acked_bytes;
         bool did_work = false;
 
         // Nothing to send (an empty send_buffer call, an uneven split
@@ -1715,11 +1724,15 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
         // empty block carrying LastBlock. Without it `sent_last` is never
         // set and the lane spins until timeout instead of completing.
         const bool need_empty_last = (ranges.empty() && next_seq == 0);
-        if ((ri < ranges.size() || need_empty_last) && next_seq < base + window) {
+        // Two limits: the registry holds at most kWindow blocks, and the
+        // bytes in flight stay within the congestion window.
+        if ((ri < ranges.size() || need_empty_last) && next_seq < base + kWindow &&
+            inflight < window_bytes) {
             const uint16_t seg = static_cast<uint16_t>(kDataPrefixSize + block +
                                                        (keys.enabled ? kAeadTagLen : 0));
-            const size_t max_segs = std::min<size_t>(
-                {kGsoBudget / seg, window - (next_seq - base), kMaxGsoSegments});
+            const uint64_t byte_room = (window_bytes - inflight + block - 1) / block;
+            const size_t max_segs = static_cast<size_t>(std::min<uint64_t>(
+                {kGsoBudget / seg, kWindow - (next_seq - base), byte_room, kMaxGsoSegments}));
             size_t packed = 0, bytes_in_batch = 0;
 
             while (packed < max_segs && (ri < ranges.size() || need_empty_last)) {
@@ -1760,6 +1773,7 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 ++packed;
                 ++next_seq;
                 next_offset += len;
+                sent_bytes += len;
                 if (ri < ranges.size() && next_offset >= range_end) {
                     // This range is done; the next one starts elsewhere.
                     if (++ri < ranges.size()) next_offset = ranges[ri].offset;

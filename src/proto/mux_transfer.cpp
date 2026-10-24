@@ -137,7 +137,9 @@ struct SenderStreamState {
           window_size(wsize),
           reg(id, wsize),
           cc(wsize, /*enabled=*/true, 1, 16),
-          retransmit_backlog(wsize, /*coalesce=*/false) {}
+          retransmit_backlog(wsize, /*coalesce=*/false) {
+        cc.enable_slow_start(16); // ROADMAP #8 (blocks are fixed-size here)
+    }
 };
 
 struct ReceiverStreamState {

@@ -152,3 +152,36 @@ TEST(Congestion, RtoFollowsRfc6298AndBacksOff) {
     EXPECT_EQ(cc.rto_ns(5'000'000, 1'000'000'000, 1'000'000'000), jittery);
     EXPECT_EQ(cc.rto_ns(5'000'000, 20'000'000, 1'000'000'000), 20'000'000u) << "capped at max";
 }
+
+// ROADMAP #8: opt-in slow start doubles per clean RTT until the first loss,
+// then continues as AIMD from half the window.
+TEST(Congestion, SlowStartDoublesUntilFirstLoss) {
+    CongestionController cc(1024, true, 1, 16);
+    cc.enable_slow_start(16);
+    EXPECT_EQ(cc.window(), 16u);
+    cc.on_rtt_sample(1000);
+    uint64_t t = 1;
+    cc.poll(t);
+    for (uint32_t want : {32u, 64u, 128u}) {
+        t += 1000;
+        cc.poll(t);
+        EXPECT_EQ(cc.window(), want);
+    }
+    EXPECT_TRUE(cc.in_slow_start());
+    cc.on_loss();
+    t += 1000;
+    cc.poll(t);
+    EXPECT_EQ(cc.window(), 64u);
+    EXPECT_FALSE(cc.in_slow_start());
+    t += 1000;
+    cc.poll(t);
+    EXPECT_EQ(cc.window(), 80u) << "additive increase after the first loss";
+
+    CongestionController capped(100, true, 1, 16);
+    capped.enable_slow_start(64);
+    capped.on_rtt_sample(1000);
+    capped.poll(1);
+    capped.poll(1001);
+    EXPECT_EQ(capped.window(), 100u);
+    EXPECT_FALSE(capped.in_slow_start());
+}
