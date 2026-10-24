@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <vector>
 
 #include <unistd.h>
 #if defined(__linux__)
@@ -106,16 +107,19 @@ bool derive_session_key(const uint8_t *psk, size_t psk_len, const uint8_t *salt,
         return false;
     }
     // wc_Tls13_HKDF_Extract wants a mutable ikm; copy rather than cast away
-    // the caller's const.
-    uint8_t ikm[256];
-    if (psk_len > sizeof(ikm)) {
+    // the caller's const. Sized to the key, so a PSK of any length works (a
+    // fixed 256-byte buffer used to reject longer keys as "Unsupported").
+    if (psk_len > UINT32_MAX || salt_len > UINT32_MAX) {
         return false;
     }
-    std::memcpy(ikm, psk, psk_len);
+    std::vector<uint8_t> ikm(psk, psk + psk_len);
 
     uint8_t prk[WC_SHA256_DIGEST_SIZE];
-    if (wc_Tls13_HKDF_Extract(prk, salt, static_cast<word32>(salt_len), ikm,
-                              static_cast<word32>(psk_len), WC_SHA256) != 0) {
+    const bool extracted = wc_Tls13_HKDF_Extract(prk, salt, static_cast<word32>(salt_len),
+                                                 ikm.data(), static_cast<word32>(psk_len),
+                                                 WC_SHA256) == 0;
+    wc_ForceZero(ikm.data(), ikm.size());
+    if (!extracted) {
         return false;
     }
 
