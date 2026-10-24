@@ -46,6 +46,13 @@ bool session_crypto_available();
 // back to a predictable salt.
 bool random_bytes(uint8_t *out, size_t len);
 
+// An unpredictable 64-bit value for protocol nonces and tokens (StreamStart
+// nonces, path challenges, address-validation secrets). Available in every
+// build: it uses the crypto backend's RNG when there is one and the
+// kernel's getrandom() otherwise. Never a seeded PRNG, whose future outputs
+// can be predicted from a few observed ones.
+uint64_t secure_random_u64();
+
 // Derives the session key from a pre-shared key and salt material (HKDF).
 // Both endpoints must pass byte-identical salt and get the same key. `salt`
 // need not be a single kSessionSaltLen buffer: a caller that wants the key

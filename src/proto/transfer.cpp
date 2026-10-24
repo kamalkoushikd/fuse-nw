@@ -16,7 +16,6 @@
 #include <limits>
 #include <memory>
 #include <new>
-#include <random>
 #include <stdexcept>
 #include <thread>
 
@@ -67,15 +66,14 @@ void set_timeout_us(int fd, long us) {
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 }
 
-// Associated data binds a block to its identity so a valid block cannot be
-// replayed at another position.
 // Handshake anti-replay nonce for StreamStart (kept independent of the
 // crypto backend: this guards session identity, not confidentiality, so it
-// must work in unencrypted transfers too).
-uint64_t random_nonce() {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    return rng();
-}
+// must work in unencrypted transfers too). It is the only session check on
+// several control messages, so it must not be predictable from earlier ones.
+uint64_t random_nonce() { return secure_random_u64(); }
+
+// Associated data binds a block to its identity so a valid block cannot be
+// replayed at another position.
 
 // The retransmission bit is deliberately left out. A retransmit re-seals the
 // same plaintext under the same (key, nonce); if the AAD differed between
