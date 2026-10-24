@@ -69,6 +69,10 @@ struct StreamStart {
     // larger than a Retry) for a StreamStart whose token proves the sender
     // receives at its source address.
     uint64_t token = 0;
+    // v8: extension area (see wire.hpp). Decoding refuses a StreamStart
+    // whose area is malformed or holds a critical type it doesn't know.
+    uint16_t ext_len = 0;
+    uint8_t  ext[kMaxExtensionBytes] = {};
 };
 
 // v8 address validation: the receiver's answer to a StreamStart without a

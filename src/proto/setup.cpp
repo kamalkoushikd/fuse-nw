@@ -7,10 +7,10 @@
 namespace fuse::proto {
 
 size_t serialize_setup_payload(const SetupPayload &p, uint8_t *out, size_t out_cap) {
-    if (p.num_streams > kMaxStreams) {
+    if (p.num_streams > kMaxStreams || p.ext_len > kMaxExtensionBytes) {
         return 0;
     }
-    const size_t total = 1 + 2 + 2 + static_cast<size_t>(p.num_streams) * 9;
+    const size_t total = 1 + 2 + 2 + static_cast<size_t>(p.num_streams) * 9 + 2 + p.ext_len;
     if (out_cap < total) {
         return 0;
     }
@@ -27,7 +27,9 @@ size_t serialize_setup_payload(const SetupPayload &p, uint8_t *out, size_t out_c
         off += put_u16(out + off, s.block_size);
         off += put_u16(out + off, s.window_size);
     }
-    return off;
+    off += put_u16(out + off, p.ext_len);
+    for (uint16_t i = 0; i < p.ext_len; ++i) out[off + i] = p.ext[i];
+    return off + p.ext_len;
 }
 
 size_t encode_setup_data(const SetupPayload &p, uint8_t *out, size_t out_cap) {
@@ -70,8 +72,8 @@ bool decode_setup_data(const uint8_t *in, size_t in_len, SetupPayload *p,
     if (p->num_streams > kMaxStreams) {
         return false;
     }
-    const size_t expected = 1 + 2 + 2 + static_cast<size_t>(p->num_streams) * 9;
-    if (body_len != expected) {
+    const size_t fixed = 1 + 2 + 2 + static_cast<size_t>(p->num_streams) * 9;
+    if (body_len < fixed + 2) {
         return false;
     }
 
@@ -83,6 +85,12 @@ bool decode_setup_data(const uint8_t *in, size_t in_len, SetupPayload *p,
         off += get_u16(body + off, &s.block_size);
         off += get_u16(body + off, &s.window_size);
     }
+    off += get_u16(body + off, &p->ext_len);
+    if (p->ext_len > kMaxExtensionBytes || body_len != fixed + 2 + p->ext_len ||
+        !extensions_acceptable(body + off, p->ext_len)) {
+        return false;
+    }
+    for (uint16_t i = 0; i < p->ext_len; ++i) p->ext[i] = body[off + i];
 
     if (raw_body) *raw_body = body;
     if (raw_body_len) *raw_body_len = body_len;

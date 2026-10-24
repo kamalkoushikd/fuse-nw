@@ -351,3 +351,21 @@ TEST(Setup, CompletesOverRealUdpLoopback) {
     ASSERT_TRUE(resp.has_config());
     EXPECT_TRUE(resp.config() == payload);
 }
+
+// ROADMAP #24: SETUP carries an extension area too, covered by the hash.
+TEST(Setup, ExtensionsRoundTripAndCriticalOnesAreRefused) {
+    SetupPayload p = sample_payload();
+    const uint8_t v[2] = {9, 9};
+    p.ext_len = static_cast<uint16_t>(append_extension(p.ext, sizeof(p.ext), 0, 0x0042, v, 2));
+    uint8_t buf[kMaxSetupDatagramSize];
+    size_t n = encode_setup_data(p, buf, sizeof(buf));
+    ASSERT_GT(n, 0u);
+    SetupPayload back;
+    ASSERT_TRUE(decode_setup_data(buf, n, &back, nullptr, nullptr));
+    EXPECT_TRUE(back == p);
+
+    p.ext_len = static_cast<uint16_t>(
+        append_extension(p.ext, sizeof(p.ext), 0, kExtensionCritical | 0x0042, v, 2));
+    n = encode_setup_data(p, buf, sizeof(buf));
+    EXPECT_FALSE(decode_setup_data(buf, n, &back, nullptr, nullptr));
+}

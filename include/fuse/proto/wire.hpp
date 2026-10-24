@@ -128,6 +128,38 @@ inline constexpr size_t kSendTimeSize    = 8;                 // send_time_ns ca
 inline constexpr size_t kDataPrefixSize  = kOuterHeaderSize + kBlockHeaderSize + kSendTimeSize; // = 31
 inline constexpr size_t kMaxDatagramSize = kDataPrefixSize + kMaxPayloadSize;
 
+// --- Extensions (v8, ROADMAP #24) ----------------------------------------
+//
+// Every field change used to need a kProtocolVersion bump, which breaks
+// interop outright. StreamStart and SETUP_DATA now end in an extension area
+//
+//     [ext_len:2][ type:2 len:2 value:len ]*
+//
+// that later versions can add optional fields to without a version bump.
+// Rules: a receiver ignores extension types it does not know, except
+// *critical* ones (top bit set, type >= 0x8000), which it must refuse the
+// whole message for. This version defines no extension types.
+inline constexpr size_t   kMaxExtensionBytes = 256;
+inline constexpr uint16_t kExtensionCritical = 0x8000;
+
+struct Extension {
+    uint16_t type = 0;
+    uint16_t len = 0;
+    const uint8_t *value = nullptr;
+};
+
+// Iterates an extension area: returns true and fills *ext with the entry at
+// *off (advancing it), false at the end or on a malformed entry.
+inline bool next_extension(const uint8_t *area, size_t area_len, size_t *off, Extension *ext);
+
+// Appends one entry. Returns the new used length, or 0 if it doesn't fit.
+inline size_t append_extension(uint8_t *area, size_t cap, size_t used, uint16_t type,
+                               const uint8_t *value, uint16_t len);
+
+// True if the area is well formed and holds no critical type this version
+// doesn't understand (which is every critical type, for now).
+inline bool extensions_acceptable(const uint8_t *area, size_t area_len);
+
 // --- Big-endian fixed-width encode/decode -------------------------------
 //
 // These are the only functions permitted to touch raw wire bytes; every
@@ -170,6 +202,35 @@ inline size_t get_u64(const uint8_t *p, uint64_t *v) {
     }
     *v = out;
     return 8;
+}
+
+inline bool next_extension(const uint8_t *area, size_t area_len, size_t *off, Extension *ext) {
+    if (*off + 4 > area_len) return false;
+    get_u16(area + *off, &ext->type);
+    get_u16(area + *off + 2, &ext->len);
+    if (ext->len > area_len - *off - 4) return false;
+    ext->value = area + *off + 4;
+    *off += 4 + ext->len;
+    return true;
+}
+
+inline size_t append_extension(uint8_t *area, size_t cap, size_t used, uint16_t type,
+                               const uint8_t *value, uint16_t len) {
+    if (used > cap || cap - used < 4u + len) return 0;
+    put_u16(area + used, type);
+    put_u16(area + used + 2, len);
+    for (uint16_t i = 0; i < len; ++i) area[used + 4 + i] = value[i];
+    return used + 4 + len;
+}
+
+inline bool extensions_acceptable(const uint8_t *area, size_t area_len) {
+    size_t off = 0;
+    Extension ext;
+    while (off < area_len) {
+        if (!next_extension(area, area_len, &off, &ext)) return false; // malformed
+        if (ext.type & kExtensionCritical) return false;               // not understood
+    }
+    return true;
 }
 
 } // namespace fuse::proto

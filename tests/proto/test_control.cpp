@@ -251,3 +251,35 @@ TEST(Aux, RetryAndPathProbesRoundTrip) {
     }
     EXPECT_EQ(encode_path_probe(MsgType::Ack, pp, buf, sizeof(buf)), 0u);
 }
+
+// ROADMAP #24: StreamStart can carry optional extensions. Unknown ones are
+// skipped; an unknown *critical* one (top bit) makes the message invalid;
+// a malformed area is rejected.
+TEST(Aux, StreamStartExtensions) {
+    uint8_t buf[512];
+    StreamStart ss;
+    ss.nonce = 42;
+    const uint8_t v[3] = {1, 2, 3};
+    ss.ext_len = static_cast<uint16_t>(append_extension(ss.ext, sizeof(ss.ext), 0, 0x0007, v, 3));
+    ASSERT_EQ(ss.ext_len, 7u);
+    size_t n = encode_stream_start(ss, buf, sizeof(buf));
+    ASSERT_GT(n, 0u);
+    StreamStart back;
+    ASSERT_TRUE(decode_stream_start(buf, n, &back)) << "an unknown extension is ignored";
+    EXPECT_EQ(back.nonce, 42u);
+    size_t off = 0;
+    Extension e;
+    ASSERT_TRUE(next_extension(back.ext, back.ext_len, &off, &e));
+    EXPECT_EQ(e.type, 0x0007);
+    EXPECT_EQ(e.len, 3);
+    EXPECT_EQ(e.value[2], 3);
+
+    ss.ext_len = static_cast<uint16_t>(
+        append_extension(ss.ext, sizeof(ss.ext), 0, kExtensionCritical | 1, v, 3));
+    n = encode_stream_start(ss, buf, sizeof(buf));
+    EXPECT_FALSE(decode_stream_start(buf, n, &back)) << "unknown critical extension accepted";
+
+    ss.ext_len = 3; // claims an entry it doesn't hold
+    n = encode_stream_start(ss, buf, sizeof(buf));
+    EXPECT_FALSE(decode_stream_start(buf, n, &back)) << "malformed extension area accepted";
+}
