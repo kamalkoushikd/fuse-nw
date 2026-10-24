@@ -4,13 +4,13 @@
 // Stage 1.1 block header and DATA-datagram framing.
 //
 // A "block" is one independently-addressed, independently-retransmittable
-// datagram. Its 13-byte header identifies the stream and the per-stream
-// monotonic sequence number the sender assigned it. The full DATA
-// datagram on the wire is:
+// datagram. Its 21-byte header identifies the stream, the per-stream
+// monotonic sequence number the sender assigned it, and the payload's byte
+// offset within the stream (v2). The full DATA datagram on the wire is:
 //
-//   [version:1][msg_type=Data:1]                 <- outer header (wire.hpp)
-//   [stream_id:2][seq_no:8][flags:1][payload_len:2]  <- block header (13B)
-//   [send_time_ns:8]                             <- for the ACK RTT echo
+//   [version:1][msg_type=Data:1]                              <- outer header (wire.hpp)
+//   [stream_id:2][seq_no:8][flags:1][payload_len:2][offset:8] <- block header (21B)
+//   [send_time_ns:8]                                          <- for the ACK RTT echo
 //   [payload: payload_len bytes]
 //
 // send_time_ns is not part of the formal block header, but is transmitted
