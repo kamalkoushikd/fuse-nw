@@ -72,8 +72,9 @@ int severity(TransferStatus s) {
         case TransferStatus::ResourceLimit: return 7;
         case TransferStatus::IoError: return 8;
         case TransferStatus::SocketError: return 9;
-        case TransferStatus::ConfigError: return 10;
-        case TransferStatus::Unsupported: return 10;
+        case TransferStatus::VersionMismatch: return 10;
+        case TransferStatus::ConfigError: return 11;
+        case TransferStatus::Unsupported: return 11;
     }
     return 0;
 }
@@ -218,6 +219,7 @@ private:
 
     uint64_t start_ns_ = 0;
     uint64_t end_ns_ = 0;
+    bool version_mismatch_ = false;
 };
 
 bool MuxSender::run_setup_handshake() {
@@ -244,7 +246,12 @@ bool MuxSender::run_setup_handshake() {
     while (!init_->is_matched() && !init_->is_failed()) {
         if (now_ns() > deadline) return false;
         size_t got = 0;
+        uint8_t peer_version = 0;
         if (sock_.recv_from(in, sizeof(in), &got, nullptr)) {
+            if (decode_version_mismatch(in, got, &peer_version)) {
+                version_mismatch_ = true; // ROADMAP #11: say so, don't time out
+                return false;
+            }
             n = init_->on_datagram(in, got, out, sizeof(out), now_ns());
         } else {
             n = init_->on_timeout(out, sizeof(out), now_ns());
@@ -472,7 +479,9 @@ TransferStatus MuxSender::run() {
     set_bufs(sock_.fd(), 32 << 20);
     set_timeout_us(sock_.fd(), 50000);
 
-    if (!run_setup_handshake()) return TransferStatus::Timeout;
+    if (!run_setup_handshake()) {
+        return version_mismatch_ ? TransferStatus::VersionMismatch : TransferStatus::Timeout;
+    }
 
     build_streams();
 
@@ -608,6 +617,7 @@ bool MuxReceiver::run_setup_handshake() {
     SetupResponder resp;
     uint8_t in[kMaxSetupDatagramSize];
     uint8_t out[kMaxSetupDatagramSize];
+    uint64_t last_version_reply_ns = 0;
 
     const uint64_t deadline = now_ns() + static_cast<uint64_t>(cfg_.timeout_ms) * 1000000ull;
     while (!resp.is_complete() && !resp.is_failed()) {
@@ -616,6 +626,17 @@ bool MuxReceiver::run_setup_handshake() {
         PeerAddr from;
         size_t n = 0;
         if (sock_.recv_from(in, sizeof(in), &got, &from)) {
+            if (is_foreign_version(in, got)) {
+                // Another protocol version: tell it, rate-limited, instead of
+                // leaving it to time out (ROADMAP #11).
+                const uint64_t t = now_ns();
+                if (t - last_version_reply_ns > 100'000'000ull) {
+                    last_version_reply_ns = t;
+                    const size_t vn = encode_version_mismatch(out, sizeof(out));
+                    if (vn) sock_.send_to(out, vn, from);
+                }
+                continue;
+            }
             if (!have_peer_) {
                 peer_ = from;
                 have_peer_ = true;

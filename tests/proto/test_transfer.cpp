@@ -1177,6 +1177,72 @@ TEST(Transfer, ForeignSourceCannotRedirectAcks) {
     EXPECT_GE(challenges, 1u);
 }
 
+// ROADMAP #11: a version mismatch is reported as such on both ends instead
+// of as a silent Timeout.
+TEST(Transfer, VersionMismatchIsReported) {
+    using namespace fuse::proto;
+    // Receiver side: a datagram from an older peer gets the mismatch reply.
+    {
+        const uint16_t port = next_port();
+        std::atomic<bool> cancel{false};
+        fuse::TransferConfig rx;
+        rx.bind_address = "127.0.0.1";
+        rx.base_port = port;
+        rx.lanes = 1;
+        rx.timeout_ms = 20000;
+        rx.cancel = &cancel;
+        std::vector<uint8_t> got;
+        std::thread receiver([&] { fuse::receive_buffer(rx, &got, nullptr); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        UdpSocket old_peer;
+        ASSERT_TRUE(old_peer.open("127.0.0.1", 0));
+        fakepeer::set_rcv_timeout_ms(old_peer, 1000);
+        PeerAddr dst;
+        ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", port, &dst));
+        uint8_t v7[70] = {7, static_cast<uint8_t>(MsgType::StreamStart)};
+        ASSERT_TRUE(old_peer.send_to(v7, sizeof(v7), dst));
+        uint8_t in[64];
+        size_t n = 0;
+        ASSERT_TRUE(old_peer.recv_from(in, sizeof(in), &n, nullptr));
+        uint8_t peer_version = 0;
+        EXPECT_EQ(n, kVersionMismatchSize);
+        EXPECT_EQ(in[0], kProtocolVersion);
+        EXPECT_EQ(in[1], kVersionMismatchMarker);
+        EXPECT_FALSE(decode_version_mismatch(in, n, &peer_version)); // it's ours
+        cancel.store(true);
+        receiver.join();
+    }
+    // Sender side: a receiver that answers with a mismatch ends the call.
+    {
+        const uint16_t port = next_port();
+        UdpSocket other_version;
+        ASSERT_TRUE(other_version.open("127.0.0.1", port));
+        std::atomic<bool> stop{false};
+        std::thread fake([&] {
+            fakepeer::set_rcv_timeout_ms(other_version, 20);
+            while (!stop.load()) {
+                uint8_t in[kMaxDatagramSize + 64];
+                size_t n = 0;
+                PeerAddr from;
+                if (other_version.recv_from(in, sizeof(in), &n, &from)) {
+                    const uint8_t reply[3] = {9, kVersionMismatchMarker, 9};
+                    other_version.send_to(reply, sizeof(reply), from);
+                }
+            }
+        });
+        fuse::TransferConfig tx;
+        tx.host = "127.0.0.1";
+        tx.base_port = port;
+        tx.lanes = 1;
+        const uint8_t byte = 1;
+        const auto t0 = fakepeer::Clock::now();
+        EXPECT_EQ(fuse::send_buffer(tx, &byte, 1), fuse::TransferStatus::VersionMismatch);
+        EXPECT_LT(fakepeer::ms_since(t0), 1000.0);
+        stop.store(true);
+        fake.join();
+    }
+}
+
 // Return routability (ROADMAP #18, #5): a StreamStart from an address that
 // hasn't proved it can receive there (no valid token) is answered only with
 // a Retry no larger than itself, and claims nothing — so a spoofed source
