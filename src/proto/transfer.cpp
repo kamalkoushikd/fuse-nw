@@ -1657,6 +1657,29 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     // blocks have grown to (ROADMAP #8). Counting blocks of the current
     // size let one window grow up to 13x in bytes as blocks grew.
     const uint64_t base_block = block;
+    // ROADMAP #7: how far the block may grow. Never past what one datagram
+    // of the route MTU holds, as the kernel reports it (loopback reports
+    // 64 KiB, so growth to 16 KiB stays allowed there; a 1500-byte path
+    // stops at about 1450). Unknown MTU means no growth at all. On top of
+    // that, a loss right after a growth step makes the previous size a
+    // ceiling: on a path that fragments or drops large datagrams the size
+    // settles instead of sawtoothing between "grow" and "reset". As in
+    // DPLPMTUD (RFC 8899) the larger size is re-probed later, after a clean
+    // stretch that doubles with every failed probe, so one transient loss
+    // (a full socket buffer, say) doesn't cap the lane for good.
+    uint16_t growth_ceiling = block;
+    {
+        const size_t mtu = path_mtu(dst);
+        const size_t overhead = ip_udp_overhead(dst) + kDataPrefixSize + (keys.enabled ? kAeadTagLen : 0);
+        if (mtu > overhead) {
+            growth_ceiling = static_cast<uint16_t>(
+                std::max<size_t>(block, std::min<size_t>(block_ceiling, mtu - overhead)));
+        }
+    }
+    uint16_t pre_growth_block = 0; // size before the latest growth step (0 = none pending)
+    uint32_t clean_since_growth = 0;
+    uint16_t mtu_ceiling = growth_ceiling;      // the route-MTU bound computed above
+    uint32_t reprobe_after = 64, clean_at_ceiling = 0;
     uint64_t sent_bytes = 0; // new payload bytes sent (not retransmissions)
     // Pacing (ROADMAP #22): earliest time the next batch of new data may go.
     uint64_t next_batch_ns = 0;
@@ -1949,13 +1972,31 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
         // has even had time to arrive — growing past path MTU and
         // fragmenting on an ordinary network, the opposite of wire.hpp's
         // intent).
+        if (base_advanced) {
+            ++clean_since_growth;
+            // Long enough clean at a lowered ceiling: probe above it again.
+            if (growth_ceiling < mtu_ceiling && ++clean_at_ceiling >= reprobe_after) {
+                growth_ceiling = mtu_ceiling;
+                clean_at_ceiling = 0;
+            }
+        }
         if (loss_seen) {
+            clean_at_ceiling = 0;
+            if (pre_growth_block != 0 && clean_since_growth < kCleanBatchesToGrow) {
+                // Lost right after growing: that size may not survive this
+                // path. Hold below it, and wait longer before the next probe.
+                growth_ceiling = pre_growth_block;
+                reprobe_after = std::min<uint32_t>(reprobe_after * 2, 4096);
+            }
+            pre_growth_block = 0;
             block = std::min<uint16_t>(cfg.block_size, block_ceiling);
             clean_batches = 0;
         } else if (base_advanced && ++clean_batches >= kCleanBatchesToGrow &&
-                  block < block_ceiling) {
+                   block < growth_ceiling) {
             clean_batches = 0;
-            block = static_cast<uint16_t>(std::min<uint32_t>(block_ceiling, block * 2u));
+            pre_growth_block = block;
+            clean_since_growth = 0;
+            block = static_cast<uint16_t>(std::min<uint32_t>(growth_ceiling, block * 2u));
         }
 
         res->retransmits.store(retransmits, std::memory_order_relaxed);
