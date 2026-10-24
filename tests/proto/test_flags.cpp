@@ -198,3 +198,33 @@ TEST(Flags, NonCoalesceBacksUpUnderPressure) {
     while (q.pop(v)) drained.push_back(v);
     EXPECT_EQ(drained, (std::vector<uint64_t>{0, 1, 2, 3}));
 }
+
+// ROADMAP #17: an unordered stream's duplicate tracking is bounded by the
+// window, not grown to the wire-supplied seq_no + 1.
+TEST(Flags, UnorderedDuplicateTrackingIsWindowBounded) {
+    StreamConfig cfg;
+    cfg.stream_flags = kStreamFlagLossless; // ORDERED=0
+    std::vector<uint8_t> sink(64 * 1024);
+    ReassemblyStream r(cfg, sink.data(), sink.size());
+    const uint8_t b[4] = {1, 2, 3, 4};
+    EXPECT_EQ(r.on_block(UINT64_MAX - 1, 0, b, 4), 0u) << "a seq far beyond the window is refused";
+    EXPECT_EQ(r.on_block(kMaxWindow, 0, b, 4), 0u);
+    for (uint64_t s = 0; s < 5000; ++s) {
+        const uint64_t seq = s ^ 1; // pairwise swapped arrival
+        EXPECT_EQ(r.on_block(seq, (seq % 16000) * 4, b, 4), 1u);
+        EXPECT_EQ(r.on_block(seq, (seq % 16000) * 4, b, 4), 0u) << "duplicate";
+    }
+    EXPECT_EQ(r.delivered_count(), 5000u);
+    EXPECT_LE(r.delivery_order().size(), ReassemblyStream::kMaxDeliveryTrace);
+}
+
+// ROADMAP #30: a zero-capacity SendQueue used to divide by zero.
+TEST(Flags, ZeroCapacitySendQueueIsUsable) {
+    SendQueue q(0, /*coalesce=*/true);
+    EXPECT_EQ(q.capacity(), 1u);
+    EXPECT_TRUE(q.push(1));
+    EXPECT_TRUE(q.push(2)); // coalesces: drops 1
+    uint64_t v = 0;
+    ASSERT_TRUE(q.pop(v));
+    EXPECT_EQ(v, 2u);
+}

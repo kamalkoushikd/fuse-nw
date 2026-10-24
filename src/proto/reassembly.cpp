@@ -1,6 +1,7 @@
 #include "fuse/proto/reassembly.hpp"
 
 #include <cstring>
+#include <utility>
 
 namespace fuse::proto {
 
@@ -11,11 +12,15 @@ ReassemblyStream::ReassemblyStream(const StreamConfig &config, uint8_t *sink,
       sink_cap_(sink_cap),
       total_blocks_(total_blocks) {}
 
+void ReassemblyStream::record(uint64_t seq_no) {
+    if (delivery_order_.size() < kMaxDeliveryTrace) delivery_order_.push_back(seq_no);
+    ++delivered_count_;
+}
+
 void ReassemblyStream::deliver(uint64_t seq_no, uint64_t offset, const uint8_t *payload,
                                uint16_t len) {
     write_sink(offset, payload, len);
-    delivery_order_.push_back(seq_no);
-    ++delivered_count_;
+    record(seq_no);
 }
 
 void ReassemblyStream::write_sink(uint64_t offset, const uint8_t *payload, uint16_t len) {
@@ -32,13 +37,23 @@ uint32_t ReassemblyStream::on_block(uint64_t seq_no, uint64_t offset, const uint
         // ordered mode's next_expected_ does, so it needs its own record —
         // without this, a retransmitted duplicate double-counts
         // delivered_count_ and can make is_complete() go true early.
-        if (seq_no < unordered_seen_.size() && unordered_seen_[seq_no]) {
+        if (seq_no < unordered_low_ || seq_no - unordered_low_ >= kMaxWindow) {
+            return 0; // already delivered, or beyond any valid window
+        }
+        const auto bit = [](uint64_t s) { return std::pair<size_t, uint64_t>((s % kMaxWindow) / 64, 1ull << (s % 64)); };
+        const auto [w, m] = bit(seq_no);
+        if (unordered_seen_[w] & m) {
             return 0;
         }
-        if (seq_no >= unordered_seen_.size()) {
-            unordered_seen_.resize(seq_no + 1, false);
+        unordered_seen_[w] |= m;
+        // Slide the low mark over the contiguous prefix, clearing as it goes,
+        // so each ring bit belongs to exactly one seq in the window.
+        for (;;) {
+            const auto [lw, lm] = bit(unordered_low_);
+            if (!(unordered_seen_[lw] & lm)) break;
+            unordered_seen_[lw] &= ~lm;
+            ++unordered_low_;
         }
-        unordered_seen_[seq_no] = true;
         // Positional write, delivered immediately in arrival order.
         deliver(seq_no, offset, payload, len);
         return 1;
@@ -82,8 +97,7 @@ uint32_t ReassemblyStream::on_block(uint64_t seq_no, uint64_t offset, const uint
         if (!slot.valid || slot.seq_no != next_expected_) {
             break;
         }
-        delivery_order_.push_back(slot.seq_no);
-        ++delivered_count_;
+        record(slot.seq_no);
         slot.valid = false;
         ++next_expected_;
         ++surfaced;

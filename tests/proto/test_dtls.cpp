@@ -100,6 +100,7 @@ HandshakeOutcome run_dtls(const std::string &client_psk, const std::string &serv
     scfg.handshake_timeout_max_sec = 1;
 
     DtlsConfig ccfg;
+    ccfg.record_wire = true; // the tests inspect the last datagram sent
     ccfg.encryption_required = true;
     ccfg.role = DtlsRole::Client;
     ccfg.psk_key = client_psk;

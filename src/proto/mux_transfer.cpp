@@ -12,7 +12,6 @@
 #include <memory>
 #include <mutex>
 #include <new>
-#include <random>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -24,6 +23,7 @@
 #include "fuse/proto/receiver.hpp"
 #include "fuse/proto/registry.hpp"
 #include "fuse/proto/send_queue.hpp"
+#include "fuse/proto/session_crypto.hpp"
 #include "fuse/proto/setup.hpp"
 #include "fuse/proto/udp.hpp"
 
@@ -54,10 +54,9 @@ void set_timeout_us(int fd, long us) {
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 }
 
-uint64_t random_nonce() {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    return rng();
-}
+// Session nonces are the only session check on several control messages, so
+// they must not be predictable from earlier ones (ROADMAP #20).
+uint64_t random_nonce() { return secure_random_u64(); }
 
 // Same ranking as transfer.cpp's worst() — duplicated rather than shared
 // since transfer.cpp is deliberately left untouched by this module.
@@ -73,8 +72,9 @@ int severity(TransferStatus s) {
         case TransferStatus::ResourceLimit: return 7;
         case TransferStatus::IoError: return 8;
         case TransferStatus::SocketError: return 9;
-        case TransferStatus::ConfigError: return 10;
-        case TransferStatus::Unsupported: return 10;
+        case TransferStatus::VersionMismatch: return 10;
+        case TransferStatus::ConfigError: return 11;
+        case TransferStatus::Unsupported: return 11;
     }
     return 0;
 }
@@ -105,6 +105,9 @@ struct SenderStreamState {
     SenderRegistry reg;
     CongestionController cc;
     SendQueue retransmit_backlog; // NACK-driven; coalesce=false matches LOSSLESS
+    // queued[seq % window] == seq while seq sits in the backlog, so a gap
+    // NACKed again before its resend isn't queued twice (ROADMAP #30).
+    std::vector<uint64_t> queued;
 
     const uint8_t *data = nullptr; // points into the caller's buffer; not owned
     uint64_t shard_bytes = 0;
@@ -114,6 +117,8 @@ struct SenderStreamState {
     bool sent_last = false;
 
     uint64_t nonce = 0;
+    uint64_t clock_offset = 0; // added to send_time_ns on the wire (ROADMAP #31)
+    uint64_t received_end = 0; // one past the highest seq the receiver holds
     bool start_acked = false;
     uint64_t last_start_send_ns = 0;
 
@@ -137,7 +142,10 @@ struct SenderStreamState {
           window_size(wsize),
           reg(id, wsize),
           cc(wsize, /*enabled=*/true, 1, 16),
-          retransmit_backlog(wsize, /*coalesce=*/false) {}
+          retransmit_backlog(wsize, /*coalesce=*/false),
+          queued(wsize == 0 ? 1 : wsize, UINT64_MAX) {
+        cc.enable_slow_start(16); // ROADMAP #8 (blocks are fixed-size here)
+    }
 };
 
 struct ReceiverStreamState {
@@ -181,6 +189,7 @@ private:
     bool run_setup_handshake();
     void build_streams();
     bool try_send_one(SenderStreamState &s);
+    bool resend(SenderStreamState &s, uint64_t seq);
     void dispatch_incoming(const uint8_t *dg, size_t dlen);
     bool worker_task(uint16_t);
     bool all_done() const;
@@ -219,6 +228,7 @@ private:
 
     uint64_t start_ns_ = 0;
     uint64_t end_ns_ = 0;
+    bool version_mismatch_ = false;
 };
 
 bool MuxSender::run_setup_handshake() {
@@ -245,7 +255,12 @@ bool MuxSender::run_setup_handshake() {
     while (!init_->is_matched() && !init_->is_failed()) {
         if (now_ns() > deadline) return false;
         size_t got = 0;
+        uint8_t peer_version = 0;
         if (sock_.recv_from(in, sizeof(in), &got, nullptr)) {
+            if (decode_version_mismatch(in, got, &peer_version)) {
+                version_mismatch_ = true; // ROADMAP #11: say so, don't time out
+                return false;
+            }
             n = init_->on_datagram(in, got, out, sizeof(out), now_ns());
         } else {
             n = init_->on_timeout(out, sizeof(out), now_ns());
@@ -266,11 +281,33 @@ void MuxSender::build_streams() {
         s->data = data_ + off;
         s->shard_bytes = sz;
         s->nonce = random_nonce();
+        s->clock_offset = secure_random_u64();
         const uint64_t t = now_ns();
         s->last_progress_ns = t;
         s->last_real_progress_ns.store(t, std::memory_order_relaxed);
         streams_.push_back(std::move(s));
     }
+}
+
+// Resends block `seq` of stream `s` from its registry (caller holds s.mu).
+bool MuxSender::resend(SenderStreamState &s, uint64_t seq) {
+    const RegistrySlot *slot = s.reg.lookup(seq);
+    if (slot == nullptr) return false;
+    BlockHeader hdr;
+    hdr.stream_id = s.stream_id;
+    hdr.seq_no = seq;
+    // OR, not overwrite: a retransmitted last block is still the last block,
+    // and the receiver has no other way to learn a stream finished if this
+    // bit is dropped here.
+    hdr.flags = slot->flags | kFlagRetransmission;
+    hdr.payload_len = slot->payload_len;
+    hdr.offset = slot->offset;
+    uint8_t dgram[kMaxDatagramSize];
+    const size_t n =
+        encode_data_datagram(hdr, now_ns() + s.clock_offset, slot->payload, dgram, sizeof(dgram));
+    if (n == 0 || !sock_.send_to(dgram, n, dst_)) return false;
+    ++s.retransmit_count;
+    return true;
 }
 
 bool MuxSender::try_send_one(SenderStreamState &s) {
@@ -304,43 +341,25 @@ bool MuxSender::try_send_one(SenderStreamState &s) {
 
     uint64_t seq = 0;
     if (s.retransmit_backlog.pop(seq)) {
-        const RegistrySlot *slot = s.reg.lookup(seq);
-        if (slot != nullptr) {
-            BlockHeader hdr;
-            hdr.stream_id = s.stream_id;
-            hdr.seq_no = seq;
-            // OR, not overwrite: a retransmitted last block is still the
-            // last block, and the receiver has no other way to learn a
-            // stream finished if this bit is dropped here.
-            hdr.flags = slot->flags | kFlagRetransmission;
-            hdr.payload_len = slot->payload_len;
-            hdr.offset = slot->offset;
-            uint8_t dgram[kMaxDatagramSize];
-            const size_t n = encode_data_datagram(hdr, now_ns(), slot->payload, dgram, sizeof(dgram));
-            if (n && sock_.send_to(dgram, n, dst_)) ++s.retransmit_count;
-        }
+        uint64_t &mark = s.queued[seq % s.queued.size()];
+        if (mark == seq) mark = UINT64_MAX;
+        resend(s, seq);
         return true;
     }
 
-    const uint64_t srtt = s.cc.rtt_ns();
-    const uint64_t rto_ns = srtt ? std::clamp<uint64_t>(srtt * 2, 5'000'000ull, 1'000'000'000ull)
-                                  : 1'000'000'000ull;
+    // RFC 6298 RTO with backoff, as in transfer.cpp (ROADMAP #23).
+    const uint64_t rto_ns = s.cc.rto_ns(5'000'000ull, 1'000'000'000ull, 1'000'000'000ull);
     if (s.tx_base < s.tx_next_seq && t > s.last_progress_ns + rto_ns) {
-        const RegistrySlot *slot = s.reg.lookup(s.tx_base);
-        if (slot != nullptr) {
-            BlockHeader hdr;
-            hdr.stream_id = s.stream_id;
-            hdr.seq_no = s.tx_base;
-            hdr.flags = slot->flags | kFlagRetransmission; // see the backlog path's comment above
-            hdr.payload_len = slot->payload_len;
-            hdr.offset = slot->offset;
-            uint8_t dgram[kMaxDatagramSize];
-            const size_t n = encode_data_datagram(hdr, now_ns(), slot->payload, dgram, sizeof(dgram));
-            if (n && sock_.send_to(dgram, n, dst_)) {
-                ++s.retransmit_count;
-                s.cc.on_loss();
-            }
+        // The first few un-SACKed holes, not just the base (see transfer.cpp).
+        unsigned holes = 0;
+        bool sent = false;
+        for (uint64_t q = s.tx_base; q < s.tx_next_seq && holes < 8; ++q) {
+            if (q != s.tx_base && q >= s.received_end) break; // beyond: maybe in flight
+            if (!s.reg.lookup(q)) continue;
+            ++holes;
+            sent |= resend(s, q);
         }
+        if (sent) s.cc.on_timeout();
         s.last_progress_ns = t; // pacing clock: don't retry every call while waiting out the RTO
         return true;
     }
@@ -363,7 +382,8 @@ bool MuxSender::try_send_one(SenderStreamState &s) {
 
         uint8_t dgram[kMaxDatagramSize];
         const size_t n =
-            encode_data_datagram(hdr, now_ns(), s.data + s.next_offset, dgram, sizeof(dgram));
+            encode_data_datagram(hdr, now_ns() + s.clock_offset, s.data + s.next_offset, dgram,
+                                 sizeof(dgram));
         if (n == 0) return false;
         sock_.send_to(dgram, n, dst_);
 
@@ -387,21 +407,18 @@ void MuxSender::dispatch_incoming(const uint8_t *dg, size_t dlen) {
         std::lock_guard<std::mutex> lk(s.mu);
         if (ack.nonce != s.nonce) return; // not this attempt's session
         s.start_acked = true;
-        if (ack.base_seq_no > s.tx_base) {
-            // Acks are unauthenticated (no crypto in this module at all):
-            // clamp to what was actually sent, mirroring the same fix
-            // applied to transfer.cpp/sdk.cpp this session.
-            const uint64_t new_base = std::min(ack.base_seq_no, s.tx_next_seq);
-            for (uint64_t seq = s.tx_base; seq < new_base; ++seq) s.reg.confirm(seq);
-            s.tx_base = new_base;
+        const uint64_t old_base = s.tx_base;
+        // Cumulative base (clamped to what was sent) plus the SACK bitmask.
+        apply_ack(s.reg, ack, &s.tx_base, s.tx_next_seq, &s.received_end);
+        if (s.tx_base > old_base) {
+            s.cc.on_progress();
             const uint64_t t = now_ns();
             s.last_progress_ns = t;
             s.last_real_progress_ns.store(t, std::memory_order_release);
         }
         if (ack.echoed_send_time > 0 && ack.echoed_send_time != s.last_rtt_echo_ns) {
             s.last_rtt_echo_ns = ack.echoed_send_time;
-            const uint64_t t = now_ns();
-            if (t > ack.echoed_send_time) s.cc.on_rtt_sample(t - ack.echoed_send_time);
+            s.cc.on_rtt_sample(rtt_sample_from_echo(now_ns() + s.clock_offset, ack.echoed_send_time));
         }
         if (s.tx_base >= s.tx_next_seq && s.sent_last) {
             s.done.store(true, std::memory_order_release);
@@ -414,7 +431,16 @@ void MuxSender::dispatch_incoming(const uint8_t *dg, size_t dlen) {
         if (s.done.load(std::memory_order_relaxed)) return;
         s.cc.on_loss();
         for (uint16_t i = 0; i < nack.count; ++i) {
-            s.retransmit_backlog.push(nack.missing[i]); // best-effort; a full push just isn't queued
+            const uint64_t seq = nack.missing[i];
+            uint64_t &mark = s.queued[seq % s.queued.size()];
+            if (mark == seq) continue; // already waiting for its resend
+            if (s.retransmit_backlog.push(seq)) {
+                mark = seq;
+            } else {
+                // Backlog full: resend right away rather than drop the
+                // request and leave the gap to the RTO.
+                resend(s, seq);
+            }
         }
     } else if (type == MsgType::SetupHashReply && init_) {
         // The receiver's own retry for a FINACK that never arrived (see
@@ -468,12 +494,15 @@ TransferStatus MuxSender::run() {
         cfg_.block_size == 0 || cfg_.window_size == 0 || (data_ == nullptr && len_ > 0)) {
         return TransferStatus::ConfigError;
     }
-    if (!sock_.open("0.0.0.0", 0)) return TransferStatus::SocketError;
     if (!UdpSocket::resolve(cfg_.host.c_str(), cfg_.port, &dst_)) return TransferStatus::ConfigError;
+    // Same family as the destination, so IPv6 hosts are reachable.
+    if (!sock_.open(wildcard_for(dst_), 0)) return TransferStatus::SocketError;
     set_bufs(sock_.fd(), 32 << 20);
     set_timeout_us(sock_.fd(), 50000);
 
-    if (!run_setup_handshake()) return TransferStatus::Timeout;
+    if (!run_setup_handshake()) {
+        return version_mismatch_ ? TransferStatus::VersionMismatch : TransferStatus::Timeout;
+    }
 
     build_streams();
 
@@ -609,6 +638,7 @@ bool MuxReceiver::run_setup_handshake() {
     SetupResponder resp;
     uint8_t in[kMaxSetupDatagramSize];
     uint8_t out[kMaxSetupDatagramSize];
+    uint64_t last_version_reply_ns = 0;
 
     const uint64_t deadline = now_ns() + static_cast<uint64_t>(cfg_.timeout_ms) * 1000000ull;
     while (!resp.is_complete() && !resp.is_failed()) {
@@ -617,7 +647,21 @@ bool MuxReceiver::run_setup_handshake() {
         PeerAddr from;
         size_t n = 0;
         if (sock_.recv_from(in, sizeof(in), &got, &from)) {
-            if (!have_peer_) {
+            if (is_foreign_version(in, got)) {
+                // Another protocol version: tell it, rate-limited, instead of
+                // leaving it to time out (ROADMAP #11).
+                const uint64_t t = now_ns();
+                if (t - last_version_reply_ns > 100'000'000ull) {
+                    last_version_reply_ns = t;
+                    const size_t vn = encode_version_mismatch(out, sizeof(out));
+                    if (vn) sock_.send_to(out, vn, from);
+                }
+                continue;
+            }
+            // The peer is whoever sends the SETUP (not just any first
+            // datagram to arrive on the port).
+            MsgType type;
+            if (peek_msg_type(in, got, &type) && type == MsgType::SetupData) {
                 peer_ = from;
                 have_peer_ = true;
             }
@@ -625,10 +669,17 @@ bool MuxReceiver::run_setup_handshake() {
         } else {
             n = resp.on_timeout(out, sizeof(out), now_ns());
         }
-        if (n > 0) sock_.send_to(out, n, peer_);
+        if (n > 0 && have_peer_) sock_.send_to(out, n, peer_);
     }
     if (!resp.is_complete()) return false;
-    build_streams(resp.config());
+    // This receiver indexes its streams by id, so the ids must be exactly
+    // 0..n-1 (which is what MuxSender sends). Anything else is refused
+    // rather than mis-indexed (ROADMAP #30).
+    const SetupPayload &cfg = resp.config();
+    for (uint16_t i = 0; i < cfg.num_streams; ++i) {
+        if (cfg.streams[i].stream_id != i) return false;
+    }
+    build_streams(cfg);
     return true;
 }
 

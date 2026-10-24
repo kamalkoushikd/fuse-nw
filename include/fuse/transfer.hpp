@@ -84,6 +84,12 @@ struct TransferConfig {
 
     // Non-empty enables AES-256-GCM. Both ends must supply the same key.
     //
+    // Use at least 16 bytes of real randomness (e.g. 32 bytes from
+    // /dev/urandom), never a password: the key is used directly as HKDF
+    // input with no stretching, so anyone who captures one handshake can
+    // test guesses offline. Keys shorter than 16 bytes are rejected with
+    // TransferStatus::ConfigError.
+    //
     // This provides confidentiality and integrity with a key that is fresh
     // per session, but NOT forward secrecy: an attacker who records traffic
     // and later obtains this key can decrypt it. Where that matters, use the
@@ -146,6 +152,7 @@ enum class TransferStatus {
     PeerAborted,   // the other side cancelled or gave up and said so
     IoError,       // receiver: writing the output failed (disk full, permissions, ...)
     VerifyFailed,  // receiver: a resumed file didn't match the sender's digest
+    VersionMismatch, // the peer speaks a different Fuse protocol version
 };
 
 // Human-readable form, for logs and error messages.

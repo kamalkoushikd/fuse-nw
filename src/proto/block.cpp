@@ -15,6 +15,30 @@ bool peek_msg_type(const uint8_t *in, size_t in_len, MsgType *type) {
     return true;
 }
 
+bool is_foreign_version(const uint8_t *in, size_t in_len) {
+    return in_len >= kOuterHeaderSize && in[0] != kProtocolVersion &&
+           in[1] != kVersionMismatchMarker;
+}
+
+size_t encode_version_mismatch(uint8_t *out, size_t out_cap) {
+    if (out_cap < kVersionMismatchSize) {
+        return 0;
+    }
+    out[0] = kProtocolVersion;
+    out[1] = kVersionMismatchMarker;
+    out[2] = kProtocolVersion;
+    return kVersionMismatchSize;
+}
+
+bool decode_version_mismatch(const uint8_t *in, size_t in_len, uint8_t *peer_version) {
+    if (in_len < kVersionMismatchSize || in[1] != kVersionMismatchMarker || in[0] != in[2] ||
+        in[0] == kProtocolVersion) {
+        return false;
+    }
+    *peer_version = in[0];
+    return true;
+}
+
 size_t encode_data_datagram(const BlockHeader &hdr,
                             uint64_t send_time_ns,
                             const uint8_t *payload,

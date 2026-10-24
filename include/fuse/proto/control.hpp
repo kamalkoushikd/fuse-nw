@@ -10,7 +10,7 @@
 // create or open a file by that name.)
 //
 //   Heartbeat : [outer][stream_id:2][highest_seq_no:8]
-//   Ack       : [outer][stream_id:2][base_seq_no:8][received_bitmask:8*kMaskWords][echoed_send_time:8][nonce:8]
+//   Ack       : [outer][stream_id:2][base_seq_no:8][received_bitmask:8*kMaskWords][echoed_send_time:8][nonce:8][rwnd:4]
 //   Nack      : [outer][stream_id:2][count:2][missing_seq_no:8]*count
 //
 // StreamStart's nonce and Ack's echoed nonce (v3) exist purely for handshake
@@ -64,7 +64,34 @@ struct StreamStart {
     // modification time), so a receiver holding a partial copy can tell
     // whether it belongs to this file. 0 = not a file / don't resume.
     uint64_t file_id = 0;
+    // v8: the address-validation token from the receiver's Retry, 0 on the
+    // first attempt. A receiver only claims a lane (and sends anything
+    // larger than a Retry) for a StreamStart whose token proves the sender
+    // receives at its source address.
+    uint64_t token = 0;
+    // v8: extension area (see wire.hpp). Decoding refuses a StreamStart
+    // whose area is malformed or holds a critical type it doesn't know.
+    uint16_t ext_len = 0;
+    uint8_t  ext[kMaxExtensionBytes] = {};
 };
+
+// v8 address validation: the receiver's answer to a StreamStart without a
+// valid token. 20 bytes, smaller than the 78-byte StreamStart it answers.
+struct Retry {
+    uint16_t stream_id = 0;
+    uint64_t nonce     = 0; // echoes the StreamStart nonce
+    uint64_t token     = 0;
+};
+
+// v8 path validation. A PathResponse echoes the PathChallenge's value.
+struct PathProbe {
+    uint16_t stream_id = 0;
+    uint64_t nonce     = 0; // the lane's session nonce
+    uint64_t challenge = 0;
+};
+
+// Ack::rwnd value meaning "no receive-window limit".
+inline constexpr uint32_t kRwndUnlimited = UINT32_MAX;
 
 struct Ack {
     uint16_t stream_id        = 0;
@@ -72,6 +99,12 @@ struct Ack {
     uint64_t received_bitmask[kMaskWords] = {};
     uint64_t echoed_send_time = 0;
     uint64_t nonce            = 0; // echoes the StreamStart nonce (v3)
+    // Flow control (v8, ROADMAP #9): how many unacknowledged blocks the
+    // receiver can hold right now. A sender keeps its blocks in flight within
+    // it, so a slow disk or a slow application is not mistaken for network
+    // congestion (overrunning the receiver used to cost dropped blocks, NACKs
+    // and a halved window).
+    uint32_t rwnd             = kRwndUnlimited;
 };
 
 // A NACK names up to kMaxWindow missing sequence numbers for one stream —
@@ -87,6 +120,11 @@ struct Nack {
 // it is not authenticated under a PSK — the nonce is the only session check.
 inline constexpr uint8_t kStreamCloseFinished = 0; // sender: every byte acknowledged
 inline constexpr uint8_t kStreamCloseAborted  = 1; // either side: giving up on this lane
+// Receiver -> sender (v8): the StreamStart failed authentication, i.e. the
+// two ends hold different pre-shared keys (or only one has one). Sent
+// unauthenticated, since the receiver has no key it shares with this peer;
+// it only lets a mis-keyed sender fail fast instead of timing out.
+inline constexpr uint8_t kStreamCloseAuthFailed = 2;
 
 struct StreamClose {
     uint16_t stream_id = 0;
@@ -148,6 +186,13 @@ bool   decode_resume_ranges(const uint8_t *in, size_t in_len, ResumeRanges *rr);
 
 size_t encode_digest(const DigestMessage &dm, uint8_t *out, size_t out_cap);
 bool   decode_digest(const uint8_t *in, size_t in_len, DigestMessage *dm);
+
+size_t encode_retry(const Retry &r, uint8_t *out, size_t out_cap);
+bool   decode_retry(const uint8_t *in, size_t in_len, Retry *r);
+
+// `type` is MsgType::PathChallenge or MsgType::PathResponse.
+size_t encode_path_probe(MsgType type, const PathProbe &pp, uint8_t *out, size_t out_cap);
+bool   decode_path_probe(MsgType type, const uint8_t *in, size_t in_len, PathProbe *pp);
 
 // Largest aux datagram: a full-window NACK. Used to size receive buffers.
 inline constexpr size_t kMaxAuxDatagramSize =

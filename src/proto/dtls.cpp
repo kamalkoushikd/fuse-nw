@@ -100,9 +100,11 @@ int DtlsSession::wire_send(const uint8_t *buf, size_t len) {
     // Record what actually went on the wire so callers can confirm it is
     // ciphertext, not plaintext.
     wire_bytes_sent_ += static_cast<uint64_t>(len);
-    size_t keep = len > sizeof(last_wire_.data) ? sizeof(last_wire_.data) : len;
-    std::memcpy(last_wire_.data, buf, keep);
-    last_wire_.len = keep;
+    if (config_.record_wire) {
+        size_t keep = len > sizeof(last_wire_.data) ? sizeof(last_wire_.data) : len;
+        std::memcpy(last_wire_.data, buf, keep);
+        last_wire_.len = keep;
+    }
     return static_cast<int>(len);
 }
 

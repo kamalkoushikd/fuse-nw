@@ -38,6 +38,19 @@ struct PeerAddr {
 // The address's port in host byte order, or 0 if addr is empty/unrecognized.
 uint16_t peer_port(const PeerAddr &p);
 
+// The MTU of the route to `dst` as the kernel currently knows it (the
+// interface MTU, or a smaller path MTU it has learned), or 0 if it can't be
+// determined on this platform. Used to cap block growth (ROADMAP #7).
+uint16_t path_mtu(const PeerAddr &dst);
+
+// The wildcard local address of `dst`'s family ("::" or "0.0.0.0"), for a
+// client socket that must be able to reach it: an AF_INET socket cannot
+// send to an IPv6 address.
+const char *wildcard_for(const PeerAddr &dst);
+
+// IP + UDP header bytes for a datagram to `dst` (28 for IPv4, 48 for IPv6).
+size_t ip_udp_overhead(const PeerAddr &dst);
+
 // Formats just the address (no port) into buf, e.g. "192.0.2.1" or
 // "2001:db8::1". Returns false if buf is too small or the family is
 // unrecognized.

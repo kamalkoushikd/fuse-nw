@@ -20,12 +20,16 @@ topology, or application domain.
   required, and is never negotiated in-band.
 - **No allocation on the data path** and no locks in the worker hot path.
 
-**Implemented and tested** (120 tests; see `docs/ROADMAP.md` for detail and
+**Implemented and tested** (206 tests; see `docs/ROADMAP.md` for detail and
 the honest list of gaps): a one-call `fuse/transfer.hpp` send/receive API
 over a sharded, GSO-batched data plane with registry-backed retransmission,
-O(1) bitmask loss detection, RTT-adaptive timeouts, per-stream AIMD
-congestion control, adaptive block sizing, optional AES-256-GCM encryption,
-and a userspace network-emulator test harness.
+selective acknowledgement, O(1) bitmask loss detection, RFC 6298 timeouts,
+per-stream congestion control with slow start and pacing, receive-window
+flow control, MTU-bounded adaptive block sizing, address and path
+validation, optional AES-256-GCM encryption with an authenticated control
+plane and key rotation, and a userspace network-emulator test harness.
+The wire format is version 8 ([docs/PROTOCOL.md](docs/PROTOCOL.md)); the
+benchmark figures below were measured on earlier versions.
 
 > **Measured against QUIC on a 1 GiB checksum-verified file transfer, Fuse
 > is 1.3–2.2× faster** than a reference QUIC implementation (quinn) at
@@ -164,10 +168,10 @@ a distro's own repositories.
 
 ```sh
 # Debian/Ubuntu (needs dpkg-dev, normally already present)
-sudo dpkg -i fuse-0.1.0-Linux.deb
+sudo dpkg -i fuse-0.2.0-Linux.deb
 
 # Fedora/RHEL (needs rpm-build)
-sudo rpm -i fuse-0.1.0-1.x86_64.rpm
+sudo rpm -i fuse-0.2.0-1.x86_64.rpm
 ```
 
 Every push to `main` also builds these packages in CI and uploads them

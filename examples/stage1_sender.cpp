@@ -79,7 +79,8 @@ int main(int argc, char **argv) {
     // Send all blocks, withholding drop_seq on its first pass.
     for (uint64_t seq = 0; seq < count; ++seq) {
         for (uint16_t i = 0; i < kLen; ++i) payload[i] = static_cast<uint8_t>(seq * 31 + i);
-        registry.store(seq, payload, kLen, now_ns(), seq * kLen);
+        const uint8_t flags = (seq + 1 == count) ? kFlagLastBlock : 0;
+        registry.store(seq, payload, kLen, now_ns(), seq * kLen, flags);
 
         if (static_cast<int64_t>(seq) == drop_seq) {
             std::printf("send seq=%llu  [deliberately dropped]\n",
@@ -88,8 +89,9 @@ int main(int argc, char **argv) {
             BlockHeader hdr;
             hdr.stream_id = kStream;
             hdr.seq_no = seq;
-            hdr.flags = (seq + 1 == count) ? kFlagLastBlock : 0;
+            hdr.flags = flags;
             hdr.payload_len = kLen;
+            hdr.offset = seq * kLen;
             size_t n = encode_data_datagram(hdr, now_ns(), payload, buf, sizeof(buf));
             if (n > 0) sock.send_to(buf, n, dst);
         }
@@ -112,8 +114,9 @@ int main(int argc, char **argv) {
                     BlockHeader hdr;
                     hdr.stream_id = kStream;
                     hdr.seq_no = slot->seq_no;
-                    hdr.flags = kFlagRetransmission;
+                    hdr.flags = slot->flags | kFlagRetransmission;
                     hdr.payload_len = slot->payload_len;
+                    hdr.offset = slot->offset;
                     size_t n = encode_data_datagram(hdr, slot->send_time_ns, slot->payload,
                                                     buf, sizeof(buf));
                     if (n > 0) {
@@ -148,8 +151,9 @@ int main(int argc, char **argv) {
             BlockHeader hdr;
             hdr.stream_id = kStream;
             hdr.seq_no = slot->seq_no;
-            hdr.flags = kFlagRetransmission;
+            hdr.flags = slot->flags | kFlagRetransmission;
             hdr.payload_len = slot->payload_len;
+            hdr.offset = slot->offset;
             size_t n = encode_data_datagram(hdr, slot->send_time_ns, slot->payload,
                                             buf, sizeof(buf));
             if (n > 0) {

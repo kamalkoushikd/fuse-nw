@@ -45,6 +45,10 @@ public:
     uint64_t delivered_count() const { return delivered_count_; }
     bool is_complete() const { return total_blocks_ != 0 && delivered_count_ == total_blocks_; }
 
+    // The seqs in the order they were surfaced -- trace evidence for tests,
+    // capped at kMaxDeliveryTrace entries so a long stream can't grow it
+    // without bound (ROADMAP #17).
+    static constexpr size_t kMaxDeliveryTrace = 1u << 16;
     const std::vector<uint64_t> &delivery_order() const { return delivery_order_; }
 
     // Feeds one received block, at its wire-carried byte `offset` within
@@ -63,13 +67,17 @@ private:
     uint64_t total_blocks_;
     uint64_t delivered_count_ = 0;
     std::vector<uint64_t> delivery_order_;
-    // Unordered mode has no sliding base to bound "already delivered" the
-    // way ordered mode's next_expected_ does, so duplicate detection needs
-    // its own persistent record — without it, a retransmitted duplicate
-    // (the retransmit itself is legitimate; on_block seeing it twice is
-    // not) would double-count delivered_count_, letting is_complete() go
-    // true while a real gap remains.
-    std::vector<bool> unordered_seen_;
+    // Unordered mode's duplicate detection: without it, a retransmitted
+    // duplicate would double-count delivered_count_, letting is_complete()
+    // go true while a real gap remains. It is a window-bounded ring --
+    // unordered_low_ is the lowest seq not yet seen, bit (seq % kMaxWindow)
+    // marks seqs seen above it -- not a vector grown to seq_no + 1 from a
+    // wire-supplied value (ROADMAP #17). A block more than kMaxWindow
+    // beyond the lowest gap is outside any window a sender may use and is
+    // refused.
+    uint64_t unordered_low_ = 0;
+    std::array<uint64_t, kMaskWords> unordered_seen_{};
+    void record(uint64_t seq_no);
 
     // Ordered-mode reorder buffer: a fixed ring keyed by seq_no, bounded by
     // the window, so it needs no per-block allocation. An out-of-order

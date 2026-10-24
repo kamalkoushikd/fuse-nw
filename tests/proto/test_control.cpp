@@ -65,10 +65,11 @@ TEST(Aux, AckRoundTrip) {
     ack.received_bitmask[0] = 0b10110;
     ack.echoed_send_time = 55555;
     ack.nonce = 0xdeadbeefULL;
+    ack.rwnd = 77;
 
     uint8_t buf[kMaxAuxDatagramSize];
     size_t len = encode_ack(ack, buf, sizeof(buf));
-    ASSERT_GT(len, 0u);
+    ASSERT_EQ(len, 160u);
 
     Ack got;
     ASSERT_TRUE(decode_ack(buf, len, &got));
@@ -79,6 +80,8 @@ TEST(Aux, AckRoundTrip) {
     }
     EXPECT_EQ(got.echoed_send_time, ack.echoed_send_time);
     EXPECT_EQ(got.nonce, ack.nonce);
+    EXPECT_EQ(got.rwnd, 77u);
+    EXPECT_EQ(Ack{}.rwnd, kRwndUnlimited) << "default must not limit anyone";
 }
 
 TEST(Aux, NackRoundTrip) {
@@ -215,4 +218,71 @@ TEST(Aux, DigestMessageRoundTrip) {
     EXPECT_EQ(got.nonce, dm.nonce);
     EXPECT_EQ(0, std::memcmp(got.digest, dm.digest, kDigestLen));
     EXPECT_FALSE(decode_digest(buf, len - 1, &got));
+}
+
+TEST(Aux, RetryAndPathProbesRoundTrip) {
+    uint8_t buf[64];
+    Retry r;
+    r.stream_id = 3;
+    r.nonce = 0xA1A2A3A4A5A6A7A8ULL;
+    r.token = 0x0102030405060708ULL;
+    const size_t n = encode_retry(r, buf, sizeof(buf));
+    ASSERT_EQ(n, 20u);
+    Retry back;
+    ASSERT_TRUE(decode_retry(buf, n, &back));
+    EXPECT_EQ(back.stream_id, 3);
+    EXPECT_EQ(back.nonce, r.nonce);
+    EXPECT_EQ(back.token, r.token);
+
+    StreamStart ss;
+    uint8_t sbuf[128];
+    EXPECT_LE(n, encode_stream_start(ss, sbuf, sizeof(sbuf)))
+        << "a Retry must never be larger than the StreamStart it answers";
+
+    PathProbe pp;
+    pp.stream_id = 1;
+    pp.nonce = 7;
+    pp.challenge = 0xDEADBEEFCAFEF00DULL;
+    for (MsgType t : {MsgType::PathChallenge, MsgType::PathResponse}) {
+        const size_t m = encode_path_probe(t, pp, buf, sizeof(buf));
+        ASSERT_EQ(m, 20u);
+        PathProbe got;
+        ASSERT_TRUE(decode_path_probe(t, buf, m, &got));
+        EXPECT_EQ(got.challenge, pp.challenge);
+        const MsgType other = t == MsgType::PathChallenge ? MsgType::PathResponse : MsgType::PathChallenge;
+        EXPECT_FALSE(decode_path_probe(other, buf, m, &got));
+    }
+    EXPECT_EQ(encode_path_probe(MsgType::Ack, pp, buf, sizeof(buf)), 0u);
+}
+
+// ROADMAP #24: StreamStart can carry optional extensions. Unknown ones are
+// skipped; an unknown *critical* one (top bit) makes the message invalid;
+// a malformed area is rejected.
+TEST(Aux, StreamStartExtensions) {
+    uint8_t buf[512];
+    StreamStart ss;
+    ss.nonce = 42;
+    const uint8_t v[3] = {1, 2, 3};
+    ss.ext_len = static_cast<uint16_t>(append_extension(ss.ext, sizeof(ss.ext), 0, 0x0007, v, 3));
+    ASSERT_EQ(ss.ext_len, 7u);
+    size_t n = encode_stream_start(ss, buf, sizeof(buf));
+    ASSERT_GT(n, 0u);
+    StreamStart back;
+    ASSERT_TRUE(decode_stream_start(buf, n, &back)) << "an unknown extension is ignored";
+    EXPECT_EQ(back.nonce, 42u);
+    size_t off = 0;
+    Extension e;
+    ASSERT_TRUE(next_extension(back.ext, back.ext_len, &off, &e));
+    EXPECT_EQ(e.type, 0x0007);
+    EXPECT_EQ(e.len, 3);
+    EXPECT_EQ(e.value[2], 3);
+
+    ss.ext_len = static_cast<uint16_t>(
+        append_extension(ss.ext, sizeof(ss.ext), 0, kExtensionCritical | 1, v, 3));
+    n = encode_stream_start(ss, buf, sizeof(buf));
+    EXPECT_FALSE(decode_stream_start(buf, n, &back)) << "unknown critical extension accepted";
+
+    ss.ext_len = 3; // claims an entry it doesn't hold
+    n = encode_stream_start(ss, buf, sizeof(buf));
+    EXPECT_FALSE(decode_stream_start(buf, n, &back)) << "malformed extension area accepted";
 }
