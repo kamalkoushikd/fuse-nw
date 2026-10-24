@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(fuse
-    VERSION 0.1.0
+    VERSION 0.2.0
     DESCRIPTION "Fuse: an experimental low-latency transport protocol"
     HOMEPAGE_URL "https://github.com/kamalkoushikd/fuse-nw"
     LANGUAGES C CXX
@@ -268,6 +268,7 @@ install(DIRECTORY include/fuse
     PATTERN "sdk.h" EXCLUDE
     PATTERN "transfer.hpp" EXCLUDE
     PATTERN "mux_transfer.hpp" EXCLUDE
+    PATTERN "http.h" EXCLUDE
 )
 install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/include/fuse/version.h"
@@ -348,7 +349,11 @@ endif()
 
 if(FUSE_BUILD_BENCH)
     add_subdirectory(bench)
-    add_subdirectory(scripts/net-sim/src)
+    # The network-simulation helpers are optional and not always shipped
+    # with the source tree; their absence must not break a default configure.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/net-sim/src/CMakeLists.txt")
+        add_subdirectory(scripts/net-sim/src)
+    endif()
 endif()
 
 # --- Packaging (CPack) ------------------------------------------------------
