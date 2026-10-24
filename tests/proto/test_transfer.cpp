@@ -766,8 +766,12 @@ std::vector<uint8_t> read_all(const fs::path &p) {
 // dedicated retransmission thread serves.
 class LossyRelay {
 public:
-    LossyRelay(uint16_t listen_port, uint16_t receiver_port, int drop_every)
-        : drop_every_(drop_every) {
+    // `rebind_after` > 0: after that many forwarded data blocks, the relay
+    // switches to a fresh source port toward the receiver, which is what a
+    // NAT rebinding looks like from the receiver's side.
+    LossyRelay(uint16_t listen_port, uint16_t receiver_port, int drop_every,
+               uint64_t rebind_after = 0)
+        : drop_every_(drop_every), rebind_after_(rebind_after) {
         using namespace fuse::proto;
         EXPECT_TRUE(front_.open("127.0.0.1", listen_port));
         EXPECT_TRUE(back_.open("127.0.0.1", 0));
@@ -845,6 +849,15 @@ private:
                     dropped_.fetch_add(1);
                     continue;
                 }
+                if (rebind_after_ != 0 && data_seen == rebind_after_ && !rebound_) {
+                    fuse::proto::UdpSocket fresh;
+                    EXPECT_TRUE(fresh.open("127.0.0.1", 0));
+                    int big = 8 << 20;
+                    setsockopt(fresh.fd(), SOL_SOCKET, SO_RCVBUF, &big, sizeof(big));
+                    fresh.set_nonblocking(true);
+                    back_ = std::move(fresh);
+                    rebound_ = true;
+                }
                 back_.send_to(buf.data(), got, receiver_);
             }
             // Receiver -> sender, untouched.
@@ -857,6 +870,8 @@ private:
     fuse::proto::UdpSocket front_, back_;
     fuse::proto::PeerAddr receiver_;
     int drop_every_;
+    uint64_t rebind_after_ = 0;
+    bool rebound_ = false;
     std::atomic<bool> stop_{false};
     std::atomic<uint64_t> dropped_{0};
     std::atomic<uint64_t> resends_{0}, changed_resends_{0};
@@ -1073,6 +1088,94 @@ TEST(Transfer, ForgedControlMessagesAreIgnoredUnderPsk) {
 }
 
 #endif // FUSE_PROTO_WITH_DTLS
+
+// The sender's address changing mid-transfer (a NAT rebinding) must not
+// break the transfer: the receiver validates the new source with a path
+// challenge and then moves its ACKs there (v8, ROADMAP #3).
+TEST(Transfer, SurvivesSenderAddressChangeViaPathValidation) {
+    const auto payload = make_payload(4 * 1024 * 1024);
+    std::vector<std::string> keys = {""};
+    if (fuse::encryption_available()) keys.push_back("path-validation-test-key");
+    for (const std::string &psk : keys) {
+        SCOPED_TRACE(psk.empty() ? "plain" : "psk");
+        const uint16_t rx_port = next_port();
+        const uint16_t relay_port = next_port();
+        fuse::TransferConfig rx;
+        rx.bind_address = "127.0.0.1";
+        rx.base_port = rx_port;
+        rx.lanes = 1;
+        rx.timeout_ms = 20000;
+        rx.pre_shared_key = psk;
+        fuse::TransferConfig tx = rx;
+        tx.host = "127.0.0.1";
+        tx.base_port = relay_port;
+
+        pipeline_test::LossyRelay relay(relay_port, rx_port, 1 << 30, /*rebind_after=*/200);
+        std::vector<uint8_t> got;
+        fuse::TransferStatus rs = fuse::TransferStatus::Incomplete;
+        std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const auto ss = fuse::send_buffer(tx, payload.data(), payload.size());
+        receiver.join();
+        EXPECT_EQ(ss, fuse::TransferStatus::Ok) << fuse::to_string(ss);
+        EXPECT_EQ(rs, fuse::TransferStatus::Ok) << fuse::to_string(rs);
+        EXPECT_EQ(got, payload);
+    }
+}
+
+// A data block from some other address -- here a correct-looking forgery in
+// plaintext mode -- must not redirect the receiver's ACKs there. The other
+// address only ever gets a path challenge, which it cannot answer for the
+// real sender.
+TEST(Transfer, ForeignSourceCannotRedirectAcks) {
+    using namespace fuse::proto;
+    const uint16_t port = next_port();
+    std::atomic<bool> cancel{false};
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = port;
+    rx.lanes = 1;
+    rx.timeout_ms = 20000;
+    rx.cancel = &cancel;
+    std::vector<uint8_t> got;
+    std::thread receiver([&] { fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    UdpSocket real, other;
+    ASSERT_TRUE(real.open("127.0.0.1", 0));
+    ASSERT_TRUE(other.open("127.0.0.1", 0));
+    fakepeer::set_rcv_timeout_ms(other, 50);
+    PeerAddr dst;
+    ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", port, &dst));
+    StreamStart ss;
+    ss.total_bytes = 1 << 20;
+    ss.file_total_bytes = ss.total_bytes;
+    ss.nonce = 0x77;
+    ASSERT_TRUE(send_stream_start_v8(real, dst, ss));
+
+    // Block 0 from the foreign address. It is new, so it is Accepted, which
+    // used to be enough to re-anchor the peer.
+    uint8_t buf[kMaxDatagramSize + 64], payload[1200] = {};
+    BlockHeader hdr;
+    hdr.payload_len = sizeof(payload);
+    const size_t n = encode_data_datagram(hdr, 1, payload, buf, sizeof(buf));
+    ASSERT_TRUE(other.send_to(buf, n, dst));
+
+    uint64_t acks = 0, challenges = 0;
+    const auto until = fakepeer::Clock::now() + std::chrono::milliseconds(500);
+    while (fakepeer::Clock::now() < until) {
+        size_t got_n = 0;
+        MsgType t;
+        if (other.recv_from(buf, sizeof(buf), &got_n, nullptr) && peek_msg_type(buf, got_n, &t)) {
+            if (t == MsgType::Ack) ++acks;
+            if (t == MsgType::PathChallenge) ++challenges;
+        }
+    }
+    cancel.store(true);
+    receiver.join();
+    EXPECT_EQ(acks, 0u) << "ACKs were redirected to an unvalidated address";
+    EXPECT_GE(challenges, 1u);
+}
 
 // Return routability (ROADMAP #18, #5): a StreamStart from an address that
 // hasn't proved it can receive there (no valid token) is answered only with
