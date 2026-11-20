@@ -32,3 +32,7 @@ dist/
 dist-py/
 __pycache__/
 *.pyc
+
+# Local tool state and generated caches
+.claude/
+graphify-out/
