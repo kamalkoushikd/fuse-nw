@@ -42,9 +42,10 @@ add_executable(fuse_proto_tests
     proto/test_sdk.cpp
     proto/test_spsc_ring.cpp
     proto/test_digest.cpp
+    proto/test_http.cpp
 )
 
-target_link_libraries(fuse_proto_tests PRIVATE fuse::proto fuse::sdk GTest::gtest_main)
+target_link_libraries(fuse_proto_tests PRIVATE fuse::proto fuse::sdk fuse::http GTest::gtest_main)
 
 # A per-test TIMEOUT keeps one wedged transfer test from hanging the whole run.
 gtest_discover_tests(fuse_proto_tests PROPERTIES TIMEOUT 180)
