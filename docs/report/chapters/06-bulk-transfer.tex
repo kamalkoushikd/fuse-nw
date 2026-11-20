@@ -106,8 +106,12 @@ outcomes are possible:
   \item \emph{Verification succeeds.} The receiver validates the sizes in an order that cannot overflow, namely
     $\mathit{total\_bytes}\le\mathit{file\_total}$ and
     $\mathit{base\_offset}\le\mathit{file\_total}-\mathit{total\_bytes}$. The first lane to succeed then sizes
-    the output with an atomic compare-and-swap, and every other lane must agree on the total. If the claimed
-    size cannot be allocated, the receiver fails with \code{ResourceLimit}.
+    the output with an atomic compare-and-swap, and every other lane must agree on the total. A claim larger
+    than \code{TransferConfig::max_receive_bytes}, or one that cannot be allocated, fails the call with
+    \code{ResourceLimit}. By default the limit is half the machine's physical memory for
+    \code{receive_buffer} and the free space on the destination's filesystem for \code{receive_file}. Before
+    the second review (R4) any claimed size was accepted; on Linux, zero-filling a huge buffer brings in the
+    out-of-memory killer rather than a catchable allocation failure.
 \end{itemize}
 
 \paragraph{Answer and retries.} The receiver then records the lane nonce and the sender's address, computes the
@@ -186,8 +190,10 @@ the receiver's disk.
     one \code{sendmsg} with \code{UDP_SEGMENT}. The kernel splits the buffer into individual datagrams.
   \item \textbf{Reception.} On the receiver, the lane's reader collects it with up to 63 others in one
     \code{recvmmsg}, peeks at the type, and decodes the header. It discards the block if the block is below the
-    base, beyond the window, already received, or currently held by a writer. Otherwise it copies the datagram
-    into the ring of writer $\lfloor4711/64\rfloor\bmod K$.
+    base, beyond the window, already received, or currently held by a writer. Under a pre-shared key, a block
+    from an address other than the validated peer is authenticated by the reader itself before it may take a
+    queue slot (R3); otherwise a forged copy could occupy the slot while the genuine one arrived and was dropped.
+    The reader then copies the datagram into the ring of writer $\lfloor4711/64\rfloor\bmod K$.
   \item \textbf{Decryption and write.} The writer selects its own cipher for the lane and epoch, rebuilds the
     AAD, and opens the block. On success it checks that
     $\mathit{offset}\le\mathit{lane\_total}$ and $\mathit{len}\le\mathit{lane\_total}-\mathit{offset}$, merges
@@ -254,9 +260,15 @@ The growth ceiling is computed from the kernel's route MTU:
 \mathit{ceiling}=\min\bigl(\mathit{block\_ceiling},\;\mathit{mtu}-\mathit{ip\_udp}-31-\mathit{tag}\bigr),
 \]
 and is never below the starting size. An unknown MTU means no growth at all. On loopback, which reports a
-64~KiB MTU, blocks may still grow to 16~KiB; on an ordinary 1,500-byte path they stop at about 1,450 bytes.
+64~KiB MTU, blocks may still grow to 16~KiB; behind a 1,500-byte first hop they stop at about 1,450 bytes.
 Before version~8, blocks grew to 16~KiB on any path. Above the MTU every such datagram is fragmented, and losing
 one fragment loses the whole datagram.
+
+This fix is only partial. The kernel reports the MTU of the first hop, and a narrower link further along the
+path is not detected. Simply setting the don't-fragment bit would be unsafe: a stored block cannot be re-cut
+smaller, so a block too large for the path would be dropped on every retransmission and the transfer would
+stall. Real path MTU discovery needs DPLPMTUD probe packets that are separate from the data, or retransmissions
+that can be re-chunked, and remains open (Chapter~\ref{ch:conclusion}).
 
 On top of the MTU bound, a loss that occurs soon after a growth step makes the previous size the new ceiling,
 so on a path that drops large datagrams the size settles instead of oscillating. In the spirit of
@@ -300,7 +312,8 @@ this linger, so throughput figures are not diluted.
 
 For a resumed transfer, lane~0 also waits for the sender's whole-file digest. The sender computes the digest in a
 background thread that starts right after the handshake, overlapped with sending the missing data. It re-sends
-the digest every 50~ms until the receiver echoes it, and then sends StreamClose(finished) three times.
+the digest every 50~ms, signed afresh each time so that the replay window accepts it, until the receiver
+echoes it, and then sends StreamClose(finished) three times.
 
 \section{State machines of the two lane roles}
 
@@ -375,8 +388,11 @@ $<$ IoError $<$ SocketError $<$ VersionMismatch $<$ ConfigError, Unsupported.
 \section{Resumable file reception}\label{sec:resume}
 
 \code{receive_file} writes into \code{<path>.part} and renames it over \code{<path>} only after every byte has
-arrived and been synchronised to disk, so the destination file is always either untouched or complete. Behind
-the data, the \code{.part} file carries a trailer
+arrived and been synchronised to disk, so the destination file is always either untouched or complete. The
+\code{.part} file is opened with \code{O_NOFOLLOW} and created with \code{O_CREAT|O_EXCL} at mode 0600; an
+existing one is reused only if it is a regular, singly linked file owned by the receiving user (R5). Earlier, a
+symbolic or hard link planted in a shared directory could redirect the write, and decrypted data was readable
+by every user. Behind the data, the \code{.part} file carries a trailer
 \[
 [\,\text{data}\,][\,\text{bitmap: one bit per chunk}\,][\,\mathit{file\_id},\mathit{total},\mathit{chunk},\mathit{nchunks},\mathit{checksum},\text{``FUSERSM1''}\,].
 \]

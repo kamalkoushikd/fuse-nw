@@ -27,4 +27,4 @@ Needs a TeX distribution with TikZ: `sudo apt install texlive-latex-recommended 
 texlive-pictures latexmk` (Debian/Ubuntu) or `brew install --cask mactex-no-gui` (macOS).
 
 All measurements in Chapter 9 were taken on one 4-core Linux machine, comparing protocol version 7 (commit
-`abbf731`) with version 8 (commit `9706e21`).
+`abbf731`) with version 8 after both review passes (commit `e5cb73a`).

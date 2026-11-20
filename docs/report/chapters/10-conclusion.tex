@@ -2,29 +2,23 @@
 
 \section{Limitations}
 
-\subsection{Open issues in the SDK and the HTTP mapping}
+\subsection{Open issues}
 
-The socket-style SDK and the HTTP mapping were deliberately left out of the version~8 pass, which concentrated
-on the protocol core. Their open findings are listed in Table~\ref{tab:open}. The first item in the table is
-the most serious: an application that uses the SDK with encryption is still exposed to the GCM authentication-key
-recovery described in Section~\ref{sec:nonce}, and fixing the SDK is the first item of future work.
+After both review passes, the findings in Table~\ref{tab:open} remain. None of them can be closed by a local
+fix: each needs a redesign.
 
 \begin{table}[H]
 \centering\small
-\caption{Findings still open in the SDK and the HTTP mapping.}\label{tab:open}
+\caption{Findings still open after the second review.}\label{tab:open}
 \begin{tabularx}{\linewidth}{c>{\raggedright\arraybackslash}X}
 \toprule
 \textbf{\#} & \textbf{Issue} \\
 \midrule
-1 & SDK retransmissions re-seal with the retransmission bit in the AAD: the GCM nonce-reuse flaw remains in the SDK \\
-2, 3 & SDK control messages are unauthenticated, and the SDK re-anchors its peer on any ACK, NACK or CLOSE \\
-4 & The SDK server never authenticates the client, and allocates a connection, a socket and a thread per HELLO \\
-12 & Idle SDK connections have no liveness check (HEARTBEAT is never sent) \\
+4 & The SDK server allocates a connection, a socket and a thread for every HELLO before the client proves anything. Heartbeats now bound how long such a connection lives, and the HTTP server caps the count at 256, but the allocation is not prevented. The fix is a stateless cookie exchange like the transfer's Retry, plus a client-side key proof before \code{fuse_accept} returns \\
 13 & The SDK is stop-and-wait per message: only one message is in flight per direction \\
 26 & About 17~MB per SDK connection: registry slots embed 16~KiB payloads while the SDK sends 1,200-byte blocks \\
-27 & \code{fuse_close} frees the connection after two seconds even if a caller is still inside a call \\
-28 & \code{fuse_connect} takes the PSK through \code{strlen}, so a key containing a zero byte is truncated \\
-29 & HTTP: header injection (no CR/LF validation), timeout scope, reason truncation, detached threads, server status, and no tests \\
+--- & In plaintext, SDK path validation only proves that a new address can receive; an attacker who guesses the port and an in-window sequence number can still inject data or move the connection \\
+7 (rest) & No real path MTU discovery: block growth is bounded by the first-hop MTU only (Section~\ref{sec:blocksize}) \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -60,18 +54,14 @@ recovery described in Section~\ref{sec:nonce}, and fixing the SDK is the first i
 
 In order of priority, the next steps are:
 \begin{enumerate}
-  \item \textbf{Apply the version~8 hardening to the SDK}, reusing the bulk transfer's components rather than
-    re-implementing them:
+  \item \textbf{Finish the SDK}:
     \begin{itemize}
-      \item the AAD fix;
-      \item control-plane GMAC;
-      \item path validation;
-      \item Retry-style client validation before allocating per-connection state;
-      \item heartbeats;
-      \item a pipelined window instead of stop-and-wait;
-      \item registry slots sized to the block.
+      \item Retry-style client validation before allocating per-connection state (\#4);
+      \item a pipelined window instead of stop-and-wait (\#13);
+      \item registry slots sized to the block (\#26).
     \end{itemize}
-  \item \textbf{Fix the HTTP mapping's input validation}, and add tests.
+  \item \textbf{Implement real path MTU discovery}, with DPLPMTUD probe packets separate from the data or
+    retransmissions that can be re-chunked~\cite{rfc8899}, so that blocks can safely grow beyond the first hop.
   \item \textbf{Expose per-stream flags in a public API}, so an application can open a loss-tolerant and a
     loss-intolerant stream in one session. This is the feature that motivates the protocol.
   \item \textbf{Make the bulk transfer use a single port}, demultiplexing by stream identifier, and add work
@@ -110,4 +100,6 @@ tests of the happy path never reveal:
 Protocol version~8 fixes all of these in the protocol core, mostly by adopting mechanisms whose design rationale
 is well established in QUIC and TCP: Retry tokens, path validation, AEAD usage limits, selective
 acknowledgement, RFC~6298 timers, pacing and MTU discovery. It does so without any loss of loopback throughput,
-and with large gains under loss. The remaining work, above all the SDK, is now well defined.
+and with large gains under loss. A second, independent review of those fixes found and closed further gaps,
+above all the replay of authenticated control messages, and extended the same protections to the SDK and the
+HTTP mapping. The work that remains is now well defined, and each item in it is a redesign rather than a bug fix.

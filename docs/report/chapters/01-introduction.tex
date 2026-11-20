@@ -64,19 +64,21 @@ The protocol existed at version~7 when this work began. Our contributions are:
   \item \textbf{A complete study of the design and implementation.} We read the entire repository and document
     the wire format, every building block, the three transports, their state machines and the engineering
     principles they follow (Chapters~\ref{ch:arch}--\ref{ch:sdkmux}).
-  \item \textbf{A security and correctness hardening of the protocol core, released as protocol version~8.} A
-    review of version~7 found 31 issues. We fixed every one of them in the protocol core, deliberately leaving
-    the socket-style SDK and the HTTP mapping for a later pass. Each fix was its own commit, with tests. The
-    most significant fixes are:
+  \item \textbf{A security and correctness hardening, released as protocol version~8.} A review of version~7
+    found 31 issues. A first pass fixed every one of them in the protocol core, deliberately leaving the
+    socket-style SDK and the HTTP mapping for later. A second review then examined those fixes, found eight
+    further problems in them (R1--R8), and brought the SDK and the HTTP mapping up to the same standard. Each fix
+    was its own commit, with tests. The most significant fixes are:
     \begin{itemize}
       \item an AES-GCM nonce-reuse flaw on every retransmission;
-      \item an unauthenticated control plane under a pre-shared key;
+      \item an unauthenticated control plane under a pre-shared key, and replay of signed control messages;
       \item address and path validation;
       \item flow control;
       \item use of the selective-acknowledgement bitmask;
       \item RFC~6298 timers with backoff;
       \item slow start, a byte-based window and pacing;
       \item MTU-bounded block growth;
+      \item limits on the resources a peer can make the receiver commit;
       \item AES-GCM key usage limits;
       \item an extension mechanism and an explicit version-mismatch reply (Chapter~\ref{ch:security}).
     \end{itemize}
@@ -109,5 +111,5 @@ The protocol existed at version~7 when this work began. Our contributions are:
 \paragraph{Conventions.} ``Sender'' and ``receiver'' always refer to the direction of the data. A
 \emph{block} is one DATA datagram. A \emph{lane} (bulk transfer) and a \emph{stream} (SDK and multiplexed
 transfer) denote the same idea: one independent sequence-numbered flow with its own window and congestion state.
-References of the form \code{file.cpp:123} point to a line of the source at commit \code{9706e21}. Features new
+References of the form \code{file.cpp:123} point to a line of the source at commit \code{e5cb73a}. Features new
 in protocol version~8 are marked \vviii.

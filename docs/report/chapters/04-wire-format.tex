@@ -18,7 +18,7 @@ dispatches on the message type by peeking at the header alone. Table~\ref{tab:ms
 \textbf{Type} & \textbf{Name} & \textbf{Direction} & \textbf{Used by} & \textbf{Size} \\
 \midrule
 0 & DATA & sender $\to$ receiver & all & $31+\text{payload}$ \\
-1 & HEARTBEAT & either & none (defined only) & 12 \\
+1 & HEARTBEAT & either & SDK (idle liveness) & 12 \\
 2 & ACK & receiver $\to$ sender & all & 160 \\
 3 & NACK & receiver $\to$ sender & all & $6+8n$ \\
 4 & SETUP\_DATA & initiator $\to$ responder & mux & $7+9s+2+\text{ext}$ \\
@@ -47,7 +47,12 @@ version, so any future version can recognise it.
 \begin{itemize}
   \item The reply is never larger than the datagram that triggered it, so it cannot be used to amplify an attack.
   \item A mismatch reply is itself never answered; otherwise two mismatched peers would exchange replies forever.
-  \item The bulk-transfer and multiplexed senders report the condition as \code{VersionMismatch}.
+  \item The reply is unauthenticated by necessity, so a sender treats it only as a \emph{hint}. It counts only
+    if it comes from the receiver's own address; it then shortens the handshake to one second, and the sender
+    reports \code{VersionMismatch} only if the receiver has sent nothing in our version by then. The
+    multiplexed transfer's SETUP likewise ignores replies from other addresses. Before this rule, introduced by
+    the second review (R1), one forged three-byte datagram from anywhere could abort any transfer, even under a
+    pre-shared key.
 \end{itemize}
 
 \subsection{Extensions\vviii}
@@ -118,8 +123,9 @@ domain, and an echo from the future or older than one minute is discarded.
 A NACK, \code{[outer][stream_id:2][count:2][missing_seq_no:8]}$\times$\code{count}, names up to 1,024
 missing sequence numbers. Its length is bounded by the window, because nothing outside the window can be
 tracked, so a full-window NACK (8,198 bytes) is the largest control datagram and receive buffers are sized for
-it. A HEARTBEAT, \code{[outer][stream_id:2][highest_seq_no:8]}, is defined but never sent today, so idle SDK
-connections have no liveness signal (Chapter~\ref{ch:conclusion}).
+it. A HEARTBEAT, \code{[outer][stream_id:2][highest_seq_no:8]}, is sent by an SDK connection that has been idle
+for one second; a peer that has sent nothing for $\max(\mathit{timeout},3\,\mathrm{s})$ is declared lost
+(Section~\ref{sec:sdk}).
 
 \section{Bulk-transfer control messages}
 
@@ -172,6 +178,11 @@ connections have no liveness signal (Chapter~\ref{ch:conclusion}).
   \item \textbf{CLOSE} (2 bytes) is a graceful teardown.
 \end{itemize}
 
+\noindent The SDK otherwise uses the shared DATA, ACK, NACK, HEARTBEAT and path-probe formats. Under a
+pre-shared key its ACK, NACK, CLOSE, HEARTBEAT and path probes carry the control trailer of
+Section~\ref{sec:wirecrypto}\vviii; in plaintext they are acted on only when they come from the peer's current
+address. A key may contain zero bytes: \code{fuse_config::pre_shared_key_len} gives its length.
+
 SETUP\_DATA carries:
 \begin{itemize}
   \item \code{[protocol_version:1][num_workers:2][num_streams:2]};
@@ -198,7 +209,7 @@ Session key & HKDF-SHA256~\cite{rfc5869}: Extract(salt, PSK), then Expand-Label(
 Data key\vviii & Expand-Label(session key, \code{"lane key"}, $\mathit{lane}{:}2\,\|\,(\mathit{seq}\gg22){:}8$) \\
 Control key\vviii & Expand-Label(session key, \code{"control key"}, empty) \\
 DATA AEAD & AES-256-GCM~\cite{nist-gcm}. Nonce $=\mathit{lane}{:}2\,\|\,\mathit{seq}{:}8\,\|\,\text{0x0000}$. AAD $=\mathit{lane}\,\|\,\mathit{seq}\,\|\,\mathit{offset}\,\|\,\mathit{flags}$, with the retransmission bit cleared\vviii. The 16-byte tag follows the ciphertext. \\
-Control trailer\vviii & $\mathit{ctr}{:}8\,\|\,\mathit{tag}{:}16$ appended to every control datagram except RETRY, the version-mismatch reply and STREAM\_CLOSE(reason~2). The tag is a GMAC (GCM with empty plaintext) over the whole datagram including \code{ctr}. Nonce $=\mathit{lane}{:}2\,\|\,\mathit{ctr}{:}8\,\|\,\mathit{dir}{:}1\,\|\,\text{0x01}$, where $\mathit{dir}$ is 0 for the data sender and 1 for the data receiver. \\
+Control trailer\vviii & $\mathit{ctr}{:}8\,\|\,\mathit{tag}{:}16$ appended to every control datagram except RETRY, the version-mismatch reply and STREAM\_CLOSE(reason~2). The tag is a GMAC (GCM with empty plaintext) over the whole datagram including \code{ctr}. Nonce $=\mathit{lane}{:}2\,\|\,\mathit{ctr}{:}8\,\|\,\mathit{dir}{:}1\,\|\,\text{0x01}$, where $\mathit{dir}$ is 0 for the data sender and 1 for the data receiver. Each counter is accepted at most once: the verifier keeps a sliding window of the 1,024 counters below the highest one seen. \\
 \bottomrule
 \end{tabularx}
 \end{table}
