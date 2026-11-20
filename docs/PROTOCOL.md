@@ -20,7 +20,7 @@ Every datagram starts with:
 | value | type | sent by | used by |
 |---|---|---|---|
 | 0 | `Data` | data sender | all transports |
-| 1 | `Heartbeat` | — | defined and encodable, but **no transport sends it** |
+| 1 | `Heartbeat` | either SDK peer | SDK (liveness on idle connections) |
 | 2 | `Ack` | data receiver | all transports |
 | 3 | `Nack` | data receiver | all transports |
 | 4 | `SetupData` | initiator | mux transfer only |
@@ -34,8 +34,8 @@ Every datagram starts with:
 | 12 | `ResumeRanges` | transfer receiver | transfer |
 | 13 | `FileDigest` | transfer sender (echoed by receiver) | transfer (resumed files only) |
 | 14 | `Retry` | transfer receiver | transfer (v8, address validation) |
-| 15 | `PathChallenge` | either transfer peer | transfer (v8, path validation) |
-| 16 | `PathResponse` | either transfer peer | transfer (v8, path validation) |
+| 15 | `PathChallenge` | either peer | transfer, SDK (v8, path validation) |
+| 16 | `PathResponse` | either peer | transfer, SDK (v8, path validation) |
 
 ### Version mismatch (v8)
 
@@ -51,8 +51,18 @@ the transfer and mux receivers answer it (at most once per 100 ms) with a
 
 This layout is fixed independently of `kProtocolVersion`, so any version
 from 8 on recognises it whatever version it speaks. It is never answered
-itself. A sender that receives one returns `TransferStatus::VersionMismatch`
-instead of timing out. (Peers older than v8 still just drop our datagrams.)
+itself. (Peers older than v8 still just drop our datagrams.)
+
+The reply cannot be authenticated (the peer shares neither our framing nor,
+necessarily, our key), so it is treated as a **hint**, not a verdict. A
+sender (transfer `StreamStart`, mux `SETUP_DATA`) only considers one that
+comes from the receiver's own address. It then shortens its handshake
+deadline to 1 s, and returns `TransferStatus::VersionMismatch` only if
+nothing in its own version arrived from the receiver by then. Once the
+receiver has answered in our version, further mismatch replies are ignored.
+A forged 3-byte datagram therefore can't abort a transfer to a receiver
+that really speaks our version. At worst it shortens the wait for one
+that doesn't answer at all.
 
 ### Extensions (v8)
 
@@ -135,9 +145,9 @@ variance allowance, clamped to [5 ms, 1 s], 1 s before any sample, and doubled
 for each consecutive timeout (up to 64×). Only the first timeout of a run
 halves the congestion window.
 
-### HEARTBEAT (12 bytes, unused)
+### HEARTBEAT (12 bytes)
 
-`stream_id:2, highest_seq_no:8`. Nothing sends this today.
+`stream_id:2, highest_seq_no:8`. Sent by the SDK only (see §4).
 
 ## 3. Bulk transfer (`fuse/transfer.hpp`)
 
@@ -169,7 +179,10 @@ gone silent.
 address (a NAT rebinding, say), the receiving side sends a `PathChallenge`
 with a random 64-bit value there, and switches its peer address only when a
 matching `PathResponse` comes back from it. Data from the new source is
-accepted meanwhile.
+accepted meanwhile. Under a PSK, the receiver authenticates a data block
+from a source other than the validated peer on its socket thread *before*
+it is queued for writing. Forged blocks from elsewhere therefore can't
+occupy a sequence number's queue slot and push out the genuine copy.
 
 StreamStart is retried with backoff (1 ms → 200 ms) until both an `Ack`
 and every `ResumeRanges` part carrying the same nonce have arrived, bounded
@@ -242,11 +255,36 @@ of `[bitmap: 1 bit per chunk][footer: file_id, total, chunk_size, nchunks,
 checksum (u64 each), "FUSERSM1"]`. Chunks are 64 KiB, doubled until there
 are at most 8 M of them. The trailer is cut off before the final rename.
 
+The `.part` file is opened with `O_NOFOLLOW` and created with
+`O_CREAT | O_EXCL`, mode `0600`. An existing one is reused only if it is a
+regular, singly linked file owned by the receiving user, so a symlink or
+hard link planted in a shared directory is refused (`ConfigError`).
+
+Before allocating anything, the receiver checks the transfer size claimed
+in `StreamStart` against `TransferConfig::max_receive_bytes`. By default
+that is half of physical memory for `receive_buffer`, and the destination
+filesystem's free space for `receive_file`. A larger claim ends the call
+with `ResourceLimit`.
+
 ## 4. Socket-style SDK (`fuse/sdk.h`)
 
-Unchanged by v8 except for the shared formats above (the ACK is 160 bytes;
-its `rwnd` is not used). The SDK does not send `Retry`, path probes or the
-control-plane trailer; see the roadmap for its pending fixes.
+The SDK shares the formats above (its ACK is 160 bytes, and it ignores
+`rwnd`). It does not use `Retry`. In v8 it gained:
+
+- **Signed control messages** under a PSK (§6). Ack, Nack, Close, Heartbeat
+  and the path probes carry the `ctr ‖ tag` trailer, are verified, and are
+  accepted once each. Unsigned ones are ignored. In plaintext, Ack/Nack/Close
+  are only acted on from the peer's current address.
+- **Path validation**, as in §3. The peer address moves only after the new
+  source answers a `PathChallenge`. It no longer re-anchors on any Ack,
+  Nack or new data block.
+- **Liveness.** A connection that has sent nothing for 1 s sends a
+  `Heartbeat`. A peer that has sent nothing (no data and no signed control
+  message) for `max(timeout_ms, 3 s)` is declared lost, and blocked calls
+  return `FUSE_ERR_TIMEOUT`.
+- **Reassembly bound.** Block `seq` of a message must sit at offset
+  `(seq − first_seq) × 1200`. Blocks outside the receive window are
+  dropped before decryption.
 
 ```
 client (ephemeral port)        server listen port      server per-conn port
@@ -291,7 +329,7 @@ encryption.
 Each stream then runs its own `StreamStart`/Data/Ack/Nack exchange as in
 §3, without address validation, resume, digest or `StreamClose`.
 
-## 6. Encryption (PSK mode, transfer API)
+## 6. Encryption (PSK mode)
 
 - **Key**: HKDF-SHA256. Extract with `salt` = the 16-byte StreamStart salt
   (transfer) or `salt_c ‖ salt_s` (SDK), and IKM = the PSK. Then
@@ -303,10 +341,11 @@ Each stream then runs its own `StreamStart`/Data/Ack/Nack exchange as in
   `Expand-Label(session_key, "lane key", l:2 ‖ (seq >> 22):8)`, so each key
   protects at most 2²² blocks per lane. Both ends derive it independently.
 - **AEAD**: AES-256-GCM. Nonce = `stream_id:2 ‖ seq_no:8 ‖ 0x0000`.
-  AAD = `stream_id:2 ‖ seq_no:8 ‖ offset:8 ‖ flags:1`, where since v8 the
-  transfer API clears the retransmission bit (`0x01`) in the AAD's copy of
-  `flags`, so a retransmission is byte-for-byte the original ciphertext and
-  tag. The 16-byte tag is appended to the ciphertext, inside `payload_len`.
+  AAD = `stream_id:2 ‖ seq_no:8 ‖ offset:8 ‖ flags:1`. Since v8, both the
+  transfer API and the SDK clear the retransmission bit (`0x01`) in the
+  AAD's copy of `flags`, so a retransmission is byte-for-byte the original
+  ciphertext and tag. The 16-byte tag is appended to the ciphertext, inside
+  `payload_len`.
 - **Control plane (v8)**: every transfer control datagram (StreamStart, Ack,
   Nack, ResumeRanges, StreamClose, FileDigest, PathChallenge, PathResponse)
   carries a trailer `ctr:8 ‖ tag:16`: a GMAC over the whole datagram under
@@ -315,8 +354,19 @@ Each stream then runs its own `StreamStart`/Data/Ack/Nack exchange as in
   Unsigned control messages are ignored. The StreamStart's tag confirms the
   key at the handshake. Exceptions, unauthenticated by necessity: `Retry`,
   the version-mismatch reply, and `StreamClose(reason = 2)`.
-- **SDK**: unchanged by v8. Only DATA payloads are protected; its control
-  messages remain unauthenticated.
+- **Replay window**: the verifier keeps a 1024-counter sliding window per
+  lane and direction, like an IPsec/DTLS receiver. It accepts each counter
+  at most once, refuses counters older than the window, and records a
+  counter only after its tag verifies. A sender therefore signs every
+  resend afresh (FileDigest, the three `StreamClose`/`Close` copies). The
+  one exception is the receiver's pre-signed `ResumeRanges` answer, which
+  the sender only needs to accept once per part.
+- **SDK** (v8): data keys rotate per 2²²-block epoch exactly as above, on
+  lane 0 (client→server) and lane 1 (server→client). Control messages are
+  signed as above on lane `0xFFFE`, with `dir` 0 = client and 1 = server.
+  The HelloAck proof is sealed under the session key itself (lane `0xFFFF`,
+  seq 0). `fuse_config::pre_shared_key_len` allows binary keys that contain
+  NUL bytes.
 - **DTLS** (`fuse/proto/dtls.hpp`, DTLS 1.2 with ECDHE-PSK, which does give
   forward secrecy) exists as a standalone primitive. It is exercised by the
   tests and by `fuse_bench`, but none of the three transports above uses it.

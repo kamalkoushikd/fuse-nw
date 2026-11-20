@@ -80,7 +80,8 @@ the [fuse-sdk](https://github.com/kamalkoushikd/fuse-sdk) repo.
 | `fuse/proto/reassembly.hpp` | ORDERED / unordered delivery into a sink |
 | `fuse/proto/send_queue.hpp` | COALESCE / backpressure send queue |
 | `fuse/proto/congestion.hpp` | per-stream AIMD controller |
-| `fuse/proto/session_crypto.hpp` | PSK session keys + per-lane AES-256-GCM |
+| `fuse/proto/session_crypto.hpp` | PSK session keys, per-lane AES-256-GCM, signed control messages with a replay window |
+| `fuse/proto/path_validator.hpp` | challenge/response check before a peer's address may change |
 | `fuse/proto/dtls.hpp` | DTLS 1.2 ECDHE-PSK session (standalone; no transport uses it yet) |
 | `fuse/proto/digest.hpp` | whole-file / segmented SHA-256 digest |
 | `fuse/proto/spsc_ring.hpp` | lock-free single-producer/single-consumer ring |
@@ -90,6 +91,24 @@ the [fuse-sdk](https://github.com/kamalkoushikd/fuse-sdk) repo.
 The byte-level format of every message, and which transport uses which,
 is in [PROTOCOL.md](PROTOCOL.md). Before relying on the encryption, read
 [Known protocol issues](ROADMAP.md#known-protocol-issues).
+
+Behaviour of the higher-level APIs worth knowing when you build on them:
+
+- `TransferConfig::max_receive_bytes` caps the transfer size a receiver
+  accepts. The default (0) is half of physical memory for `receive_buffer`,
+  and the destination's free disk space for `receive_file`. Set it to the
+  largest transfer you expect.
+- `receive_file` creates `<path>.part` with mode `0600`, so the finished file
+  has that mode as well. It refuses a `.part` that is a symlink, a hard link
+  or someone else's file. `chmod` the result if others should read it.
+- `fuse_config::pre_shared_key_len` takes binary SDK keys that contain NUL
+  bytes (0 = NUL-terminated string).
+- SDK connections exchange a heartbeat each second while idle. A peer that
+  is silent for `max(timeout_ms, 3 s)` is treated as gone, and blocked calls
+  return `FUSE_ERR_TIMEOUT`.
+- `fuse_http_serve` serves at most 256 connections at once, gives each
+  `timeout_ms` (default 10 s) to send its request, and returns only after
+  every in-flight handler has finished.
 
 ## 5. Runnable examples
 
