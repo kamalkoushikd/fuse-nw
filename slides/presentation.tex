@@ -1,10 +1,10 @@
-% Fuse: a per-stream transport protocol over UDP -- 20-minute presentation.
+% Fuse: a per-stream transport protocol over UDP -- 15-minute presentation (19 slides).
 % Build:  latexmk -pdf presentation.tex      (or: pdflatex presentation.tex, twice)
 
 \documentclass[aspectratio=169,11pt]{beamer}
 
 \IfFileExists{beamerthememetropolis.sty}{%
-  \usetheme[progressbar=frametitle,numbering=fraction]{metropolis}%
+  \usetheme[progressbar=frametitle,numbering=fraction,sectionpage=none]{metropolis}%
 }{%
   \usetheme{Madrid}%
 }
@@ -69,27 +69,6 @@
   \titlepage
 \end{frame}
 
-% 2 -----------------------------------------------------------------------
-\begin{frame}{Outline}
-  \begin{columns}[T]
-    \column{0.48\textwidth}
-    \begin{enumerate}
-      \item The problem
-      \item Why TCP and QUIC fall short
-      \item Goals and approach
-      \item Architecture
-      \item Reliability and congestion control
-    \end{enumerate}
-    \column{0.48\textwidth}
-    \begin{enumerate}\setcounter{enumi}{5}
-      \item Making it fast
-      \item Security review and the v8 hardening
-      \item Testing and results
-      \item Limitations and future work
-    \end{enumerate}
-  \end{columns}
-\end{frame}
-
 % 3 -----------------------------------------------------------------------
 \section{The problem}
 \begin{frame}{Problem statement}
@@ -149,29 +128,19 @@
   shared --- loss on the bulk stream throttles the telemetry stream too.
 \end{frame}
 
-% 6 -----------------------------------------------------------------------
+% 5 -----------------------------------------------------------------------
 \section{Approach}
-\begin{frame}{Goals}
-  \begin{itemize}
-    \item The \textbf{stream}, not the connection, is the unit of reliability, ordering
-          and congestion control
-    \item Per-stream policy: LOSSLESS, ORDERED, COALESCE
-    \item No heap allocation and no locks on the data path
-    \item Optional AES-256-GCM, a local decision, never negotiated, fails closed
-    \item Measured against a reference QUIC (quinn), not assumed
-    \item Nothing in the core assumes a particular workload
-  \end{itemize}
-\end{frame}
-
-% 7 -----------------------------------------------------------------------
-\begin{frame}{Approach in one slide}
+\begin{frame}{Goals and approach}
+  \small
+  \textbf{Goal:} the \alert{stream}, not the connection, is the unit of reliability, ordering and congestion
+  control; each stream picks LOSSLESS, ORDERED, COALESCE. Encryption optional, local, fail-closed.
+  \vspace{2mm}
   \begin{columns}[T]
     \column{0.5\textwidth}
     \begin{itemize}\small
-      \item \textbf{Blocks over UDP}: each datagram carries stream id, sequence number,
-            byte offset, send time
+      \item \textbf{Blocks over UDP}: stream id, sequence number, byte offset, send time
       \item \textbf{Sender registry}: every unacked block kept for exact resend
-      \item \textbf{Receiver bitmask}: 1024-block window, gaps NACKed after a reorder delay
+      \item \textbf{Receiver window}: 1024 blocks, gaps NACKed after a reorder delay
       \item \textbf{ACK} = base + selective bitmask + RTT echo + receive window
     \end{itemize}
     \column{0.5\textwidth}
@@ -179,7 +148,7 @@
       \item \textbf{Per-stream AIMD} with slow start, RFC 6298 timeouts, pacing
       \item \textbf{Batching}: 64 datagrams per syscall (GSO, \texttt{recvmmsg})
       \item \textbf{Sharding}: N lanes, each its own port, thread and stream
-      \item \textbf{Write-in-place}: lock-free rings, \texttt{pwritev} straight to the final offset
+      \item \textbf{Write-in-place}: lock-free rings, \texttt{pwritev} to the final offset
     \end{itemize}
   \end{columns}
 \end{frame}
@@ -440,36 +409,36 @@ recv seq=3 [rtx]  base=8
 \end{frame}
 
 % 20 ----------------------------------------------------------------------
-\begin{frame}{References (1/2)}
-  \scriptsize
-  \begin{enumerate}[{[}1{]}]\setlength{\itemsep}{1pt}
-    \item J.~Iyengar, M.~Thomson. \emph{QUIC: A UDP-Based Multiplexed and Secure Transport}. RFC 9000, 2021.
-    \item M.~Thomson, S.~Turner. \emph{Using TLS to Secure QUIC}. RFC 9001, 2021 (AEAD usage limits, \S6.6).
-    \item J.~Iyengar, I.~Swett. \emph{QUIC Loss Detection and Congestion Control}. RFC 9002, 2021.
-    \item W.~Eddy (Ed.). \emph{Transmission Control Protocol (TCP)}. RFC 9293, 2022.
-    \item M.~Allman, V.~Paxson, E.~Blanton. \emph{TCP Congestion Control}. RFC 5681, 2009.
-    \item M.~Mathis et al. \emph{TCP Selective Acknowledgment Options}. RFC 2018, 1996.
-    \item V.~Paxson et al. \emph{Computing TCP's Retransmission Timer}. RFC 6298, 2011.
-    \item G.~Fairhurst et al. \emph{Packetization Layer Path MTU Discovery for Datagram Transports}. RFC 8899, 2020.
-    \item H.~Krawczyk, P.~Eronen. \emph{HMAC-based Extract-and-Expand Key Derivation Function (HKDF)}. RFC 5869, 2010.
-    \item E.~Rescorla. \emph{The Transport Layer Security (TLS) Protocol Version 1.3}. RFC 8446, 2018.
-  \end{enumerate}
-\end{frame}
-
-\begin{frame}{References (2/2)}
-  \scriptsize
-  \begin{enumerate}[{[}1{]}]\setcounter{enumi}{10}\setlength{\itemsep}{1pt}
-    \item E.~Rescorla, N.~Modadugu. \emph{Datagram Transport Layer Security Version 1.2}. RFC 6347, 2012; DTLS 1.3, RFC 9147, 2022.
-    \item M.~Dworkin. \emph{Recommendation for Block Cipher Modes of Operation: GCM and GMAC}. NIST SP 800-38D, 2007.
-    \item A.~Joux. \emph{Authentication Failures in NIST version of GCM}. Comments to NIST, 2006.
-    \item J.-P.~Aumasson, D.~J.~Bernstein. \emph{SipHash: a fast short-input PRF}. INDOCRYPT 2012.
-    \item V.~Jacobson. \emph{Congestion Avoidance and Control}. ACM SIGCOMM 1988.
-    \item M.~Mathis, J.~Semke, J.~Mahdavi, T.~Ott. \emph{The Macroscopic Behavior of the TCP Congestion Avoidance Algorithm}. ACM CCR, 1997.
-    \item W.~de Bruijn, E.~Dumazet. \emph{Optimizing UDP for content delivery: GSO, pacing and zerocopy}. Linux Plumbers 2018; \texttt{recvmmsg(2)}.
-    \item S.~Hemminger. \emph{Network Emulation with NetEm}. Linux Conf Australia, 2005.
-    \item A.~Langley et al. \emph{The QUIC Transport Protocol: Design and Internet-Scale Deployment}. ACM SIGCOMM 2017.
-    \item Fuse repository \texttt{kamalkoushikd/fuse-nw}: \texttt{docs/PROTOCOL.md}, \texttt{docs/ROADMAP.md}, \texttt{bench/RESULTS.md}; and our project report.
-  \end{enumerate}
+\begin{frame}{References}
+  \tiny
+  \begin{columns}[T]
+    \column{0.49\textwidth}
+    \begin{enumerate}[{[}1{]}]\setlength{\itemsep}{0pt}
+      \item J.~Iyengar, M.~Thomson. \emph{QUIC: A UDP-Based Multiplexed and Secure Transport}. RFC 9000, 2021.
+      \item M.~Thomson, S.~Turner. \emph{Using TLS to Secure QUIC}. RFC 9001, 2021 (AEAD usage limits, \S6.6).
+      \item J.~Iyengar, I.~Swett. \emph{QUIC Loss Detection and Congestion Control}. RFC 9002, 2021.
+      \item W.~Eddy (Ed.). \emph{Transmission Control Protocol (TCP)}. RFC 9293, 2022.
+      \item M.~Allman, V.~Paxson, E.~Blanton. \emph{TCP Congestion Control}. RFC 5681, 2009.
+      \item M.~Mathis et al. \emph{TCP Selective Acknowledgment Options}. RFC 2018, 1996.
+      \item V.~Paxson et al. \emph{Computing TCP's Retransmission Timer}. RFC 6298, 2011.
+      \item G.~Fairhurst et al. \emph{Packetization Layer Path MTU Discovery for Datagram Transports}. RFC 8899, 2020.
+      \item H.~Krawczyk, P.~Eronen. \emph{HMAC-based Extract-and-Expand Key Derivation Function (HKDF)}. RFC 5869, 2010.
+      \item E.~Rescorla. \emph{The Transport Layer Security (TLS) Protocol Version 1.3}. RFC 8446, 2018.
+    \end{enumerate}
+    \column{0.49\textwidth}
+    \begin{enumerate}[{[}1{]}]\setcounter{enumi}{10}\setlength{\itemsep}{0pt}
+      \item E.~Rescorla, N.~Modadugu. \emph{Datagram Transport Layer Security Version 1.2}. RFC 6347, 2012; DTLS 1.3, RFC 9147, 2022.
+      \item M.~Dworkin. \emph{Recommendation for Block Cipher Modes of Operation: GCM and GMAC}. NIST SP 800-38D, 2007.
+      \item A.~Joux. \emph{Authentication Failures in NIST version of GCM}. Comments to NIST, 2006.
+      \item J.-P.~Aumasson, D.~J.~Bernstein. \emph{SipHash: a fast short-input PRF}. INDOCRYPT 2012.
+      \item V.~Jacobson. \emph{Congestion Avoidance and Control}. ACM SIGCOMM 1988.
+      \item M.~Mathis, J.~Semke, J.~Mahdavi, T.~Ott. \emph{The Macroscopic Behavior of the TCP Congestion Avoidance Algorithm}. ACM CCR, 1997.
+      \item W.~de Bruijn, E.~Dumazet. \emph{Optimizing UDP for content delivery: GSO, pacing and zerocopy}. Linux Plumbers 2018; \texttt{recvmmsg(2)}.
+      \item S.~Hemminger. \emph{Network Emulation with NetEm}. Linux Conf Australia, 2005.
+      \item A.~Langley et al. \emph{The QUIC Transport Protocol: Design and Internet-Scale Deployment}. ACM SIGCOMM 2017.
+      \item Fuse repository \texttt{kamalkoushikd/fuse-nw}: \texttt{docs/PROTOCOL.md}, \texttt{docs/ROADMAP.md}, \texttt{bench/RESULTS.md}; and our project report.
+    \end{enumerate}
+  \end{columns}
 \end{frame}
 
 % 21 ----------------------------------------------------------------------
@@ -477,27 +446,6 @@ recv seq=3 [rtx]  base=8
   Thank you \\[4mm]
   \normalsize Questions?\\[2mm]
   \footnotesize github.com/kamalkoushikd/fuse-nw
-\end{frame}
-
-% Backup -------------------------------------------------------------------
-\appendix
-\begin{frame}{Backup: wire format (version 8)}
-  \scriptsize
-  \begin{tabular}{@{}llp{0.6\textwidth}@{}}
-    \toprule
-    \textbf{Message} & \textbf{Size} & \textbf{Contents} \\
-    \midrule
-    DATA & 31 + payload & stream, seq, flags, length, offset, send time \\
-    ACK & 160 & base, 1024-bit SACK bitmask, echoed time, nonce, rwnd \\
-    NACK & 6 + 8n & missing sequence numbers \\
-    STREAM\_START & 80 + ext & lane size, file offset, salt, nonce, file id, token, extensions \\
-    RETRY & 20 & address-validation token \\
-    PATH\_CHALLENGE/RESPONSE & 20 & 64-bit challenge \\
-    SETUP / HASH\_REPLY / FINACK & 7+9n / 18 / 18 & stream table; receiver's hash + nonce \\
-    HEARTBEAT & 12 & SDK idle liveness, every second \\
-    Version mismatch & 3 & \texttt{[ver][0xFF][ver]}, fixed forever \\
-    \bottomrule
-  \end{tabular}
 \end{frame}
 
 \end{document}

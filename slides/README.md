@@ -1,6 +1,6 @@
 # Presentation slides
 
-A 20-minute Beamer presentation of the project for **CS3530: Computer Networks**: problem statement, design,
+A 15-minute, 19-slide Beamer presentation of the project for **CS3530: Computer Networks**: problem statement, design,
 the version 8 hardening (both review passes), the measured results, and references.
 
 | File | Contents |
@@ -26,4 +26,4 @@ All results on the slides were measured on one 4-core Linux machine, comparing v
 `abbf731`) with version 8 after both review passes (commit `e5cb73a`): the test counts from `ctest -j8` in four
 build configurations, loopback throughput (512 MiB, 4 lanes, median of five runs), and transfers through
 `bench/fuse_netem` (32 MiB, 4 lanes, every output checked byte for byte). The project report
-(`docs/report/`) has the full tables. The numbered references [1]–[20] are listed on the last two slides.
+(`docs/report/`) has the full tables. The numbered references [1]–[20] are listed on the References slide.
