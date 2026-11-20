@@ -28,6 +28,6 @@ macOS: `brew install --cask mactex-no-gui`.
 - **Fuse vs QUIC** (throughput, latency under load, the network-impairment table): `bench/RESULTS.md`,
   measured on a 16-core host at protocol versions 5–7 against quinn.
 - **Fuse vs TCP vs raw UDP** (throughput, latency, delivered fraction under loss): measured for this presentation
-  on a 4-core Linux host at protocol version 8 over loopback (512 MiB in memory, median of 3 runs; 64-byte probes
-  at 2000/s for 5 s with 4 bulk streams; 32 MiB through `bench/fuse_netem` at 2 % and 5 % loss). TCP could not be
-  tested under loss on that host because its kernel has no `netem`.
+  on a 12 core Linux laptop at protocol version 8 over loopback (512 MiB in memory, median of 3 runs; 64 byte probes
+  at 2000/s for 5 s with 4 bulk streams; 32 MiB through `bench/fuse_netem` at 2 % and 5 % loss). TCP was not run
+  under emulated loss.
