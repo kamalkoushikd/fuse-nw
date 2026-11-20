@@ -1,18 +1,18 @@
-% Numbers measured for the presentation (CS3530), 4-core Linux host, protocol v8, loopback.
-% Throughput: 512 MiB in memory, median of 3 runs. Latency: 64-byte probes at 2000/s for 5 s,
+% Numbers measured for the presentation (CS3530) on a 12 core Linux laptop, protocol v8, loopback.
+% Throughput: 512 MiB in memory, median of 3 runs. Latency: 64 byte probes at 2000/s for 5 s,
 % 4 bulk streams. Reliability: 32 MiB through bench/fuse_netem. QUIC numbers on the slides are quoted
-% from bench/RESULTS.md (16-core host, protocol v5-v7).
-\newcommand{\FUSEONE}{729}      % Fuse, 1 lane, MB/s
-\newcommand{\FUSEFOUR}{751}     % Fuse, 4 lanes
+% from bench/RESULTS.md (16 core host, protocol v5 to v7).
+\newcommand{\FUSEONE}{1318}     % Fuse, 1 lane, MB/s
+\newcommand{\FUSEFOUR}{1070}    % Fuse, 4 lanes
 \newcommand{\TCPONE}{6023}      % TCP, 1 connection
 \newcommand{\TCPFOUR}{5189}     % TCP, 4 connections
 \newcommand{\UDPRAW}{552}       % raw UDP send rate (no reliability)
 \newcommand{\UDPDELTWO}{48.2}   % raw UDP, % of datagrams delivered through 2% emulated loss, sent at line rate
 \newcommand{\UDPDELFIVE}{46.3}  % same, 5% loss
-\newcommand{\FUSELATIDLEA}{46.7}  \newcommand{\FUSELATIDLEB}{169.8}  % Fuse idle p50 / p99 (us)
-\newcommand{\FUSELATLOADA}{8.3}   \newcommand{\FUSELATLOADB}{769.9}  % Fuse under 4-lane bulk (2.3 GB/s)
+\newcommand{\FUSELATIDLEA}{30.1}  \newcommand{\FUSELATIDLEB}{136.6}  % Fuse idle p50 / p99 (us)
+\newcommand{\FUSELATLOADA}{19.2}  \newcommand{\FUSELATLOADB}{188.0}  % Fuse under 4 lane bulk (5.5 GB/s)
 \newcommand{\TCPLATIDLEA}{40.8}   \newcommand{\TCPLATIDLEB}{130.6}   % TCP idle
-\newcommand{\TCPLATSAMEA}{15.0}  \newcommand{\TCPLATSAMEB}{15015.9} % TCP, probes on a bulk connection
-\newcommand{\TCPLATSEPA}{25.2}     \newcommand{\TCPLATSEPB}{835.6}   % TCP, probes on their own connection
-\newcommand{\QUICJIT}{0.6}      % QUIC MB/s under 10+-5 ms jitter (bench/RESULTS.md)
+\newcommand{\TCPLATSAMEA}{15.0}   \newcommand{\TCPLATSAMEB}{15015.9} % TCP, probes on a bulk connection
+\newcommand{\TCPLATSEPA}{25.2}    \newcommand{\TCPLATSEPB}{835.6}    % TCP, probes on their own connection
+\newcommand{\QUICJIT}{0.6}      % QUIC MB/s under 10+/5 ms jitter (bench/RESULTS.md)
 \newcommand{\FUSEJIT}{50}       % Fuse MB/s under the same jitter (bench/RESULTS.md)
