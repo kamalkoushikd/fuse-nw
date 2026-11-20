@@ -1,29 +1,33 @@
 # Presentation slides
 
-A 15-minute, 19-slide Beamer presentation of the project for **CS3530: Computer Networks**: problem statement, design,
-the version 8 hardening (both review passes), the measured results, and references.
+A 15-minute, 20-slide presentation of the project for **CS3530: Computer Networks** (17 content slides
+including the title and demo, 2 reference slides, 1 appendix slide). Plain Beamer, with JetBrains Mono as the
+monospace font.
 
 | File | Contents |
 |---|---|
 | `presentation.tex` | Beamer source (16:9) |
+| `results.tex` | The measured numbers used on the results slides, with where they come from |
+| `fonts/` | JetBrains Mono (Apache License 2.0, see `fonts/NOTICE.txt`), bundled so the slides build the same everywhere |
 | `presentation.pdf` | The compiled slides |
 
 ## Building
 
+The slides use `fontspec`, so they need **LuaLaTeX**:
+
 ```sh
 cd slides
-latexmk -pdf presentation.tex        # or: pdflatex presentation.tex && pdflatex presentation.tex
+latexmk -lualatex presentation.tex        # or: lualatex presentation.tex (twice)
 ```
 
-Needs a TeX distribution with Beamer and TikZ:
-`sudo apt install texlive-latex-recommended texlive-latex-extra texlive-pictures latexmk` (Debian/Ubuntu)
-or `brew install --cask mactex-no-gui` (macOS). The `metropolis` theme is used when installed (it ships with
-`texlive-latex-extra`); otherwise the slides fall back to the built-in `Madrid` theme.
+Debian/Ubuntu: `sudo apt install texlive-luatex texlive-latex-extra texlive-pictures fonts-lmodern latexmk`.
+macOS: `brew install --cask mactex-no-gui`.
 
 ## Where the numbers come from
 
-All results on the slides were measured on one 4-core Linux machine, comparing version 7 (commit
-`abbf731`) with version 8 after both review passes (commit `e5cb73a`): the test counts from `ctest -j8` in four
-build configurations, loopback throughput (512 MiB, 4 lanes, median of five runs), and transfers through
-`bench/fuse_netem` (32 MiB, 4 lanes, every output checked byte for byte). The project report
-(`docs/report/`) has the full tables. The numbered references [1]–[20] are listed on the References slide.
+- **Fuse vs QUIC** (throughput, latency under load, the network-impairment table): `bench/RESULTS.md`,
+  measured on a 16-core host at protocol versions 5–7 against quinn.
+- **Fuse vs TCP vs raw UDP** (throughput, latency, delivered fraction under loss): measured for this presentation
+  on a 4-core Linux host at protocol version 8 over loopback (512 MiB in memory, median of 3 runs; 64-byte probes
+  at 2000/s for 5 s with 4 bulk streams; 32 MiB through `bench/fuse_netem` at 2 % and 5 % loss). TCP could not be
+  tested under loss on that host because its kernel has no `netem`.

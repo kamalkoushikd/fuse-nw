@@ -1,451 +1,559 @@
-% Fuse: a per-stream transport protocol over UDP -- 15-minute presentation (19 slides).
-% Build:  latexmk -pdf presentation.tex      (or: pdflatex presentation.tex, twice)
+% Fuse: a per-stream reliable transport over UDP -- CS3530 presentation (15 minutes, 20 slides).
+% Build:  latexmk -lualatex presentation.tex   (LuaLaTeX; JetBrains Mono is bundled in fonts/)
 
 \documentclass[aspectratio=169,11pt]{beamer}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+\setbeamertemplate{itemize items}[circle]
+\setbeamertemplate{blocks}[rounded][shadow=false]
 
-\IfFileExists{beamerthememetropolis.sty}{%
-  \usetheme[progressbar=frametitle,numbering=fraction,sectionpage=none]{metropolis}%
-}{%
-  \usetheme{Madrid}%
-}
-\usepackage[T1]{fontenc}
-\usepackage{lmodern}
-\usepackage{booktabs}
+\usepackage{fontspec}
+\setmonofont{JetBrainsMono}[
+  Path=fonts/, Extension=.ttf, UprightFont=*-Regular, BoldFont=*-Bold,
+  ItalicFont=*-Italic, BoldItalicFont=*-BoldItalic, Scale=0.88]
+\usepackage{booktabs,multirow}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta,positioning,shapes.geometric,calc,fit,backgrounds}
-\usepackage{xcolor}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,shapes.geometric,decorations.pathreplacing}
 
-\definecolor{fuseblue}{HTML}{1F5FA8}
-\definecolor{fusered}{HTML}{B4442A}
-\definecolor{fusegreen}{HTML}{2F7D4A}
-\definecolor{fusegray}{HTML}{5B6573}
-\setbeamercolor{alerted text}{fg=fusered}
-\newcommand{\good}[1]{\textcolor{fusegreen}{\textbf{#1}}}
-\newcommand{\bad}[1]{\textcolor{fusered}{\textbf{#1}}}
+\definecolor{fblue}{RGB}{31,94,165}
+\definecolor{fred}{RGB}{192,57,43}
+\definecolor{fgreen}{RGB}{35,134,54}
+\definecolor{fgray}{RGB}{110,110,110}
+\setbeamercolor{frametitle}{fg=fblue}
+\setbeamercolor{title}{fg=fblue}
+\setbeamercolor{structure}{fg=fblue}
+\setbeamercolor{block title}{fg=white,bg=fblue}
+\setbeamercolor{block body}{bg=fblue!6}
+
 \tikzset{
-  box/.style={draw=fuseblue, fill=fuseblue!8, rounded corners=3pt, align=center,
-              font=\footnotesize, minimum height=7mm, inner sep=3pt},
-  rbox/.style={box, draw=fusered, fill=fusered!8},
-  gbox/.style={box, draw=fusegreen, fill=fusegreen!8},
+  box/.style={draw=fgray, rounded corners=2pt, align=center, font=\footnotesize, inner sep=3pt, fill=white},
+  bbox/.style={box, draw=fblue, fill=fblue!8},
+  rbox/.style={box, draw=fred, fill=fred!8},
+  gbox/.style={box, draw=fgreen, fill=fgreen!8},
   arr/.style={-{Stealth[length=2mm]}, thick},
+  msg/.style={-{Stealth[length=1.8mm]}, semithick},
+  lost/.style={msg, dashed, fred},
+  lab/.style={font=\scriptsize, align=center},
 }
+\newcommand{\fitwidth}[1]{\resizebox{\ifdim\width>\linewidth\linewidth\else\width\fi}{!}{#1}}
+\newcommand{\rf}[1]{{\scriptsize\,[#1]}}
+% Two boxes used on the protocol slides.
+\newcommand{\happening}[1]{\begin{block}{What is happening}\scriptsize #1\end{block}}
+\newcommand{\better}[1]{\begin{block}{Where we are better}\scriptsize #1\end{block}}
 
-% ---- Title-slide details -----------------------------------------------
-\title{Fuse: A Per-Stream Transport Protocol over UDP}
-\subtitle{Reliable bulk data and low-latency streams in one session}
-\author{Boreddy Sri Sai Abhinav Reddy \quad\textbar\quad Chiruvella Gagan Chandra Sai Ram\\[3pt]
+% ---- Measured results -------------------------------------------------------------------------
+% (a) bench/RESULTS.md, 16-core host, protocol v5-v7, 1 GiB, unencrypted.
+% (b) this project's re-run on a 4-core host, protocol v8, 512 MiB, loopback, median of 3.
+\input{results.tex}
+
+\title{Fuse}
+\subtitle{A per-stream reliable transport over UDP}
+\author{Boreddy Sri Sai Abhinav Reddy \quad\textbar\quad Chiruvella Gagan Chandra Sai Ram\\[2pt]
         Kamal Koushik Duppalapadi \quad\textbar\quad Tavva Dinesh Reddy}
 \institute{CS3530: Computer Networks}
 \date{}
-% Reference marker, e.g. \rf{1} -> [1]; the list is on the References slides.
-\newcommand{\rf}[1]{{\scriptsize\,[#1]}}
-% -------------------------------------------------------------------------
-
-% ---- Measured results (filled in from the test and benchmark runs) --------
-\newcommand{\RESDEBUGON}{220 / 220}
-\newcommand{\RESDEBUGOFF}{195 / 195}
-\newcommand{\RESRELON}{220 / 220}
-\newcommand{\RESRELOFF}{195 / 195}
-\newcommand{\RESLOOPOLD}{729}
-\newcommand{\RESLOOPNEW}{924}
-\newcommand{\RESLOOPRTXOLD}{1324}
-\newcommand{\RESLOOPRTXNEW}{1454}
-\newcommand{\RESNETEMROWS}{%
-    Clean relay & 281.5 & 381.9 & +36\% \\
-    Loss 2\% & 66.4 & 181.1 & 2.7$\times$ \\
-    Loss 5\% & 31.5 & 138.4 & 4.4$\times$ \\
-    Delay 25 ms (50 ms RTT) & 55.6 & 52.0 & -6\% \\
-    Jitter 10 $\pm$ 5 ms & 2.7 & 2.7 & 0\% \\
-    Reorder 10\% at 10 ms & 4.2 & 4.0 & -5\% \\
-    Duplicate 3\% at 5 ms & 167.3 & 152.9 & -9\% \\
-    25 ms RTT + 1\% loss & 6.6 & 5.3 & -20\% \\
-}
-% -------------------------------------------------------------------------
 
 \begin{document}
 
-% 1 -----------------------------------------------------------------------
-\begin{frame}
+% 1 ------------------------------------------------------------------------------------------------
+\begin{frame}[plain]
   \titlepage
 \end{frame}
 
-% 3 -----------------------------------------------------------------------
-\section{The problem}
+% 2 ------------------------------------------------------------------------------------------------
 \begin{frame}{Problem statement}
-  \begin{block}{}
-    How do we carry \alert{loss-tolerant, latency-sensitive} streams and
-    \alert{loss-intolerant, throughput-sensitive} streams over \textbf{one session}
-    between two hosts, so that
-    \begin{itemize}
-      \item each stream gets exactly the delivery guarantee it needs,
-      \item loss or a bulk burst on one stream does \textbf{not} slow or delay the others,
-      \item and the whole thing is fast enough to saturate a modern link?
+  \begin{center}
+    \begin{tikzpicture}
+      \node[bbox, minimum width=11cm, minimum height=1.4cm, font=\large] (p)
+        {Build a transport protocol that is \textbf{faster than QUIC}\\ with \textbf{reliability on par} with QUIC};
+    \end{tikzpicture}
+  \end{center}
+  \vspace{4mm}
+  \begin{columns}[T]
+    \column{0.47\textwidth}
+    \textbf{Faster}
+    \begin{itemize}\small
+      \item higher throughput for large objects
+      \item low, flat latency for small messages \emph{while} bulk data flows
+      \item graceful under loss, jitter and reordering
     \end{itemize}
-  \end{block}
-  \vspace{2mm}
-  Also required: optional encryption (fail-closed), and robustness against loss, delay,
-  jitter, reordering and basic network attacks.
+    \column{0.47\textwidth}
+    \textbf{Reliable}
+    \begin{itemize}\small
+      \item every byte delivered, in place, verified
+      \item recovers from loss, duplication, reordering
+      \item optional authenticated encryption (AES-GCM)
+    \end{itemize}
+  \end{columns}
 \end{frame}
 
-% 4 -----------------------------------------------------------------------
-\begin{frame}{Two kinds of traffic, one link}
+% 3 ------------------------------------------------------------------------------------------------
+\begin{frame}{Why this problem?}
   \centering
-  \begin{tikzpicture}[node distance=6mm and 10mm]
-    \node[box, minimum width=34mm] (a) {Telemetry / control\\\scriptsize small, frequent, fresh-or-useless};
-    \node[rbox, minimum width=34mm, below=8mm of a] (b) {Bulk data (files, models)\\\scriptsize large, every byte must arrive};
-    \node[box, right=22mm of $(a)!0.5!(b)$, minimum width=26mm, minimum height=22mm] (s) {one session\\over UDP};
-    \node[gbox, right=22mm of s, minimum width=30mm, minimum height=22mm] (r) {receiver};
-    \draw[arr, fuseblue] (a.east) -- (s.west|-a.east);
-    \draw[arr, fusered] (b.east) -- (s.west|-b.east);
-    \draw[arr] (s) -- (r);
+  \fitwidth{\begin{tikzpicture}[node distance=4mm]
+    \node[bbox, text width=4.4cm, minimum height=3.4cm, font=\small] (a) {\textbf{(i) Beat Google}\\[3pt]
+      QUIC came out of Google and is now the default for HTTP/3\rf{1,19}.\\[2pt]
+      \emph{``Purely out of a personal grudge''} --- Kamal};
+    \node[gbox, text width=4.4cm, minimum height=3.4cm, font=\small, right=of a] (b) {\textbf{(ii) One protocol, two jobs}\\[3pt]
+      telemetry: tiny, frequent, \emph{fresh-or-useless}\\[2pt]
+      large objects: huge, \emph{every byte matters}\\[2pt]
+      \dots in the same session, without hurting each other};
+    \node[rbox, text width=4.4cm, minimum height=3.4cm, font=\small, right=of b] (c) {\textbf{(iii) Who else does this?}\\[3pt]
+      \textbf{Aspera FASP} (IBM): fast bulk transfer over UDP\\[2pt]
+      but \textbf{proprietary} and closed --- no open equivalent};
+  \end{tikzpicture}}
+  \vspace{5mm}
+
+  \small(iv) and QUIC itself has pitfalls for this mix $\Rightarrow$ next slide
+\end{frame}
+
+% 4 ------------------------------------------------------------------------------------------------
+\begin{frame}{Pitfalls of QUIC (which we address)}
+  \centering
+  \fitwidth{\begin{tikzpicture}
+    % 1: shared congestion window
+    \node[rbox, minimum width=1.3cm] (b1) at (0,1.2) {bulk};
+    \node[bbox, minimum width=1.3cm] (t1) at (0,0.2) {telemetry};
+    \node[box, minimum height=1.8cm, minimum width=1.4cm] (w1) at (2.2,0.7) {one\\congestion\\window};
+    \draw[arr, fred] (b1) -- (w1.west|-b1); \draw[arr, fblue] (t1) -- (w1.west|-t1);
+    \node[lab, text width=4.3cm] at (1.1,-0.85) {\textbf{1. Streams share one congestion window}\rf{3}\\
+      bulk loss throttles telemetry: p99 \textbf{$\times$82}};
+    \node[gbox, text width=4.1cm] at (1.1,-2.0) {\textbf{Fuse:} one controller \emph{per stream}};
+    % 2: reordering read as loss
+    \foreach \x/\n in {0/1,0.6/2,1.2/4,1.8/3,2.4/5} \node[box, minimum width=5mm] at (5+\x,1.2) {\n};
+    \draw[arr, fred] (6.2,0.85) -- (6.2,0.45);
+    \node[lab, text=fred] at (6.2,0.25) {``3 is lost'' $\Rightarrow$ recovery};
+    \node[lab, text width=4.3cm] at (6.2,-0.85) {\textbf{2. Reordering and jitter look like loss}\\
+      \QUICJIT\,MB/s under jitter (Fuse: \FUSEJIT\,MB/s)};
+    \node[gbox, text width=4.1cm] at (6.2,-2.0) {\textbf{Fuse:} bitmap + reorder delay before NACK};
+    % 3: mandatory TLS
+    \node[box, minimum width=2.4cm] (app) at (11.3,1.3) {data};
+    \node[rbox, minimum width=2.4cm] (tls) at (11.3,0.7) {TLS 1.3 always};
+    \node[box, minimum width=2.4cm] (udp) at (11.3,0.1) {UDP};
+    \draw[arr] (app) -- (tls); \draw[arr] (tls) -- (udp);
+    \node[lab, text width=4.3cm] at (11.3,-0.85) {\textbf{3. Encryption is mandatory}\rf{2}\\
+      a fixed cost even on trusted links};
+    \node[gbox, text width=4.1cm] at (11.3,-2.0) {\textbf{Fuse:} optional, per session, parallel per lane};
+  \end{tikzpicture}}
+\end{frame}
+
+% 5 ------------------------------------------------------------------------------------------------
+\begin{frame}{How? Have you ever used IDM?}
+  \begin{columns}[c]
+    \column{0.55\textwidth}
+    \centering
+    \begin{tikzpicture}
+      \node[box, minimum width=1.6cm, minimum height=2.6cm] (srv) at (0,0) {server};
+      \foreach \i/\y in {1/1.05,2/0.35,3/-0.35,4/-1.05} {
+        \node[bbox, minimum width=1.1cm] (s\i) at (3.6,\y) {seg \i};
+        \draw[arr] (srv.east|-s\i) -- node[above, lab]{conn \i} (s\i);
+      }
+      \node[gbox, minimum width=1.4cm, minimum height=2.6cm] (f) at (6.2,0) {file};
+      \foreach \i in {1,2,3,4} \draw[arr, fgreen] (s\i) -- (f.west|-s\i);
+      \node[lab] at (3.6,-1.65) {paused at 60\% $\rightarrow$ resumes from there};
+    \end{tikzpicture}
+    \column{0.42\textwidth}
+    \textbf{Internet Download Manager:}
+    \begin{enumerate}\small
+      \item \textbf{splits} the file into segments
+      \item downloads segments over \textbf{parallel connections}
+      \item \textbf{resumes} each segment where it stopped
+      \item writes each segment \textbf{straight to its place} and joins them
+    \end{enumerate}
+  \end{columns}
+\end{frame}
+
+% 6 ------------------------------------------------------------------------------------------------
+\begin{frame}{Our protocol does the same, at the transport layer}
+  \centering
+  \begin{tikzpicture}[row sep=2mm]
+    \foreach \y/\l/\r in {
+      1.5/segment/{\textbf{lane}: own UDP port, thread, window, congestion controller},
+      0.5/parallel connections/{\textbf{parallel lanes} + 64 datagrams per syscall (GSO, \texttt{recvmmsg})\rf{17}},
+      -0.5/resume/{\texttt{.part} file + chunk bitmap $\rightarrow$ \textbf{ResumeRanges}, whole-file digest},
+      -1.5/join at the end/{\textbf{write in place}: lock-free rings, \texttt{pwritev} at the final offset}} {
+      \node[box, minimum width=3.2cm] (l) at (0,\y) {IDM: \l};
+      \node[bbox, minimum width=8.6cm, text width=8.4cm, align=left] (r) at (7.4,\y) {\r};
+      \draw[arr] (l) -- (r);
+    }
+  \end{tikzpicture}
+  \vspace{4mm}
+
+  \small Unlike IDM over TCP, every lane is a \textbf{reliable stream built on UDP blocks}: our own sequence
+  numbers, selective ACKs, NACKs and timers --- no head-of-line blocking between lanes.
+\end{frame}
+
+% 7 ------------------------------------------------------------------------------------------------
+\begin{frame}{Connection flow: handshake, setup, data transfer}
+  \begin{columns}[T]
+    \column{0.55\textwidth}
+    \centering
+    \begin{tikzpicture}[yscale=0.5, every node/.style={font=\scriptsize}]
+      \node[box] at (0.9,0.7) {sender}; \node[box] at (6.1,0.7) {receiver};
+      \draw[fgray] (0.9,0.3) -- (0.9,-10.3); \draw[fgray] (6.1,0.3) -- (6.1,-10.3);
+      \foreach \y/\d/\t in {-0.3/r/StreamStart(nonce), -1.5/l/Retry(token), -2.7/r/StreamStart(nonce + token),
+                            -4.1/l/ResumeRanges + Ack, -5.5/r/DATA blocks (batched), -6.7/l/Ack: base + SACK + rwnd,
+                            -7.9/l/Nack: gaps, -9.1/r/resend the gaps only} {
+        \ifx r\d \draw[msg] (0.9,\y) -- (6.1,\y-0.6); \else \draw[msg] (6.1,\y) -- (0.9,\y-0.6); \fi
+        \node[fill=white, inner sep=1pt] at (3.5,\y-0.3) {\t};
+      }
+      \node[right, lab] at (6.15,-3.3) {key\\check};
+      \draw[decorate, decoration={brace, amplitude=4pt, mirror}, thick] (0.6,-0.2) -- node[left=5pt, lab]{hand-\\shake} (0.6,-3.4);
+      \draw[decorate, decoration={brace, amplitude=4pt, mirror}, thick] (0.6,-3.9) -- node[left=5pt, lab]{setup} (0.6,-4.8);
+      \draw[decorate, decoration={brace, amplitude=4pt, mirror}, thick] (0.6,-5.3) -- node[left=5pt, lab]{data} (0.6,-9.8);
+    \end{tikzpicture}
+    \column{0.43\textwidth}
+    \happening{The sender proves it owns its address (echoes the \textbf{Retry} token) and that it holds the key
+      (signed StreamStart). The receiver replies with the byte ranges it still needs; data then flows,
+      acknowledged cumulatively and selectively.}
+    \better{Each lane has its own window. Nothing is allocated before the peer is proven, so no amplification. A
+      wrong key fails at the handshake. Resume is part of setup, not an add-on.}
+  \end{columns}
+\end{frame}
+
+% 8 ------------------------------------------------------------------------------------------------
+\begin{frame}{Edge cases while data flows: sender side and receiver side}
+  \begin{columns}[T]
+    \column{0.49\textwidth}
+    \centering\textbf{\small Sender side: an ACK is lost}\\[1mm]
+    \begin{tikzpicture}[yscale=0.46, every node/.style={font=\scriptsize}]
+      \draw[fgray] (0,0) -- (0,-5.4); \draw[fgray] (4.6,0) -- (4.6,-5.4);
+      \node at (0,0.45) {sender}; \node at (4.6,0.45) {receiver};
+      \draw[msg] (0,-0.3) -- (4.6,-0.9); \node[fill=white, inner sep=1pt] at (2.3,-0.6) {DATA 5, 6};
+      \draw[lost] (4.6,-1.4) -- (2.6,-1.75); \node[fred] at (2.5,-1.77) {\large$\times$};
+      \node[fred, right] at (2.8,-2.15) {Ack base=7 lost};
+      \draw[msg] (0,-2.6) -- (4.6,-3.2); \node[fill=white, inner sep=1pt] at (2.3,-2.9) {DATA 7, 8};
+      \draw[msg] (4.6,-3.8) -- (0,-4.4); \node[fill=white, inner sep=1pt] at (2.3,-4.1) {Ack base=9: covers 5--8};
+    \end{tikzpicture}\\[-1mm]
+    \scriptsize All ACKs lost? The RTO, $\max(\mathrm{SRTT}{+}4\,\mathrm{RTTVAR},\,2\,\mathrm{SRTT})$\rf{7}, resends the base +
+    known holes, then backs off.
+    \column{0.49\textwidth}
+    \centering\textbf{\small Receiver side: a DATA block is lost}\\[1mm]
+    \begin{tikzpicture}[yscale=0.46, every node/.style={font=\scriptsize}]
+      \draw[fgray] (0,0) -- (0,-5.4); \draw[fgray] (4.6,0) -- (4.6,-5.4);
+      \node at (0,0.45) {sender}; \node at (4.6,0.45) {receiver};
+      \draw[lost] (0,-0.3) -- (2.0,-0.6); \node[fred] at (2.1,-0.62) {\large$\times$};
+      \node[fred, left] at (1.9,-1.0) {DATA 3 lost};
+      \draw[msg] (0,-1.4) -- (4.6,-2.0); \node[fill=white, inner sep=1pt] at (2.3,-1.7) {DATA 4, 5};
+      \node[right, align=left] at (4.65,-2.4) {wait\\RTT/2};
+      \draw[msg] (4.6,-2.9) -- (0,-3.5); \node[fill=white, inner sep=1pt] at (2.3,-3.2) {Nack [3]};
+      \draw[msg] (0,-3.9) -- (4.6,-4.5); \node[fill=white, inner sep=1pt] at (2.3,-4.2) {DATA 3 (resend)};
+      \node[right] at (4.65,-4.6) {base 3$\to$6};
+    \end{tikzpicture}\\[-1mm]
+    \scriptsize Nack lost? Re-Nack after 1.5\,RTT. Duplicates and far-ahead blocks are dropped.
+  \end{columns}
+  \vspace{1mm}
+  \begin{columns}[T]
+    \column{0.49\textwidth}\happening{ACKs are cumulative and carry a 1024-bit SACK map\rf{6}, so the next ACK repairs a lost one.}
+    \column{0.49\textwidth}\better{A late block is not treated as lost: no spurious resends under reordering (QUIC: $\approx$1\,MB/s).}
+  \end{columns}
+\end{frame}
+
+% 9 ------------------------------------------------------------------------------------------------
+\begin{frame}{Edge cases in the handshake}
+  \begin{columns}[T]
+    \column{0.6\textwidth}
+    \scriptsize
+    \begin{tabular}{@{}p{0.34\linewidth}p{0.62\linewidth}@{}}
+      \toprule
+      \textbf{Case} & \textbf{What Fuse does} \\
+      \midrule
+      StreamStart / Retry lost & resend with backoff 1, 2, 4 \dots\ 200\,ms until the connect timeout \\
+      Ack / ResumeRanges lost & the retried StreamStart (same nonce) makes the receiver resend them \\
+      Stale Ack, old session & ignored: the nonce does not match \\
+      Wrong or missing key & StreamStart fails authentication: \texttt{AuthFailed} at once \\
+      Spoofed source address & gets only a 20-byte Retry; nothing is allocated \\
+      Peer on another version & answered with a version reply (only a hint) \\
+      \bottomrule
+    \end{tabular}
+    \column{0.38\textwidth}
+    \centering
+    \begin{tikzpicture}[yscale=0.42, every node/.style={font=\scriptsize}]
+      \draw[fgray] (0,0) -- (0,-5.2); \draw[fgray] (3.6,0) -- (3.6,-5.2);
+      \node at (0,0.45) {sender}; \node at (3.6,0.45) {receiver};
+      \draw[lost] (0,-0.3) -- (1.2,-0.5); \node[fred] at (1.3,-0.52) {\large$\times$}; \node[fred, right] at (1.45,-0.52) {lost};
+      \node[left] at (-0.05,-1.4) {+1 ms};
+      \draw[msg] (0,-1.4) -- (3.6,-2.0); \node[fill=white, inner sep=1pt] at (1.8,-1.7) {StreamStart};
+      \draw[lost] (3.6,-2.5) -- (2.4,-2.75); \node[fred] at (2.3,-2.77) {\large$\times$}; \node[fred, left] at (2.1,-2.77) {lost};
+      \node[left] at (-0.05,-3.4) {+2 ms};
+      \draw[msg] (0,-3.4) -- (3.6,-4.0); \node[fill=white, inner sep=1pt] at (1.8,-3.7) {StreamStart};
+      \draw[msg] (3.6,-4.3) -- (0,-4.9); \node[fill=white, inner sep=1pt] at (1.8,-4.6) {Retry};
+    \end{tikzpicture}
+  \end{columns}
+  \vspace{2mm}
+  \begin{columns}[T]
+    \column{0.49\textwidth}\happening{Every handshake message is retried on silence, and every reply carries the sender's random nonce.}
+    \column{0.49\textwidth}\better{Bounded by time, not a retry count, so it works at any RTT; a key or version problem is reported, not a timeout.}
+  \end{columns}
+\end{frame}
+
+% 10 -----------------------------------------------------------------------------------------------
+\begin{frame}{Receiver side: big files, resume, many threads}
+  \centering
+  \begin{tikzpicture}
+    \foreach \i/\y in {0/1.2,1/0.4,2/-0.4,3/-1.2} {
+      \node[box, minimum width=1.4cm] (s\i) at (0,\y) {lane \i};
+      \node[bbox, minimum width=1.6cm] (r\i) at (2.4,\y) {reader \i};
+      \draw[arr] (s\i) -- (r\i);
+    }
+    \node[gbox, minimum width=1.7cm] (w0) at (5.6,0.8) {writer 1};
+    \node[gbox, minimum width=1.7cm] (w1) at (5.6,0) {writer $K$};
+    \node[rbox, minimum width=1.7cm] (rt) at (5.6,-0.8) {retransmits};
+    \foreach \i in {0,1,2,3} { \draw[msg, fblue] (r\i.east) -- (w0.west); \draw[msg, fblue] (r\i.east) -- (w1.west); \draw[msg, fred!70] (r\i.east) -- (rt.west); }
+    \node[box, minimum width=2.4cm, minimum height=2.4cm] (f) at (8.9,0) {\texttt{file.part}\\[2pt]\scriptsize data\\\scriptsize + chunk bitmap\\\scriptsize + footer};
+    \draw[arr, fgreen] (w0) -- (f.west|-w0); \draw[arr, fgreen] (w1) -- (f); \draw[arr, fgreen] (rt) -- (f.west|-rt);
+    \node[lab] at (4.0,1.75) {lock-free SPSC rings};
+    \node[lab] at (7.25,-1.35) {\texttt{pwritev} at offset};
+    \node[box, minimum width=1.4cm] (fin) at (11.9,0) {\texttt{file}};
+    \draw[arr] (f) -- (fin); \node[lab] at (10.6,-0.55) {rename when\\complete};
+  \end{tikzpicture}
+  \vspace{3mm}
+
+  \begin{columns}[T]
+    \column{0.32\textwidth}\textbf{\small Big files}\\\scriptsize never held in memory; each block goes straight to its final offset; runs of 64 blocks become one write
+    \column{0.32\textwidth}\textbf{\small Resume}\\\scriptsize chunk bitmap saved every second; a rerun asks only for missing ranges, then checks a whole-file SHA-256 digest
+    \column{0.32\textwidth}\textbf{\small Many threads}\\\scriptsize one reader per lane, $K$ writers decrypt + write in parallel; an ACK only covers bytes already on disk
+  \end{columns}
+\end{frame}
+
+% 11 -----------------------------------------------------------------------------------------------
+\begin{frame}{Connection close}
+  \centering
+  \begin{tikzpicture}[node distance=4mm and 7mm, every node/.style={font=\scriptsize}]
+    \node[bbox] (a) {every byte\\acknowledged};
+    \node[bbox, right=of a] (b) {sender: StreamClose\\(finished) $\times$3};
+    \node[gbox, right=of b] (c) {receiver leaves at once};
+    \node[box, below=of b] (d) {close lost?};
+    \node[gbox, right=of d] (e) {receiver lingers and re-ACKs;\\leaves after 400\,ms quiet or 1.5\,s};
+    \draw[arr] (a) -- (b); \draw[arr] (b) -- (c); \draw[arr] (b) -- (d); \draw[arr] (d) -- (e);
+    \node[rbox, below=10mm of a] (x) {cancel, timeout\\or I/O error};
+    \node[rbox, right=of x] (y) {StreamClose(aborted) $\times$3};
+    \node[rbox, right=of y] (z) {peer stops at once:\\\texttt{PeerAborted}};
+    \node[box, right=of z] (p) {\texttt{.part} kept for resume;\\\texttt{file} untouched};
+    \draw[arr, fred] (x) -- (y); \draw[arr, fred] (y) -- (z); \draw[arr] (z) -- (p);
   \end{tikzpicture}
   \vspace{4mm}
   \begin{columns}[T]
-    \column{0.45\textwidth}
-    \textbf{Loss-tolerant stream wants}\\ low, steady latency; drop old data rather than wait
-    \column{0.45\textwidth}
-    \textbf{Loss-intolerant stream wants}\\ full reliability, correct placement, maximum throughput
+    \column{0.49\textwidth}\happening{A finished sender tells the receiver it may leave; an aborting side tells its peer. Both are sent three times and signed under a key.}
+    \column{0.49\textwidth}\better{Neither side waits out a timeout, and the output file is either complete or untouched.}
   \end{columns}
 \end{frame}
 
-% 5 -----------------------------------------------------------------------
-\begin{frame}{Why TCP and QUIC fall short}
-  \small
-  \begin{tabular}{@{}lccc@{}}
+% 12 -----------------------------------------------------------------------------------------------
+\begin{frame}{Results: throughput}
+  \begin{columns}[T]
+    \column{0.5\textwidth}
+    \centering\small\textbf{Fuse vs QUIC} (quinn\rf{20}), 1 GiB file\\[-1mm]
+    \begin{tikzpicture}[x=1.15cm, y=0.0006cm]
+      \foreach \v in {0,1000,2000,3000,4000} {\draw[black!12] (0.4,\v) -- (3.9,\v); \node[lab, left] at (0.4,\v) {\v};}
+      \foreach \i/\l/\f/\q in {1/1 lane/1327.7/678.6, 2/4 lanes/3980.8/1847.4, 3/8 lanes/4225.6/3238.4} {
+        \fill[fblue] (\i-0.3,0) rectangle (\i,\f); \fill[fgray!60] (\i,0) rectangle (\i+0.3,\q);
+        \node[lab, below] at (\i,0) {\l};
+      }
+      \draw (0.4,0) -- (3.9,0);
+      \fill[fblue] (0.6,4700) rectangle ++(0.18,180); \node[lab, right] at (0.8,4790) {Fuse};
+      \fill[fgray!60] (1.7,4700) rectangle ++(0.18,180); \node[lab, right] at (1.9,4790) {QUIC};
+      \node[lab, rotate=90] at (-0.35,2200) {MB/s};
+    \end{tikzpicture}\\
+    \scriptsize 1.3--2.2$\times$ QUIC; 1.3--1.8$\times$ with encryption on both\\
+    \scriptsize (repo benchmark, 16-core host, v5--v7)
+    \column{0.5\textwidth}
+    \centering\small\textbf{Fuse vs TCP vs raw UDP}, 512 MiB, loopback\\[-1mm]
+    \begin{tikzpicture}[x=1.05cm, y=0.00048cm]
+      \foreach \v in {0,2000,4000,6000} {\draw[black!12] (0.4,\v) -- (5.6,\v); \node[lab, left] at (0.4,\v) {\v};}
+      \foreach \i/\l/\v/\c in {1/Fuse\\1 lane/\FUSEONE/fblue, 2/Fuse\\4 lanes/\FUSEFOUR/fblue, 3/TCP\\1 conn/\TCPONE/fgray!60, 4/TCP\\4 conns/\TCPFOUR/fgray!60, 5/raw\\UDP$^{*}$/\UDPRAW/fred!60} {
+        \fill[\c] (\i-0.3,0) rectangle (\i+0.3,\v); \node[lab, below] at (\i,0) {\l};
+        \node[lab, above] at (\i,\v) {\v};
+      }
+      \draw (0.4,0) -- (5.6,0);
+    \end{tikzpicture}\\
+    \scriptsize this run: 4-core host, v8. Kernel TCP wins on a \emph{lossless} loopback\\
+    \scriptsize (64\,KiB segments, kernel offload). $^{*}$UDP: no reliability at all.
+  \end{columns}
+\end{frame}
+
+% 13 -----------------------------------------------------------------------------------------------
+\begin{frame}{Results: latency of small messages during a bulk transfer}
+  \centering\footnotesize
+  One-way latency of 64-byte probes at 2000/s, idle and with 4 bulk streams running (\textmu s)\\[1mm]
+  \begin{tabular}{@{}llrrl@{}}
     \toprule
-    & \textbf{TCP}\rf{4,5} & \textbf{QUIC}\rf{1,3} & \textbf{Needed} \\
+    \textbf{Protocol} & \textbf{Configuration} & \textbf{p50} & \textbf{p99} & \\
     \midrule
-    Streams & one byte stream & many streams & many streams \\
-    Head-of-line blocking & \bad{everything} & per stream & none across streams \\
-    Congestion control & per connection & \bad{per connection} & \good{per stream} \\
-    Unreliable streams & \bad{no} & datagram ext.\ only & \good{first-class} \\
-    Encryption & optional & \bad{mandatory} & optional, fail-closed \\
+    Fuse & idle & 14.1 & 39.6 & \multirow{5}{*}{\scriptsize repo, 16-core host} \\
+    Fuse & under 6.3 GB/s bulk & \textbf{15.8} & \textbf{38.2} & \\
+    QUIC & idle & 55.3 & 153.6 & \\
+    QUIC & under bulk, same connection & 326.9 & \textcolor{fred}{\textbf{12584.8}} & $\times$82 \\
+    QUIC & under bulk, separate connection & 42.5 & 82.4 & \\
+    \midrule
+    Fuse & idle & \FUSELATIDLEA & \FUSELATIDLEB & \multirow{5}{*}{\scriptsize this run, 4-core host} \\
+    Fuse & under 2.3 GB/s bulk & \textbf{\FUSELATLOADA} & \textbf{\FUSELATLOADB} & \\
+    TCP & idle & \TCPLATIDLEA & \TCPLATIDLEB & \\
+    TCP & under bulk, same connection & \TCPLATSAMEA & \textcolor{fred}{\textbf{\TCPLATSAMEB}} & \\
+    TCP & under bulk, separate connection & \TCPLATSEPA & \TCPLATSEPB & \\
     \bottomrule
   \end{tabular}
   \vspace{3mm}
 
-  \textbf{Key observation:} QUIC multiplexes streams, but its congestion window is
-  shared --- loss on the bulk stream throttles the telemetry stream too.
+  Fuse keeps telemetry latency \textbf{flat under load inside one session}; QUIC and TCP need a second
+  connection (and handshake, and congestion controller) to get close.
 \end{frame}
 
-% 5 -----------------------------------------------------------------------
-\section{Approach}
-\begin{frame}{Goals and approach}
-  \small
-  \textbf{Goal:} the \alert{stream}, not the connection, is the unit of reliability, ordering and congestion
-  control; each stream picks LOSSLESS, ORDERED, COALESCE. Encryption optional, local, fail-closed.
-  \vspace{2mm}
+% 14 -----------------------------------------------------------------------------------------------
+\begin{frame}{Results: reliability under a bad network}
   \begin{columns}[T]
-    \column{0.5\textwidth}
-    \begin{itemize}\small
-      \item \textbf{Blocks over UDP}: stream id, sequence number, byte offset, send time
-      \item \textbf{Sender registry}: every unacked block kept for exact resend
-      \item \textbf{Receiver window}: 1024 blocks, gaps NACKed after a reorder delay
-      \item \textbf{ACK} = base + selective bitmask + RTT echo + receive window
-    \end{itemize}
-    \column{0.5\textwidth}
-    \begin{itemize}\small
-      \item \textbf{Per-stream AIMD} with slow start, RFC 6298 timeouts, pacing
-      \item \textbf{Batching}: 64 datagrams per syscall (GSO, \texttt{recvmmsg})
-      \item \textbf{Sharding}: N lanes, each its own port, thread and stream
-      \item \textbf{Write-in-place}: lock-free rings, \texttt{pwritev} to the final offset
-    \end{itemize}
+    \column{0.55\textwidth}
+    \scriptsize
+    \begin{tabular}{@{}lrrc@{}}
+      \toprule
+      \textbf{Condition} (32 MiB) & \textbf{Fuse} & \textbf{QUIC} & \textbf{intact} \\
+      \midrule
+      clean relay & 2096 & 502 & both \\
+      loss 2\,\% & 358 & 201 & both \\
+      loss 5\,\% & 27--226 & 83 & both \\
+      delay 25\,ms (50\,ms RTT) & 53 & 55 & both \\
+      jitter 10\,$\pm$5\,ms & \textbf{50} & 0.6 & both \\
+      reorder 10\,\% & \textbf{41} & 1.0 & both \\
+      duplicate 3\,\% & 249 & 218 & both \\
+      25\,ms RTT + 1\,\% loss & \textbf{52} & 2.8 & both \\
+      \bottomrule
+    \end{tabular}\\[1mm]
+    MB/s through the \texttt{fuse\_netem} emulator\rf{18}; repo, 16-core host
+    \column{0.42\textwidth}
+    \centering\small\textbf{Bytes delivered intact}\\[1mm]
+    \begin{tikzpicture}[x=1.2cm, y=0.028cm]
+      \foreach \v in {0,50,100} {\draw[black!12] (0.4,\v) -- (3.6,\v); \node[lab, left] at (0.4,\v) {\v\,\%};}
+      \fill[fblue] (0.7,0) rectangle (1.1,100); \fill[fred!60] (1.1,0) rectangle (1.5,\UDPDELTWO);
+      \fill[fblue] (2.5,0) rectangle (2.9,100); \fill[fred!60] (2.9,0) rectangle (3.3,\UDPDELFIVE);
+      \node[lab, below] at (1.1,0) {loss 2\,\%}; \node[lab, below] at (2.9,0) {loss 5\,\%};
+      \node[lab, above] at (1.3,\UDPDELTWO) {\UDPDELTWO}; \node[lab, above] at (3.1,\UDPDELFIVE) {\UDPDELFIVE};
+      \node[lab, above] at (0.9,100) {100}; \node[lab, above] at (2.7,100) {100};
+      \draw (0.4,0) -- (3.6,0);
+    \end{tikzpicture}\\
+    \scriptsize\textcolor{fblue}{$\blacksquare$} Fuse: 100\,\%, byte-identical (this run)\\
+    \textcolor{fred!60}{$\blacksquare$} raw UDP at full speed: emulated loss \emph{plus} overflow (no congestion control)\\
+    TCP: reliable by design; loss could not be emulated on this host (no \texttt{netem})
   \end{columns}
 \end{frame}
 
-% 8 -----------------------------------------------------------------------
-\section{Architecture}
-\begin{frame}{Architecture}
+% 15 -----------------------------------------------------------------------------------------------
+\begin{frame}{Bonus: SDKs and the browser}
   \centering
-  \begin{tikzpicture}[x=1mm,y=1mm]
-    \node[box, fill=fusegray!10, draw=fusegray, minimum width=126mm] (app) at (63,62) {Application (C, C++, Python)};
-    \node[rbox, minimum width=28mm] at (14,50) {HTTP mapping};
-    \node[rbox, minimum width=30mm] at (46,50) {Socket SDK};
-    \node[rbox, minimum width=30mm] at (79,50) {Bulk transfer};
-    \node[rbox, minimum width=30mm] at (112,50) {Multiplexed};
-    \node[box, minimum width=54mm, minimum height=10mm] at (27,37) {Reliability\\\scriptsize registry, receiver, congestion, SETUP};
-    \node[box, minimum width=34mm, minimum height=10mm] at (75,37) {Concurrency\\\scriptsize SPSC ring, orchestrator};
-    \node[box, minimum width=34mm, minimum height=10mm] at (112,37) {Security\\\scriptsize AEAD, GMAC, DTLS};
-    \node[gbox, minimum width=88mm] at (44,25) {Wire format: wire, block, control};
-    \node[gbox, minimum width=34mm] at (112,25) {UdpSocket};
-    \node[box, fill=fusegray!10, draw=fusegray, minimum width=126mm] at (63,14) {Kernel UDP (GSO, recvmmsg) \quad wolfSSL (AES-GCM, HKDF, SHA-256)};
+  \begin{tikzpicture}[node distance=5mm and 8mm]
+    \node[bbox, minimum width=2.4cm] (py) {Python app};
+    \node[bbox, minimum width=2.4cm, below=of py] (cpp) {C++ app};
+    \node[gbox, minimum width=3cm, minimum height=1.6cm, right=14mm of $(py)!0.5!(cpp)$] (sdk) {Fuse SDK\\\scriptsize C ABI: \texttt{fuse\_connect},\\\scriptsize \texttt{fuse\_send}, \texttt{fuse\_recv}};
+    \node[box, minimum width=2.4cm, minimum height=1.6cm, right=of sdk] (net) {Fuse over UDP};
+    \draw[arr] (py) -- (sdk); \draw[arr] (cpp) -- (sdk); \draw[arr] (sdk) -- (net);
+    \node[rbox, minimum width=2.4cm, below=12mm of cpp] (br) {browser};
+    \node[box, minimum width=3cm, right=14mm of br] (alt) {HTTPS response:\\\texttt{Alt-Svc: hfuse-00}\rf{19}};
+    \node[box, minimum width=2.4cm, right=of alt] (h) {HTTP request /\\response over Fuse};
+    \draw[arr] (br) -- (alt); \draw[arr, dashed] (alt) -- (h);
+  \end{tikzpicture}
+  \vspace{3mm}
+  \begin{columns}[T]
+    \column{0.49\textwidth}\textbf{\small SDKs}\\\scriptsize Python and C++ bindings over the C API, \textbf{tested on macOS and Linux}; message-oriented: what one \texttt{send} delivers, one \texttt{recv} returns
+    \column{0.49\textwidth}\textbf{\small Browser (partial)}\\\scriptsize one HTTP/1.1 request and response per Fuse message, discovered through \texttt{Alt-Svc}; validated headers, bounded server
+  \end{columns}
+\end{frame}
+
+% 16 -----------------------------------------------------------------------------------------------
+\begin{frame}{Demo}
+  \centering
+  \vspace{8mm}
+  {\Huge Live demo}\\[6mm]
+  {\large ncurses view of a Fuse transfer}\\[8mm]
+  \begin{tikzpicture}
+    \node[box, minimum width=4cm, minimum height=1.2cm, font=\ttfamily\small] (s) {sender};
+    \node[box, minimum width=4cm, minimum height=1.2cm, font=\ttfamily\small, right=2cm of s] (r) {receiver};
+    \draw[arr, fblue] (s) -- node[above, lab]{lanes, ACKs, NACKs} (r);
   \end{tikzpicture}
 \end{frame}
 
-% 9 -----------------------------------------------------------------------
-\begin{frame}{Reliability: registry, bitmask, NACK and SACK}
-  \centering
-  \begin{tikzpicture}[x=9mm,y=7mm]
-    \foreach \i/\s/\fc in {0/3/fusered!25,1/4/fusered!25,2/5/fusegreen!25,3/6/white,4/7/white} {
-      \draw[fill=\fc, draw=fusegray] (\i,0) rectangle +(0.85,0.85);
-      \node[font=\small] at (\i+0.42,0.42) {\s};
-    }
-    \node[anchor=east, font=\small] at (-0.2,0.42) {base = 3};
-    \node[anchor=west, font=\scriptsize, align=left] at (5.2,0.42)
-      {green: received \quad red: expected, missing\\white: not yet due};
-  \end{tikzpicture}
-  \vspace{3mm}
-  \begin{enumerate}\small
-    \item Block 5 arrives before 3 and 4 $\Rightarrow$ 3, 4 become \emph{missing}
-    \item After a reorder delay ($\approx$ RTT/2) the receiver sends \texttt{NACK[3,4]}
-    \item Sender resends them from its registry, byte for byte
-    \item ACK carries base + bitmask: blocks already held (5) are \textbf{never resent} (SACK\rf{6})
-    \item When 3 and 4 arrive the base slides to 6 --- O(1) per packet (ring-indexed)
+% 17 -----------------------------------------------------------------------------------------------
+\begin{frame}{Conclusion}
+  \begin{itemize}
+    \item \textbf{Problem:} a transport faster than QUIC with on-par reliability, for telemetry \emph{and}
+          large objects in one session
+    \item \textbf{Idea:} IDM-style parallel lanes, but every lane is its own reliable stream over UDP with its
+          own congestion control
+    \item \textbf{Protocol:} validated handshake, SACK + NACK recovery, write-in-place receiver with resume,
+          clean close; hardened in two security reviews
+    \item \textbf{Results:} 1.3--2.2$\times$ QUIC throughput; flat small-message latency under bulk load;
+          byte-identical delivery under loss, jitter and reordering
+  \end{itemize}
+  \vspace{6mm}
+  \centering{\Large Thank you --- questions?}\\[2mm]
+  \footnotesize\texttt{github.com/kamalkoushikd/fuse-nw}
+\end{frame}
+
+% 18-19 --------------------------------------------------------------------------------------------
+\begin{frame}{References (1/2)}
+  \scriptsize
+  \begin{enumerate}[{[}1{]}]\setlength{\itemsep}{1pt}
+    \item J.~Iyengar, M.~Thomson. \emph{QUIC: A UDP-Based Multiplexed and Secure Transport}. RFC 9000, 2021.
+    \item M.~Thomson, S.~Turner. \emph{Using TLS to Secure QUIC}. RFC 9001, 2021.
+    \item J.~Iyengar, I.~Swett. \emph{QUIC Loss Detection and Congestion Control}. RFC 9002, 2021.
+    \item W.~Eddy (Ed.). \emph{Transmission Control Protocol (TCP)}. RFC 9293, 2022.
+    \item M.~Allman, V.~Paxson, E.~Blanton. \emph{TCP Congestion Control}. RFC 5681, 2009.
+    \item M.~Mathis et al. \emph{TCP Selective Acknowledgment Options}. RFC 2018, 1996.
+    \item V.~Paxson et al. \emph{Computing TCP's Retransmission Timer}. RFC 6298, 2011.
+    \item G.~Fairhurst et al. \emph{Packetization Layer Path MTU Discovery for Datagram Transports}. RFC 8899, 2020.
+    \item H.~Krawczyk, P.~Eronen. \emph{HMAC-based Extract-and-Expand Key Derivation Function (HKDF)}. RFC 5869, 2010.
+    \item E.~Rescorla. \emph{The Transport Layer Security (TLS) Protocol Version 1.3}. RFC 8446, 2018.
   \end{enumerate}
 \end{frame}
 
-% 10 ----------------------------------------------------------------------
-\begin{frame}{Per-stream congestion control}
-  \begin{columns}[c]
-    \column{0.52\textwidth}
-    \begin{itemize}\small
-      \item One controller \textbf{per stream}: loss on bulk data does not shrink the
-            telemetry stream's window
-      \item RTT from timestamp echoes (sender's own clock)
-      \item Epochs of one RTT: loss $\Rightarrow$ window $\div 2$;
-            clean $\Rightarrow$ $\times 2$ (slow start) or $+$step\rf{5,15}
-      \item Timeout = $\max(\mathrm{SRTT}+4\,\mathrm{RTTVAR},\ 2\,\mathrm{SRTT})$, exponential backoff\rf{7}
-      \item Pacing spreads a window over one RTT
-      \item Receive window in every ACK (flow control)
-    \end{itemize}
-    \column{0.44\textwidth}
-    \centering
-    \begin{tikzpicture}[x=5.5mm,y=4.2mm]
-      \draw[->] (0,0) -- (10.5,0) node[right,font=\scriptsize]{RTTs};
-      \draw[->] (0,0) -- (0,8) node[above,font=\scriptsize]{window};
-      \draw[thick, fuseblue] (0,0.5) -- (1,1) -- (2,2) -- (3,4) -- (4,7.6);
-      \draw[thick, fuseblue] (4,7.6) -- (4,3.8) -- (5,4.3) -- (6,4.8) -- (7,5.3) -- (7,2.65) -- (8,3.15) -- (9,3.65) -- (10,4.15);
-      \node[font=\scriptsize, fuseblue] at (2,5) {slow start};
-      \node[font=\scriptsize, fusered] at (5.8,7.2) {loss: $\div 2$};
-      \node[font=\scriptsize, fusegray] at (8.4,1.4) {additive};
-    \end{tikzpicture}
-  \end{columns}
-\end{frame}
-
-% 11 ----------------------------------------------------------------------
-\begin{frame}{Making it fast}
-  \centering
-  \begin{tikzpicture}[node distance=5mm and 8mm]
-    \node[rbox] (s0) {lane 0}; \node[rbox, right=of s0] (s1) {lane 1};
-    \node[rbox, right=of s1] (s2) {lane 2}; \node[rbox, right=of s2] (s3) {lane 3};
-    \node[box, below=8mm of s0] (r0) {reader 0}; \node[box, below=8mm of s1] (r1) {reader 1};
-    \node[box, below=8mm of s2] (r2) {reader 2}; \node[box, below=8mm of s3] (r3) {reader 3};
-    \node[gbox, below=8mm of $(r0)!0.5!(r1)$] (w0) {writer 0};
-    \node[gbox, below=8mm of $(r2)!0.5!(r3)$] (w1) {writer 1};
-    \node[box, fill=fusegray!10, draw=fusegray, below=6mm of $(w0)!0.5!(w1)$, minimum width=80mm] (f) {output file: \texttt{pwritev} at the final offset};
-    \foreach \i in {0,1,2,3} \draw[arr] (s\i) -- node[right,font=\tiny]{GSO} (r\i);
-    \draw[arr, fuseblue] (r0) -- (w0); \draw[arr, fuseblue] (r1) -- (w0);
-    \draw[arr, fuseblue] (r2) -- (w1); \draw[arr, fuseblue] (r3) -- (w1);
-    \draw[arr, fusegreen] (w0) -- (f); \draw[arr, fusegreen] (w1) -- (f);
-    \node[font=\scriptsize, fuseblue, right=2mm of r3, align=left] {lock-free\\SPSC rings};
-  \end{tikzpicture}
-  \vspace{2mm}
-
-  \small 64 datagrams per syscall\rf{17} \quad$\cdot$\quad N independent lanes \quad$\cdot$\quad
-  decrypt + write in parallel \quad$\cdot$\quad ACK only covers bytes already written
-\end{frame}
-
-% 12 ----------------------------------------------------------------------
-\begin{frame}{The life of one packet}
-  \centering
-  \begin{tikzpicture}[x=1mm,y=1mm]
-    \foreach \x/\n in {10/sender, 45/kernel, 75/reader, 105/writer, 132/disk}
-      { \node[box, minimum width=20mm] at (\x,48) {\n}; \draw[fusegray!60] (\x,44) -- (\x,2); }
-    \draw[arr] (10,38) -- node[above,font=\tiny]{store, seal, frame, GSO} (45,38);
-    \draw[arr] (45,32) -- node[above,font=\tiny]{recvmmsg batch} (75,32);
-    \draw[arr] (75,26) -- node[above,font=\tiny]{filter, SPSC ring} (105,26);
-    \draw[arr] (105,20) -- node[above,font=\tiny]{open + pwritev} (132,20);
-    \draw[arr, fuseblue, dashed] (105,14) -- node[above,font=\tiny]{done} (75,14);
-    \draw[arr, fuseblue, dashed] (75,8) -- node[above,font=\tiny]{ACK(base, SACK, echo, rwnd)} (10,8);
-  \end{tikzpicture}
-\end{frame}
-
-% 13 ----------------------------------------------------------------------
-\section{Security and hardening}
-\begin{frame}{What a full code review found (version 7)}
-  \small
-  31 issues. The most serious:
-  \begin{itemize}
-    \item \bad{AES-GCM nonce reuse} on every retransmission: same nonce, different AAD
-          $\Rightarrow$ the authentication key can be recovered and blocks forged\rf{12,13}
-    \item \bad{Unauthenticated control plane}: a forged ACK made the sender report data as
-          delivered that never arrived; a forged close ended transfers
-    \item \bad{No address validation}: one spoofed 70-byte packet caused $\approx$0.9 MB of ACKs
-          at a victim, and could claim a lane
-    \item Predictable nonces, no key-usage limit, no path validation on migration
-    \item Transport gaps: no slow start, pacing, flow control, SACK use, MTU awareness,
-          RTO backoff; silent version mismatch
-  \end{itemize}
-\end{frame}
-
-% 14 ----------------------------------------------------------------------
-\begin{frame}{Version 8: what we fixed}
+\begin{frame}{References (2/2)}
   \scriptsize
-  \begin{tabular}{@{}p{0.27\textwidth}p{0.67\textwidth}@{}}
-    \toprule
-    \textbf{Problem} & \textbf{Fix (one commit + tests each)} \\
-    \midrule
-    Nonce reuse & retransmission bit masked from the AAD: a resend is the identical ciphertext \\
-    Forged control messages & every control datagram signed (counter + GMAC, separate key) \\
-    Wrong key found late & StreamStart signature confirms the key at the handshake \\
-    Spoofing, amplification & Retry tokens (SipHash\rf{14}, as in QUIC\rf{1}); path challenges before migrating \\
-    Replay, weak randomness & SETUP responder nonce; crypto-RNG nonces; 16-byte minimum PSK \\
-    Key usage & lane keys rotate every $2^{22}$ blocks\rf{2}, derived via HKDF\rf{9} \\
-    Transport & SACK, RFC 6298 RTO, slow start, pacing, \texttt{rwnd}, MTU cap\rf{8} \\
-    Interop & version-mismatch reply (a hint only); TLV extensions \\
-    \midrule
-    Second review (R1--R8) & replay window; receive-size limit; safe \texttt{.part}; keys wiped \\
-    SDK and HTTP & same fixes as above; heartbeats; HTTP input validation \\
-    \bottomrule
-  \end{tabular}
+  \begin{enumerate}[{[}1{]}]\setcounter{enumi}{10}\setlength{\itemsep}{1pt}
+    \item M.~Dworkin. \emph{Recommendation for Block Cipher Modes of Operation: GCM and GMAC}. NIST SP 800-38D, 2007.
+    \item A.~Joux. \emph{Authentication Failures in NIST version of GCM}. Comments to NIST, 2006.
+    \item J.-P.~Aumasson, D.~J.~Bernstein. \emph{SipHash: a fast short-input PRF}. INDOCRYPT 2012.
+    \item V.~Jacobson. \emph{Congestion Avoidance and Control}. ACM SIGCOMM 1988.
+    \item A.~Langley et al. \emph{The QUIC Transport Protocol: Design and Internet-Scale Deployment}. ACM SIGCOMM 2017.
+    \item IBM. \emph{Aspera FASP high-speed transport} (product documentation).
+    \item W.~de Bruijn, E.~Dumazet. \emph{Optimizing UDP for content delivery: GSO, pacing and zerocopy}. Linux Plumbers 2018; \texttt{recvmmsg(2)}.
+    \item S.~Hemminger. \emph{Network Emulation with NetEm}. Linux Conf Australia, 2005.
+    \item M.~Nottingham et al. \emph{HTTP Alternative Services}. RFC 7838, 2016; M.~Bishop. \emph{HTTP/3}. RFC 9114, 2022.
+    \item Fuse repository \texttt{kamalkoushikd/fuse-nw}: \texttt{docs/PROTOCOL.md}, \texttt{bench/RESULTS.md}, project report; quinn QUIC implementation.
+  \end{enumerate}
 \end{frame}
 
-% 15 ----------------------------------------------------------------------
-\section{Testing and results}
-\begin{frame}{Testing}
+% 20 -----------------------------------------------------------------------------------------------
+\begin{frame}{Appendix: security hardening (protocol version 8)}
   \begin{columns}[T]
-    \column{0.5\textwidth}
-    \small
-    \begin{tabular}{@{}lr@{}}
-      \toprule
-      \textbf{Configuration} & \textbf{Passed / total} \\
-      \midrule
-      Debug, crypto on & \RESDEBUGON \\
-      Debug, crypto off & \RESDEBUGOFF \\
-      Release, crypto on & \RESRELON \\
-      Release, crypto off & \RESRELOFF \\
-      \bottomrule
-    \end{tabular}
-
-    \vspace{1mm}\scriptsize warnings as errors; \texttt{ctest -j8}
-    \column{0.47\textwidth}
-    \small
-    \begin{itemize}
-      \item Fake clock + injected loss for handshakes
-      \item Randomized receiver vs.\ reference model
-      \item Attack tests: forged ACK/close, spoofed source, foreign address, replay
-      \item Tests shown to \textbf{fail on the unfixed code} (e.g.\ 133 resends with changed ciphertext $\to$ 0)
-    \end{itemize}
-  \end{columns}
-\end{frame}
-
-% 16 ----------------------------------------------------------------------
-\begin{frame}{Results: correctness under bad networks}
-  \small
-  Through a userspace network emulator; 32 MiB over 4 lanes; \textbf{every output byte-identical}.
-  \vspace{1mm}
-
-  \begin{tabular}{@{}lrrr@{}}
-    \toprule
-    \textbf{Condition} & \textbf{v7 (MB/s)} & \textbf{v8 (MB/s)} & \textbf{change} \\
-    \midrule
-\RESNETEMROWS
-    \bottomrule
-  \end{tabular}
-  \vspace{1mm}
-
-  \scriptsize Single host, emulated network; one run per cell.
-\end{frame}
-
-% 17 ----------------------------------------------------------------------
-\begin{frame}[fragile]{Results: speed and the reliability core}
-  \begin{columns}[T]
-    \column{0.47\textwidth}
-    \small\textbf{Loopback, 512 MiB, 4 lanes} {\scriptsize (median of 5)}\\[1mm]
-    \begin{tabular}{@{}lrr@{}}
-      \toprule
-      & \textbf{v7} & \textbf{v8} \\
-      \midrule
-      Throughput (MB/s) & \RESLOOPOLD & \RESLOOPNEW \\
-      Retransmits & \RESLOOPRTXOLD & \RESLOOPRTXNEW \\
-      \bottomrule
-    \end{tabular}
-
-    \vspace{2mm}\scriptsize Earlier benchmark (same host class): 3.6 GB/s encrypted vs.\ 1.9 GB/s
-    for QUIC (quinn); small-message p99 latency flat under 6.3 GB/s of bulk traffic.
-    \column{0.5\textwidth}
-    \small\textbf{Stage 1 demo: one block dropped}
+    \column{0.53\textwidth}
     \scriptsize
-\begin{verbatim}
-recv seq=2  base=3
-recv seq=4  base=3   <- stuck at gap
-...
-recv seq=7  base=3
-NACK seq=3           <- after delay
-recv seq=3 [rtx]  base=8
-\end{verbatim}
+    \begin{tabular}{@{}p{0.33\linewidth}p{0.63\linewidth}@{}}
+      \toprule
+      \textbf{Problem (review)} & \textbf{Fix} \\
+      \midrule
+      AES-GCM nonce reuse on resend\rf{11,12} & retransmit bit out of the AAD: a resend is identical \\
+      Forged / replayed control & GMAC on every control message; replay window \\
+      Spoofing, amplification & Retry token (SipHash\rf{13}); path validation \\
+      Key over-use & lane keys rotate every $2^{22}$ blocks (HKDF\rf{9}) \\
+      Unbounded size claims & \texttt{max\_receive\_bytes}; safe \texttt{.part} files \\
+      Transport gaps & SACK, RFC 6298 RTO\rf{7}, slow start, pacing, flow control, MTU cap\rf{8} \\
+      \bottomrule
+    \end{tabular}
+    \column{0.45\textwidth}
+    \scriptsize
+    \begin{tabular}{@{}lrl@{}}
+      \toprule
+      \textbf{Message} & \textbf{Bytes} & \textbf{Purpose} \\
+      \midrule
+      DATA & 31\,+\,n & block, offset, time \\
+      ACK & 160 & base, SACK, rwnd \\
+      NACK & 6\,+\,8n & missing blocks \\
+      STREAM\_START & 80\,+\,e & size, salt, nonce \\
+      RETRY & 20 & address token \\
+      STREAM\_CLOSE & 13 & finished / aborted \\
+      auth trailer & +24 & counter + GMAC \\
+      \bottomrule
+    \end{tabular}\\[2mm]
+    220 tests pass (195 without crypto) in 4 build configurations.
   \end{columns}
-\end{frame}
-
-% 18 ----------------------------------------------------------------------
-\section{Wrap-up}
-\begin{frame}{Limitations and future work}
-  \begin{itemize}
-    \item SDK server allocates per HELLO before the client proves anything; SDK is stop-and-wait
-    \item Block growth bounded by the first-hop MTU only; real path MTU discovery is open
-    \item Bulk transfer needs N consecutive open ports; a single-port design is next
-    \item Per-stream control: N lanes compete like N flows on a shared bottleneck
-    \item Static sharding: the slowest lane decides completion under heavy loss
-    \item Unreliable / unordered streams exist as primitives, not yet in a public API
-    \item Forward secrecy (DTLS, ECDHE-PSK) implemented but not wired in
-    \item No physical two-host test yet; impairments are emulated
-  \end{itemize}
-\end{frame}
-
-% 19 ----------------------------------------------------------------------
-\begin{frame}{Conclusion}
-  \begin{itemize}
-    \item \textbf{Problem}: mixed loss-tolerant and loss-intolerant traffic in one session,
-          without one stream hurting another
-    \item \textbf{Idea}: make the \emph{stream} the unit of reliability and congestion control,
-          on raw UDP
-    \item \textbf{Built}: block layer, per-stream AIMD, batched sharded pipeline, optional
-          AES-GCM, three transports
-    \item \textbf{Hardened}: 31-issue review + second review $\to$ version 8 with an authenticated,
-          replay-proof control plane, address and path validation, modern loss recovery
-    \item \textbf{Verified}: all tests pass in 4 configurations; byte-identical under loss,
-          delay, jitter and reordering
-  \end{itemize}
-\end{frame}
-
-% 20 ----------------------------------------------------------------------
-\begin{frame}{References}
-  \tiny
-  \begin{columns}[T]
-    \column{0.49\textwidth}
-    \begin{enumerate}[{[}1{]}]\setlength{\itemsep}{0pt}
-      \item J.~Iyengar, M.~Thomson. \emph{QUIC: A UDP-Based Multiplexed and Secure Transport}. RFC 9000, 2021.
-      \item M.~Thomson, S.~Turner. \emph{Using TLS to Secure QUIC}. RFC 9001, 2021 (AEAD usage limits, \S6.6).
-      \item J.~Iyengar, I.~Swett. \emph{QUIC Loss Detection and Congestion Control}. RFC 9002, 2021.
-      \item W.~Eddy (Ed.). \emph{Transmission Control Protocol (TCP)}. RFC 9293, 2022.
-      \item M.~Allman, V.~Paxson, E.~Blanton. \emph{TCP Congestion Control}. RFC 5681, 2009.
-      \item M.~Mathis et al. \emph{TCP Selective Acknowledgment Options}. RFC 2018, 1996.
-      \item V.~Paxson et al. \emph{Computing TCP's Retransmission Timer}. RFC 6298, 2011.
-      \item G.~Fairhurst et al. \emph{Packetization Layer Path MTU Discovery for Datagram Transports}. RFC 8899, 2020.
-      \item H.~Krawczyk, P.~Eronen. \emph{HMAC-based Extract-and-Expand Key Derivation Function (HKDF)}. RFC 5869, 2010.
-      \item E.~Rescorla. \emph{The Transport Layer Security (TLS) Protocol Version 1.3}. RFC 8446, 2018.
-    \end{enumerate}
-    \column{0.49\textwidth}
-    \begin{enumerate}[{[}1{]}]\setcounter{enumi}{10}\setlength{\itemsep}{0pt}
-      \item E.~Rescorla, N.~Modadugu. \emph{Datagram Transport Layer Security Version 1.2}. RFC 6347, 2012; DTLS 1.3, RFC 9147, 2022.
-      \item M.~Dworkin. \emph{Recommendation for Block Cipher Modes of Operation: GCM and GMAC}. NIST SP 800-38D, 2007.
-      \item A.~Joux. \emph{Authentication Failures in NIST version of GCM}. Comments to NIST, 2006.
-      \item J.-P.~Aumasson, D.~J.~Bernstein. \emph{SipHash: a fast short-input PRF}. INDOCRYPT 2012.
-      \item V.~Jacobson. \emph{Congestion Avoidance and Control}. ACM SIGCOMM 1988.
-      \item M.~Mathis, J.~Semke, J.~Mahdavi, T.~Ott. \emph{The Macroscopic Behavior of the TCP Congestion Avoidance Algorithm}. ACM CCR, 1997.
-      \item W.~de Bruijn, E.~Dumazet. \emph{Optimizing UDP for content delivery: GSO, pacing and zerocopy}. Linux Plumbers 2018; \texttt{recvmmsg(2)}.
-      \item S.~Hemminger. \emph{Network Emulation with NetEm}. Linux Conf Australia, 2005.
-      \item A.~Langley et al. \emph{The QUIC Transport Protocol: Design and Internet-Scale Deployment}. ACM SIGCOMM 2017.
-      \item Fuse repository \texttt{kamalkoushikd/fuse-nw}: \texttt{docs/PROTOCOL.md}, \texttt{docs/ROADMAP.md}, \texttt{bench/RESULTS.md}; and our project report.
-    \end{enumerate}
-  \end{columns}
-\end{frame}
-
-% 21 ----------------------------------------------------------------------
-\begin{frame}[standout]
-  Thank you \\[4mm]
-  \normalsize Questions?\\[2mm]
-  \footnotesize github.com/kamalkoushikd/fuse-nw
 \end{frame}
 
 \end{document}

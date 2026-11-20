@@ -1,0 +1,5 @@
+JetBrains Mono
+Copyright 2020 JetBrains s.r.o.
+Source: https://github.com/JetBrains/JetBrainsMono
+Licensed under the Apache License, Version 2.0 (see LICENSE-Apache-2.0.txt).
+Bundled unmodified so the slides build with the same monospace font everywhere.
