@@ -1,10 +1,7 @@
 % Fuse: a per-stream transport protocol over UDP -- 20-minute presentation.
 % Build:  latexmk -pdf presentation.tex      (or: pdflatex presentation.tex, twice)
-% Presenter notes:  each frame has a note with the full speaker script; to print them, uncomment the
-% "show notes" line below (or use pdfpc with a notes-on-second-screen build).
 
 \documentclass[aspectratio=169,11pt]{beamer}
-%\setbeameroption{show notes on second screen=right}   % show notes
 
 \IfFileExists{beamerthememetropolis.sty}{%
   \usetheme[progressbar=frametitle,numbering=fraction]{metropolis}%
@@ -45,23 +42,23 @@
 % -------------------------------------------------------------------------
 
 % ---- Measured results (filled in from the test and benchmark runs) --------
-\newcommand{\RESDEBUGON}{206 / 206}
-\newcommand{\RESDEBUGOFF}{184 / 184}
-\newcommand{\RESRELON}{206 / 206}
-\newcommand{\RESRELOFF}{184 / 184}
-\newcommand{\RESLOOPOLD}{1045}
-\newcommand{\RESLOOPNEW}{1079}
-\newcommand{\RESLOOPRTXOLD}{1644}
-\newcommand{\RESLOOPRTXNEW}{706}
+\newcommand{\RESDEBUGON}{220 / 220}
+\newcommand{\RESDEBUGOFF}{195 / 195}
+\newcommand{\RESRELON}{220 / 220}
+\newcommand{\RESRELOFF}{195 / 195}
+\newcommand{\RESLOOPOLD}{729}
+\newcommand{\RESLOOPNEW}{924}
+\newcommand{\RESLOOPRTXOLD}{1324}
+\newcommand{\RESLOOPRTXNEW}{1454}
 \newcommand{\RESNETEMROWS}{%
-    Clean relay & 435.4 & 483.6 & +11\% \\
-    Loss 2\% & 75.6 & 206.8 & 2.7$\times$ \\
-    Loss 5\% & 36 & 157.3 & 4.4$\times$ \\
-    Delay 25 ms (50 ms RTT) & 57.5 & 51.4 & -11\% \\
-    Jitter 10 $\pm$ 5 ms & 2.7 & 2.8 & +4\% \\
-    Reorder 10\% at 10 ms & 3.8 & 4.1 & +8\% \\
-    Duplicate 3\% at 5 ms & 128.6 & 163.1 & 1.3$\times$ \\
-    25 ms RTT + 1\% loss & 6.8 & 5.2 & -24\% \\
+    Clean relay & 281.5 & 381.9 & +36\% \\
+    Loss 2\% & 66.4 & 181.1 & 2.7$\times$ \\
+    Loss 5\% & 31.5 & 138.4 & 4.4$\times$ \\
+    Delay 25 ms (50 ms RTT) & 55.6 & 52.0 & -6\% \\
+    Jitter 10 $\pm$ 5 ms & 2.7 & 2.7 & 0\% \\
+    Reorder 10\% at 10 ms & 4.2 & 4.0 & -5\% \\
+    Duplicate 3\% at 5 ms & 167.3 & 152.9 & -9\% \\
+    25 ms RTT + 1\% loss & 6.6 & 5.3 & -20\% \\
 }
 % -------------------------------------------------------------------------
 
@@ -70,11 +67,6 @@
 % 1 -----------------------------------------------------------------------
 \begin{frame}
   \titlepage
-  \note{
-  Good morning, everyone. Our project is Fuse, a transport protocol that we built directly on top of UDP.
-In the next twenty minutes I will explain the problem it solves, how it works inside, how we reviewed and
-hardened it, and what our tests and measurements show.
-  }
 \end{frame}
 
 % 2 -----------------------------------------------------------------------
@@ -96,10 +88,6 @@ hardened it, and what our tests and measurements show.
       \item Limitations and future work
     \end{enumerate}
   \end{columns}
-  \note{
-  Here is the plan. First the problem, and why existing transports do not solve it. Then our design. Then the
-security work. And finally, the results.
-  }
 \end{frame}
 
 % 3 -----------------------------------------------------------------------
@@ -118,17 +106,6 @@ security work. And finally, the results.
   \vspace{2mm}
   Also required: optional encryption (fail-closed), and robustness against loss, delay,
   jitter, reordering and basic network attacks.
-  \note{
-  This is our problem statement. Many systems send two very different kinds of data between the same two
-machines at the same time. Some data must arrive completely, like a file or a machine-learning model.
-Other data only matters if it is fresh, like telemetry or control signals: a sample that arrives late is
-useless.
-
-  The question is: how do we carry both over one session, so that each stream gets exactly the guarantee it
-needs, so that loss or a big burst on one stream never slows down or delays the other, and so that the
-whole thing is fast enough to fill a modern link? On top of that we want optional encryption that never
-silently falls back to plaintext, and robustness against bad networks and basic attacks.
-  }
 \end{frame}
 
 % 4 -----------------------------------------------------------------------
@@ -150,12 +127,6 @@ silently falls back to plaintext, and robustness against bad networks and basic 
     \column{0.45\textwidth}
     \textbf{Loss-intolerant stream wants}\\ full reliability, correct placement, maximum throughput
   \end{columns}
-  \note{
-  Picture it like this. The blue stream is small and frequent, and an old message is worthless; it wants low,
-steady latency and would rather drop data than wait. The red stream is large, and every single byte matters;
-it wants full reliability and maximum throughput. Today you usually pick one transport for both, and
-one of the two streams pays for that choice.
-  }
 \end{frame}
 
 % 5 -----------------------------------------------------------------------
@@ -176,15 +147,6 @@ one of the two streams pays for that choice.
 
   \textbf{Key observation:} QUIC multiplexes streams, but its congestion window is
   shared --- loss on the bulk stream throttles the telemetry stream too.
-  \note{
-  Why not just use TCP or QUIC? TCP gives you one ordered byte stream, so one lost packet blocks everything
-behind it, including the telemetry. QUIC fixed that with many streams inside one connection. But look at the
-congestion-control row: in QUIC, all streams share one congestion window. When the bulk stream sees loss,
-the window shrinks for the telemetry stream too. QUIC also has no first-class unreliable stream, and it
-always encrypts, which costs throughput even on a trusted link.
-
-  So the key observation is: we need the stream, not the connection, to be the unit of congestion control.
-  }
 \end{frame}
 
 % 6 -----------------------------------------------------------------------
@@ -199,13 +161,6 @@ always encrypts, which costs throughput even on a trusted link.
     \item Measured against a reference QUIC (quinn), not assumed
     \item Nothing in the core assumes a particular workload
   \end{itemize}
-  \note{
-  These were our goals. The central one is the first: each stream owns its reliability, its ordering and its
-congestion control. Each stream picks a policy: lossless or not, ordered or not, and whether to drop old
-data under pressure. The data path should not allocate memory or take locks. Encryption is optional but
-fails closed. We wanted to measure against a real QUIC implementation, not assume. And nothing in the
-core may assume a particular workload.
-  }
 \end{frame}
 
 % 7 -----------------------------------------------------------------------
@@ -227,16 +182,6 @@ core may assume a particular workload.
       \item \textbf{Write-in-place}: lock-free rings, \texttt{pwritev} straight to the final offset
     \end{itemize}
   \end{columns}
-  \note{
-  Here is the whole approach on one slide. We send blocks over UDP; each block carries its stream, a
-sequence number, its byte offset and a timestamp. The sender keeps every unacknowledged block in a
-registry, so it can resend it exactly. The receiver tracks a window of 1,024 blocks in a bitmap and
-reports gaps. Each acknowledgement carries the cumulative position, a bitmap of what else arrived, a
-timestamp echo for measuring round-trip time, and how much more the receiver can take.
-
-  Each stream runs its own congestion control. And to be fast, we batch system calls, we split bulk
-data across parallel lanes, and we write each block straight to its final place on disk.
-  }
 \end{frame}
 
 % 8 -----------------------------------------------------------------------
@@ -256,13 +201,6 @@ data across parallel lanes, and we write each block straight to its final place 
     \node[gbox, minimum width=34mm] at (112,25) {UdpSocket};
     \node[box, fill=fusegray!10, draw=fusegray, minimum width=126mm] at (63,14) {Kernel UDP (GSO, recvmmsg) \quad wolfSSL (AES-GCM, HKDF, SHA-256)};
   \end{tikzpicture}
-  \note{
-  The code is layered. At the bottom: the kernel's UDP and wolfSSL for cryptography. Above that, one place
-that encodes and decodes every message, and a socket wrapper. Then reusable building blocks for
-reliability, concurrency and security. On top sit three independent transports: a bulk
-transfer API for files and buffers, a socket-style API that looks like TCP, and a multiplexed
-transfer with many streams on one socket. Each layer only calls the layers below it.
-  }
 \end{frame}
 
 % 9 -----------------------------------------------------------------------
@@ -285,16 +223,6 @@ transfer with many streams on one socket. Each layer only calls the layers below
     \item ACK carries base + bitmask: blocks already held (5) are \textbf{never resent} (SACK\rf{6})
     \item When 3 and 4 arrive the base slides to 6 --- O(1) per packet (ring-indexed)
   \end{enumerate}
-  \note{
-  This is the heart of reliability. The receiver keeps this bitmap, starting at the base, the first block
-it has not received. Say block 5 arrives, but 3 and 4 have not. They are now marked missing. We do not
-complain immediately; we wait about half a round trip, in case they were only reordered. Then we send a
-NACK listing 3 and 4, and the sender resends exactly those blocks from its registry.
-
-  The acknowledgement also carries the bitmap, so the sender knows block 5 already arrived and never wastes
-bandwidth resending it. That is selective acknowledgement. When 3 and 4 arrive, the base slides forward to
-6. In version 8 this bookkeeping is a ring, so the cost per packet is constant.
-  }
 \end{frame}
 
 % 10 ----------------------------------------------------------------------
@@ -323,16 +251,6 @@ bandwidth resending it. That is selective acknowledgement. When 3 and 4 arrive, 
       \node[font=\scriptsize, fusegray] at (8.4,1.4) {additive};
     \end{tikzpicture}
   \end{columns}
-  \note{
-  Every stream has its own controller, so loss on bulk data does not shrink the telemetry stream's window.
-The controller measures round-trip time from timestamps echoed in acknowledgements, using only the sender's
-own clock. Time is divided into epochs of one round trip. While the path is clean the window doubles —
-that's slow start — then grows step by step. Any loss in an epoch halves it, as in the graph.
-
-  Timeouts follow the standard TCP formula, including the variance of the round-trip time, and they back off
-exponentially. Sending is paced across the round trip instead of bursting, and the receiver tells the
-sender how much it can absorb.
-  }
 \end{frame}
 
 % 11 ----------------------------------------------------------------------
@@ -356,14 +274,6 @@ sender how much it can absorb.
 
   \small 64 datagrams per syscall\rf{17} \quad$\cdot$\quad N independent lanes \quad$\cdot$\quad
   decrypt + write in parallel \quad$\cdot$\quad ACK only covers bytes already written
-  \note{
-  Speed comes from three things. Batching: one system call moves 64 datagrams, using the kernel's
-segmentation offload. Sharding: a file is split into lanes, each with its own socket, thread and
-reliable stream, so the packet rate multiplies. And the receive pipeline you see here: reader threads
-pass blocks to writer threads through lock-free rings, and the writers decrypt and write each block
-directly to its final position in the file. Nothing is buffered and stitched together later. And an
-acknowledgement only ever covers data that is authentic and already written.
-  }
 \end{frame}
 
 % 12 ----------------------------------------------------------------------
@@ -379,12 +289,6 @@ acknowledgement only ever covers data that is authentic and already written.
     \draw[arr, fuseblue, dashed] (105,14) -- node[above,font=\tiny]{done} (75,14);
     \draw[arr, fuseblue, dashed] (75,8) -- node[above,font=\tiny]{ACK(base, SACK, echo, rwnd)} (10,8);
   \end{tikzpicture}
-  \note{
-  Putting it together, here is one packet's journey. The sender stores it for a possible resend, encrypts it,
-frames it and sends it in a batch. The receiver's reader picks it up, checks that it is new and inside the
-window, and passes it to a writer. The writer decrypts it and writes it to disk, then reports back. Only
-then is it acknowledged, and the sender frees its copy.
-  }
 \end{frame}
 
 % 13 ----------------------------------------------------------------------
@@ -403,19 +307,11 @@ then is it acknowledged, and the sender frees its copy.
     \item Transport gaps: no slow start, pacing, flow control, SACK use, MTU awareness,
           RTO backoff; silent version mismatch
   \end{itemize}
-  \note{
-  Once it worked, we reviewed the entire code base critically. We found 31 issues. The worst was a
-cryptographic flaw: every retransmission reused an AES-GCM nonce with different associated data, which
-lets an observer recover the authentication key and forge data. Control messages were not authenticated,
-so a forged acknowledgement could make the sender report data as delivered that never arrived. And with no
-address validation, one spoofed 70-byte packet made the receiver send about 0.9 megabytes to a victim.
-There were also transport gaps: no slow start, no pacing, no flow control.
-  }
 \end{frame}
 
 % 14 ----------------------------------------------------------------------
 \begin{frame}{Version 8: what we fixed}
-  \footnotesize
+  \scriptsize
   \begin{tabular}{@{}p{0.27\textwidth}p{0.67\textwidth}@{}}
     \toprule
     \textbf{Problem} & \textbf{Fix (one commit + tests each)} \\
@@ -423,21 +319,16 @@ There were also transport gaps: no slow start, no pacing, no flow control.
     Nonce reuse & retransmission bit masked from the AAD: a resend is the identical ciphertext \\
     Forged control messages & every control datagram signed (counter + GMAC, separate key) \\
     Wrong key found late & StreamStart signature confirms the key at the handshake \\
-    Spoofing, amplification & Retry tokens (SipHash\rf{14} of address + nonce, as in QUIC\rf{1}); path challenges before migrating \\
-    Replay, weak randomness & SETUP responder nonce; nonces from the crypto RNG; 16-byte minimum PSK \\
-    Key usage & lane keys rotate every $2^{22}$ blocks (limit from\rf{2}), derived via HKDF\rf{9} on both ends \\
-    Transport & SACK, RFC 6298 RTO + backoff, slow start, byte window, pacing, \texttt{rwnd}, MTU cap\rf{8} \\
-    Interop & version-mismatch reply; TLV extension fields \\
+    Spoofing, amplification & Retry tokens (SipHash\rf{14}, as in QUIC\rf{1}); path challenges before migrating \\
+    Replay, weak randomness & SETUP responder nonce; crypto-RNG nonces; 16-byte minimum PSK \\
+    Key usage & lane keys rotate every $2^{22}$ blocks\rf{2}, derived via HKDF\rf{9} \\
+    Transport & SACK, RFC 6298 RTO, slow start, pacing, \texttt{rwnd}, MTU cap\rf{8} \\
+    Interop & version-mismatch reply (a hint only); TLV extensions \\
+    \midrule
+    Second review (R1--R8) & replay window; receive-size limit; safe \texttt{.part}; keys wiped \\
+    SDK and HTTP & same fixes as above; heartbeats; HTTP input validation \\
     \bottomrule
   \end{tabular}
-  \note{
-  Version 8 fixes these, one change at a time, each with its own tests. A retransmission now resends the
-identical ciphertext, so there is no second tag to exploit. Every control message is signed with a
-separate key. A wrong key is detected at the handshake, not after twenty failed packets. A sender must
-prove it owns its address, by echoing a token, before the receiver commits anything, and a peer's address
-only changes after a challenge. Keys rotate automatically. And the transport gained selective
-acknowledgement, better timeouts, slow start, pacing, flow control and awareness of the path MTU.
-  }
 \end{frame}
 
 % 15 ----------------------------------------------------------------------
@@ -467,13 +358,6 @@ acknowledgement, better timeouts, slow start, pacing, flow control and awareness
       \item Tests shown to \textbf{fail on the unfixed code} (e.g.\ 133 resends with changed ciphertext $\to$ 0)
     \end{itemize}
   \end{columns}
-  \note{
-  We test with GoogleTest. All four build configurations — debug and release, with and without encryption —
-pass every test, with compiler warnings treated as errors and tests running in parallel. Handshakes are
-tested with a fake clock and injected loss. Every security fix has an attack test, and we checked that
-those tests fail on the old code: before the nonce fix, our relay saw 133 resent blocks with changed
-ciphertext; after it, zero.
-  }
 \end{frame}
 
 % 16 ----------------------------------------------------------------------
@@ -492,24 +376,13 @@ ciphertext; after it, zero.
   \vspace{1mm}
 
   \scriptsize Single host, emulated network; one run per cell.
-  \note{
-  Here is the protocol under bad network conditions, measured on one machine through a network emulator,
-comparing the old version 7 with version 8. The first thing to say is that every single transfer arrived
-byte-identical, in every condition.
-
-  Under packet loss, version 8 is much faster: about 2.7 times at 2 \% loss and 4.4 times at 5 \%
-loss, mainly because of selective acknowledgements and better timeouts. Jitter and reordering stay about the
-same. On long-delay paths it is a little slower — about 11 \% at a 50-millisecond round trip, and about a
-quarter slower with delay plus loss — and that is by design: the window no longer inflates when blocks
-grow, which makes it fairer to other traffic sharing the link.
-  }
 \end{frame}
 
 % 17 ----------------------------------------------------------------------
 \begin{frame}[fragile]{Results: speed and the reliability core}
   \begin{columns}[T]
     \column{0.47\textwidth}
-    \small\textbf{Loopback, 512 MiB, 4 lanes} {\scriptsize (median of 3)}\\[1mm]
+    \small\textbf{Loopback, 512 MiB, 4 lanes} {\scriptsize (median of 5)}\\[1mm]
     \begin{tabular}{@{}lrr@{}}
       \toprule
       & \textbf{v7} & \textbf{v8} \\
@@ -533,23 +406,14 @@ NACK seq=3           <- after delay
 recv seq=3 [rtx]  base=8
 \end{verbatim}
   \end{columns}
-  \note{
-  On a plain loopback, version 8 is as fast as version 7 — about 1,080 versus 1,045 megabytes per second
-here — with fewer than half the retransmissions. Earlier benchmarks in the repository showed
-Fuse faster than QUIC with encryption on both sides, and showed small-message latency staying flat under
-heavy bulk traffic.
-
-  On the right is the reliability core in action: block 3 is dropped, the base waits at 3, a NACK goes out after
-the reorder delay, the resend fills the gap, and the base jumps to 8.
-  }
 \end{frame}
 
 % 18 ----------------------------------------------------------------------
 \section{Wrap-up}
 \begin{frame}{Limitations and future work}
   \begin{itemize}
-    \item Socket-style SDK and HTTP mapping still need the same hardening pass
-          (including the nonce fix)
+    \item SDK server allocates per HELLO before the client proves anything; SDK is stop-and-wait
+    \item Block growth bounded by the first-hop MTU only; real path MTU discovery is open
     \item Bulk transfer needs N consecutive open ports; a single-port design is next
     \item Per-stream control: N lanes compete like N flows on a shared bottleneck
     \item Static sharding: the slowest lane decides completion under heavy loss
@@ -557,12 +421,6 @@ the reorder delay, the resend fills the gap, and the base jumps to 8.
     \item Forward secrecy (DTLS, ECDHE-PSK) implemented but not wired in
     \item No physical two-host test yet; impairments are emulated
   \end{itemize}
-  \note{
-  It is not finished, and we want to be honest about that. The socket-style API still needs the same security
-pass. Bulk transfers need a range of open ports. The unreliable streams — the original motivation — are built
-and tested as primitives, but not yet exposed in a public API. Forward secrecy exists but is not wired in.
-And we have not yet tested on two physical machines.
-  }
 \end{frame}
 
 % 19 ----------------------------------------------------------------------
@@ -574,16 +432,11 @@ And we have not yet tested on two physical machines.
           on raw UDP
     \item \textbf{Built}: block layer, per-stream AIMD, batched sharded pipeline, optional
           AES-GCM, three transports
-    \item \textbf{Hardened}: 31-issue review $\to$ version 8 with authenticated control plane,
-          address and path validation, modern loss recovery
+    \item \textbf{Hardened}: 31-issue review + second review $\to$ version 8 with an authenticated,
+          replay-proof control plane, address and path validation, modern loss recovery
     \item \textbf{Verified}: all tests pass in 4 configurations; byte-identical under loss,
           delay, jitter and reordering
   \end{itemize}
-  \note{
-  To conclude. We wanted one session for mixed traffic in which one stream never hurts another. Our answer
-is to make the stream the unit of reliability and congestion control, on raw UDP. We built it, we reviewed
-it critically, we fixed what we found, and we verified it with tests and measurements.
-  }
 \end{frame}
 
 % 20 ----------------------------------------------------------------------
@@ -601,11 +454,6 @@ it critically, we fixed what we found, and we verified it with tests and measure
     \item H.~Krawczyk, P.~Eronen. \emph{HMAC-based Extract-and-Expand Key Derivation Function (HKDF)}. RFC 5869, 2010.
     \item E.~Rescorla. \emph{The Transport Layer Security (TLS) Protocol Version 1.3}. RFC 8446, 2018.
   \end{enumerate}
-  \note{
-  These are the main sources we built on: the QUIC and TCP specifications, the RFCs for retransmission timers,
-selective acknowledgement and path MTU discovery, and the key-derivation and TLS standards. The full list, with
-every place it is used, is in the bibliography of our report.
-  }
 \end{frame}
 
 \begin{frame}{References (2/2)}
@@ -622,11 +470,6 @@ every place it is used, is in the bibliography of our report.
     \item A.~Langley et al. \emph{The QUIC Transport Protocol: Design and Internet-Scale Deployment}. ACM SIGCOMM 2017.
     \item Fuse repository \texttt{kamalkoushikd/fuse-nw}: \texttt{docs/PROTOCOL.md}, \texttt{docs/ROADMAP.md}, \texttt{bench/RESULTS.md}; and our project report.
   \end{enumerate}
-  \note{
-  The remaining references: DTLS, the GCM standard and the attack on GCM nonce reuse that motivated our most
-important fix, SipHash for the address tokens, the classic congestion-control papers, the Linux batching
-work, and the netem emulator we modelled our test relay on.
-  }
 \end{frame}
 
 % 21 ----------------------------------------------------------------------
@@ -634,9 +477,6 @@ work, and the netem emulator we modelled our test relay on.
   Thank you \\[4mm]
   \normalsize Questions?\\[2mm]
   \footnotesize github.com/kamalkoushikd/fuse-nw
-  \note{
-  Thank you. We are happy to take your questions.
-  }
 \end{frame}
 
 % Backup -------------------------------------------------------------------
@@ -654,10 +494,10 @@ work, and the netem emulator we modelled our test relay on.
     RETRY & 20 & address-validation token \\
     PATH\_CHALLENGE/RESPONSE & 20 & 64-bit challenge \\
     SETUP / HASH\_REPLY / FINACK & 7+9n / 18 / 18 & stream table; receiver's hash + nonce \\
+    HEARTBEAT & 12 & SDK idle liveness, every second \\
     Version mismatch & 3 & \texttt{[ver][0xFF][ver]}, fixed forever \\
     \bottomrule
   \end{tabular}
-  \note{Backup slide, for questions about the packet formats.}
 \end{frame}
 
 \end{document}
