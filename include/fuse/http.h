@@ -97,8 +97,19 @@ const char *fuse_http_get_header(const char *headers, const char *name,
  * must eventually call fuse_http_response_free() on it. On any other
  * status, *out_resp is left zeroed (safe to free regardless).
  *
- * timeout_ms bounds the whole exchange (connect + send + recv), same
- * meaning as fuse_recv()'s. */
+ * req->method, req->path and req->headers must follow the HTTP grammar:
+ * a token method, a path of visible ASCII (no spaces), and zero or more
+ * "Name: value\r\n" lines. Anything else (in particular a CR or LF that
+ * would inject a header) is refused with FUSE_ERR_CONFIG before anything
+ * is sent. A response whose status line or header block is malformed is
+ * reported as FUSE_ERR_INTERNAL.
+ *
+ * timeout_ms > 0 is a budget for the whole exchange: the connect and every
+ * wait inside the send are bounded by it, the response wait gets what is
+ * left, and FUSE_ERR_TIMEOUT is returned once it is used up. (A send that
+ * keeps making progress can run somewhat past it before that is noticed.)
+ * <0: connect and send use cfg->timeout_ms, and the response is waited for
+ * indefinitely. 0: the response is only polled for. */
 fuse_status fuse_http_fetch(const fuse_config *cfg, const fuse_http_request *req,
                             fuse_http_response *out_resp, int timeout_ms);
 
@@ -108,7 +119,11 @@ fuse_status fuse_http_fetch(const fuse_config *cfg, const fuse_http_request *req
  * sent. Fill *out_resp (already zero-initialized by the caller) and
  * return FUSE_OK to send it; any other return closes the connection
  * without a response (the client's fuse_http_fetch() sees that as
- * whatever fuse_recv() reports, typically FUSE_ERR_CLOSED). */
+ * whatever fuse_recv() reports, typically FUSE_ERR_CLOSED). A response
+ * with a status outside 100..999, or a reason phrase or header block that
+ * breaks the HTTP grammar (e.g. a value carrying CR/LF copied from the
+ * request), is replaced with a bare 500 rather than sent. Requests that are
+ * malformed never reach the handler; they get a 400. */
 typedef fuse_status (*fuse_http_handler)(const fuse_http_request *req,
                                          fuse_http_response *out_resp,
                                          void *user_data);
@@ -116,12 +131,18 @@ typedef fuse_status (*fuse_http_handler)(const fuse_http_request *req,
 /* Binds cfg->port and accepts connections on the calling thread (sdk.h
  * requires accept to happen from one thread at a time per listener), but
  * hands each accepted connection's request to handler on its own
- * detached worker thread, so one slow handler does not stall the accept
- * loop or other in-flight requests. Returns once *stop_flag becomes
- * non-zero (checked between accepts, so this returns promptly rather
- * than instantly) or fuse_listen() itself fails; does not wait for
- * in-flight worker threads to finish. Pass NULL for stop_flag to run
- * until an error. */
+ * worker thread, so one slow handler does not stall the accept loop or
+ * other in-flight requests. Each connection has cfg->timeout_ms (default
+ * 10 s) to send its request, and at most 256 are served at once; further
+ * connections are closed until a worker frees up. (fuse_accept does not
+ * authenticate clients, so these bounds are what keep idle connections
+ * from holding threads indefinitely.)
+ *
+ * Returns once *stop_flag becomes non-zero (checked between accepts, so
+ * this returns within about a second), or when fuse_listen()/fuse_accept()
+ * fails, with that error. Before returning it waits for every in-flight
+ * handler to finish, so handler and user_data only need to stay valid
+ * until this returns. Pass NULL for stop_flag to run until an error. */
 fuse_status fuse_http_serve(const fuse_config *cfg, fuse_http_handler handler,
                             void *user_data, const volatile int *stop_flag);
 
