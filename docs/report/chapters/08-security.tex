@@ -4,8 +4,9 @@ A full review of protocol version~7 in October 2026 found 31 issues of security,
 numbered \#1--\#31 in the repository's roadmap~\cite{repo}. This chapter states the threat model, explains the
 most important findings in detail (what each allowed, how it was fixed, and why that fix was chosen over the
 alternatives), and then summarises every fix in one table. Each fix was made as its own commit with its own
-tests. The socket-style SDK and the HTTP mapping were deliberately excluded and are discussed in
-Chapter~\ref{ch:conclusion}.
+tests. The first pass deliberately excluded the socket-style SDK and the HTTP mapping. A second review in
+November 2026 then re-examined the first pass, found eight problems in the fixes themselves (R1--R8,
+Section~\ref{sec:second}), and extended the protections to the SDK and the HTTP mapping.
 
 \section{Threat model}
 
@@ -68,9 +69,9 @@ Unsigned control messages are discarded before they are parsed.
 
 \paragraph{Why this fix.} GMAC reuses the AES-GCM context the lane already has, costs one AES pass over a few
 dozen bytes, and adds no round trips. Running the control plane through DTLS would have reintroduced the
-record-layer state that the design avoids (Section~\ref{sec:crypto}). The counter need only be unique per
-sender, not checked for replay. Replaying an authentic control message is harmless: acknowledgement bases only
-move forward, and an abort can only be replayed if it was really sent.
+record-layer state that the design avoids (Section~\ref{sec:crypto}). The first version treated replay of an
+authentic control message as harmless and did not check for it; the second review showed that it is not (R2,
+Section~\ref{sec:second}), and the verifier now accepts each counter at most once.
 
 \paragraph{Exceptions.} Three messages remain unauthenticated by necessity. In each case forgery can only cause
 a denial of service that an on-path attacker could cause anyway.
@@ -178,8 +179,9 @@ The remaining findings concerned the transport's behaviour rather than its secur
     smaller bursts on real paths.
   \item \textbf{\#9 Flow control.} There was none. Acknowledgements now carry a receive window, with window
     updates (Section~\ref{sec:flow}).
-  \item \textbf{\#7 MTU.} Blocks grew to 16~KiB regardless of the path, causing IP fragmentation. Growth is now
-    capped at the route MTU, with a ceiling after loss and later re-probing (Section~\ref{sec:blocksize}).
+  \item \textbf{\#7 MTU (partly fixed).} Blocks grew to 16~KiB regardless of the path, causing IP
+    fragmentation. Growth is now capped at the first-hop MTU the kernel reports, with a ceiling after loss and
+    later re-probing (Section~\ref{sec:blocksize}). True path MTU discovery is still open.
   \item \textbf{\#16 and \#17 Algorithmic bounds.} Receiving was $O(W)$ and a reassembly set was unbounded. Both
     now use rings bounded by the window.
   \item \textbf{\#11 Versions and \#24 extensions.} Version mismatches were silent and every new field needed a
@@ -211,7 +213,7 @@ The remaining findings concerned the transport's behaviour rather than its secur
 3 & Address migration without validation & PathChallenge/PathResponse before the peer address changes \\
 5 & No session binding without encryption; replayable SETUP & Retry tokens bind a lane to a validated address; SETUP responder nonce echoed in FINACK \\
 6 & No key confirmation & Signed StreamStart; mismatch reported as \code{AuthFailed} at the handshake \\
-7 & Block growth unaware of the MTU & Growth capped at the route MTU; ceiling after loss; DPLPMTUD-style re-probing \\
+7 & Block growth unaware of the MTU & \emph{Partly:} growth capped at the first-hop MTU; ceiling after loss; re-probing \\
 8 & Window counted in blocks; no slow start & Window in configured-block units, capped by the largest permitted block; opt-in slow start \\
 9 & No flow control & \code{rwnd} in every ACK; the sender stays within it; window updates \\
 10 & SACK bitmask discarded & \code{apply_ack} releases selectively acknowledged blocks; RTO resends known holes \\
@@ -234,20 +236,66 @@ The remaining findings concerned the transport's behaviour rather than its secur
 \end{xltabular}
 \endgroup
 
+\section{The second review}\label{sec:second}
+
+A second review, in November 2026, examined the version~8 fixes themselves rather than the original code. It
+found the eight problems in Table~\ref{tab:second}. They illustrate how a security fix can be locally correct
+yet incomplete. Authenticating the control plane did not stop replay of authentic messages (R2), and a hint
+deliberately left unauthenticated could still be decisive (R1).
+
+\begingroup\small
+\begin{xltabular}{\linewidth}{c>{\raggedright\arraybackslash}p{5.2cm}>{\raggedright\arraybackslash}X}
+\caption{Problems found in the version~8 code by the second review, and their fixes.}\label{tab:second}\\
+\toprule
+\textbf{\#} & \textbf{Problem} & \textbf{Fix} \\
+\midrule\endfirsthead
+\toprule
+\textbf{\#} & \textbf{Problem} & \textbf{Fix} \\
+\midrule\endhead
+\bottomrule\endfoot
+R1 & One forged three-byte version-mismatch reply, from any address, aborted any transfer or SETUP, even under a PSK & The reply is only a hint: it counts only from the receiver's address, shortens the handshake to 1~s, and yields \code{VersionMismatch} only if nothing in our version arrived meanwhile \\
+R2 & Signed control messages could be replayed: a captured NACK replayed every RTT pinned the window at its floor; an old ACK re-advertised a stale receive window & 1,024-counter sliding replay window, each counter accepted once; FileDigest resends are re-signed \\
+R3 & A forged block for an in-window sequence number held its dispatch slot while being rejected, so the genuine copy was dropped and had to be NACKed & Under a PSK, blocks from a source other than the validated peer are authenticated on the reader before they are queued \\
+R4 & \code{receive_buffer} zero-filled whatever size StreamStart claimed (on Linux, the out-of-memory killer), and \code{receive_file} sized the \code{.part} to it & \code{max_receive_bytes}, by default half of RAM or the free disk space; a larger claim fails with \code{ResourceLimit} \\
+R5 & The \code{.part} file followed symbolic links and was created world-readable & \code{O_NOFOLLOW}, \code{O_CREAT|O_EXCL}, mode 0600; an existing file must be regular, singly linked and owned by us \\
+R6 & Session and epoch keys left in memory & Wiped on every exit path with \code{secure_zero} \\
+R7 & The SDK used one AES-GCM key per connection & Per-epoch data keys; out-of-window blocks dropped before decryption \\
+R8 & A plaintext SDK block with an offset near 64~MiB grew the reassembly buffer to 64~MiB & A block must sit at $(\mathit{seq}-\mathit{first\_seq})\times1200$ \\
+\end{xltabular}
+\endgroup
+
+\paragraph{SDK and HTTP.} The same pass closed the SDK and HTTP halves of the original findings:
+\begin{itemize}
+  \item the SDK's GCM nonce reuse (\#1);
+  \item its unauthenticated control messages (\#2);
+  \item re-anchoring on any datagram (\#3);
+  \item missing liveness (\#12);
+  \item the unsafe close (\#27);
+  \item the \code{strlen} key (\#28);
+  \item HTTP header injection, timeout scope and the other HTTP findings (\#29).
+\end{itemize}
+The SDK server's per-HELLO allocation (\#4) is bounded in time by heartbeats, and for HTTP also in number, but
+is not prevented. Section~\ref{sec:sdk} describes the resulting SDK.
+
 \section{Security properties after version 8}
 
-Under a pre-shared key, the bulk transfer now provides the following properties:
+Under a pre-shared key, the bulk transfer, and except where noted the SDK, now provide the following
+properties:
 \begin{itemize}
   \item confidentiality and integrity of data, with no nonce reuse;
-  \item integrity of every control decision the protocol acts upon;
+  \item integrity and freshness of every control decision the protocol acts upon (no replay);
   \item key confirmation at the handshake;
   \item bounded key usage;
-  \item resistance to off-path session hijacking, address redirection and reflection amplification.
+  \item resistance to off-path session hijacking, address redirection and reflection amplification
+    (amplification and address validation at connection setup apply to the bulk transfer; the SDK server's
+    per-HELLO allocation remains open);
+  \item bounded resource commitments on the receiver.
 \end{itemize}
 
 In plaintext mode, address validation, path validation, unpredictable nonces and strict input validation still
 defeat the off-path attacks, but an on-path attacker can read and modify everything, which is inherent in
-plaintext.
+plaintext. In particular, in plaintext SDK path validation only proves that a new address can receive. An
+attacker sending from their own address who guesses a connection's port and an in-window sequence number can
+still inject data or move the connection, so a pre-shared key should be used wherever integrity matters.
 
-The pre-shared-key path still does not provide forward secrecy, and the socket-style SDK and the HTTP mapping do
-not yet have these protections (Chapter~\ref{ch:conclusion}).
+The pre-shared-key path still does not provide forward secrecy (Chapter~\ref{ch:conclusion}).

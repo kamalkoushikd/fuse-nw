@@ -1,4 +1,5 @@
 \chapter{The Socket-Style SDK and the Multiplexed Transfer}\label{ch:sdkmux}
+\chaptermark{SDK and Multiplexed Transfer}
 
 \section{The socket-style SDK}\label{sec:sdk}
 
@@ -65,24 +66,61 @@ hand a message to the pump, or take one from it, through a mutex and a condition
 
 \paragraph{Framing.} A message is carried as a run of DATA blocks whose \code{offset} is the byte position
 within the message, with LastBlock on the final one. The receiver knows the message is complete when its window
-base passes the final block, so a truncated message can never reach the application.
+base passes the final block, so a truncated message can never reach the application. Block $\mathit{seq}$ of a
+message must sit exactly at offset $(\mathit{seq}-\mathit{first\_seq})\times1200$, so a forged block cannot claim
+an offset near 64~MiB and force a large allocation (R8).
 
 \paragraph{Backpressure.} Completed messages wait in an inbox capped at 256~MiB of undelivered data. When the cap
 is reached, new blocks are not admitted, and the sender's own retransmission logic stalls until the application
 drains the inbox.
 
-\paragraph{Closing.} \code{fuse_close} sends CLOSE, stops the pump, and waits for application threads still
-inside \code{fuse_send} or \code{fuse_recv}. The wait is limited to two seconds, which is one of the open issues.
+\paragraph{Liveness\vviii.} A connection that has sent nothing for one second sends a HEARTBEAT. A peer that
+has sent nothing at all (no data and no authentic control message) for $\max(\mathit{timeout\_ms},3\,\mathrm{s})$
+is declared lost, and blocked calls return \code{FUSE_ERR_TIMEOUT}.
 
-\subsection{Status and deferred work}
+\paragraph{Closing.} \code{fuse_close} sends CLOSE and stops the pump. The connection is reference-counted by
+the application threads inside \code{fuse_send} and \code{fuse_recv}, and the last one to leave frees it, so
+closing can never free a connection another thread is still using.
 
-The SDK was deliberately left out of the version~8 pass. Its remaining problems are listed in
-Table~\ref{tab:open} (Chapter~\ref{ch:conclusion}). The most important is that it still re-seals
-retransmissions with the retransmission bit inside the AAD, so it still has the nonce-reuse flaw that version~8
-fixed in the bulk transfer (Section~\ref{sec:nonce}). Its control messages are unauthenticated, and it
-re-anchors its peer address on any ACK, NACK or CLOSE. It is also stop-and-wait per message, and its registry
-uses about 17~MB per connection because each slot embeds a 16~KiB payload while the SDK only sends 1,200-byte
-blocks.
+\subsection{Security}
+
+The SDK was left out of the first version~8 pass and brought up to the same standard by the second. It now
+shares the bulk transfer's protections:
+\begin{itemize}
+  \item retransmissions are sealed with the retransmission bit outside the AAD, which removes the nonce-reuse
+    flaw (Section~\ref{sec:nonce});
+  \item data keys rotate every $2^{22}$ blocks, and blocks outside the receive window are dropped before
+    decryption, so forged far-off sequence numbers cannot force key derivations (R7);
+  \item under a pre-shared key, ACK, NACK, CLOSE, HEARTBEAT and the path probes are signed and replay-checked;
+    in plaintext they are acted on only from the peer's current address, where previously a two-byte CLOSE from
+    anywhere ended a connection;
+  \item the peer address moves only after the new source answers a path challenge, using the shared
+    \code{PathValidator};
+  \item binary keys with zero bytes are supported through \code{pre_shared_key_len}.
+\end{itemize}
+
+\noindent Three issues remain open, listed in Table~\ref{tab:open}:
+\begin{itemize}
+  \item the server still allocates a connection, a socket and a thread for every HELLO before the client
+    proves anything; heartbeats now bound how long such a connection lives;
+  \item the SDK is stop-and-wait per message;
+  \item its registry uses about 17~MB per connection, because each slot embeds a 16~KiB payload while the SDK
+    only sends 1,200-byte blocks.
+\end{itemize}
+
+\subsection{HTTP over the SDK}
+
+\code{fuse/http.h} maps one HTTP/1.1 request and one response onto one SDK message each way, with discovery
+through the Alt-Svc token \code{hfuse-00}~\cite{rfc7838}. Since the second pass it is validated and bounded:
+\begin{itemize}
+  \item methods, paths, headers and reason phrases are checked against the HTTP grammar, so CR/LF injection is
+    refused;
+  \item \code{timeout_ms} is a budget for the whole exchange;
+  \item the server answers a malformed request with 400 and an invalid handler response with 500, gives each
+    connection \code{timeout_ms} to send its request, serves at most 256 connections at once, and waits for
+    in-flight handlers before returning;
+  \item a dedicated test suite, \code{test_http}, covers this behaviour.
+\end{itemize}
 
 \section{The multiplexed transfer}
 

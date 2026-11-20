@@ -2,15 +2,15 @@
 
 \section{Methodology}
 
-\paragraph{Test suite.} Verification rests on a GoogleTest suite of 206 tests, or 184 when built without the
+\paragraph{Test suite.} Verification rests on a GoogleTest suite of 220 tests, or 195 when built without the
 cryptographic backend, since the cryptography and DTLS tests are then excluded. There is one test file per
 component, plus end-to-end tests for each transport. The tests are designed to run concurrently: they probe for
 free ports, which makes \code{ctest -j} safe, and each has a timeout. The test style follows from the pure state
 machines of Section~\ref{sec:principles}. Timers, loss and reordering are injected through a virtual clock and
 crafted datagrams rather than waited for, so the suite is fast and deterministic.
 
-\paragraph{Performance measurements.} These compare version~7 (commit \code{abbf731}) with version~8 (commit
-\code{9706e21}), both built \code{RelWithDebInfo} without cryptography, on the same four-core Linux host.
+\paragraph{Performance measurements.} These compare version~7 (commit \code{abbf731}) with version~8 after both review
+passes (commit \code{e5cb73a}), both built \code{RelWithDebInfo} without cryptography, on the same four-core Linux host.
 \begin{itemize}
   \item \emph{Loopback} measurements transfer 512~MiB over four lanes directly between two processes.
   \item \emph{Emulated-network} measurements use \code{bench/fuse_netem}, a user-space relay that sits between
@@ -36,9 +36,10 @@ Every transfer's output was compared byte for byte with its input.
 \code{test_flags} (10) & \code{SendQueue} coalescing and backpressure, ordered and unordered reassembly, bounded duplicate set \\
 \code{test_spsc_ring} (4), \code{test_orchestrator} (6) & Ring ordering across threads; scale-out, scale-in, stabilisation, graceful drain \\
 \code{test_udp} (6), \code{test_stage1_loopback} (2) & IPv4 and IPv6 loopback, address comparison and formatting; the drop $\to$ NACK $\to$ retransmit loop over real sockets, with no heap allocation in the hot loop \\
-\code{test_session_crypto} (15), \code{test_digest} (3), \code{test_dtls} (6) & Seal/open, tamper detection, key epochs, control GMAC and direction separation, digest, DTLS handshake \\
-\code{test_transfer} (41) & Round trips over one and many lanes; encryption and wrong or mismatched keys (failing at the handshake); forged control messages ignored under a PSK; malicious offsets and huge size claims; Retry before anything else; silent peers no longer acknowledged; path validation and foreign sources unable to redirect ACKs; cancel, abort and connect timeout; lossy links; small receiver rings not overrun; block growth settling on a path that loses large datagrams; IPv6; file output, resume and whole-file verification; version mismatch; bad configurations \\
-\code{test_mux_transfer} (10), \code{test_sdk} (19) & Multiplexed transfer end to end and SETUP validation; SDK connect, messages, encryption, close \\
+\code{test_session_crypto} (16), \code{test_digest} (3), \code{test_dtls} (6) & Seal/open, tamper detection, key epochs, control GMAC and direction separation, control replay rejection, digest, DTLS handshake \\
+\code{test_transfer} (44) & Round trips over one and many lanes; encryption and wrong or mismatched keys (failing at the handshake); forged control messages ignored under a PSK; malicious offsets and huge size claims; Retry before anything else; silent peers no longer acknowledged; path validation and foreign sources unable to redirect ACKs; cancel, abort and connect timeout; lossy links; small receiver rings not overrun; block growth settling on a path that loses large datagrams; IPv6; file output, resume and whole-file verification; version mismatch, and a forged mismatch reply that must not abort; claims above \code{max_receive_bytes}; a planted \code{.part} symbolic link; bad configurations \\
+\code{test_mux_transfer} (10), \code{test_sdk} (24) & Multiplexed transfer end to end and SETUP validation; SDK connect, messages, encryption, close; unsigned control ignored under a PSK; a CLOSE from another address ignored; idle connections kept alive and silent peers detected; binary keys with zero bytes \\
+\code{test_http} (5) & Round trip; request injection refused; invalid handler response becomes 500; long reason phrases kept; the server waits for in-flight handlers \\
 Scaffold tests (16) & Legacy C packet, varint and crypto helpers \\
 \bottomrule
 \end{tabularx}
@@ -51,10 +52,10 @@ Scaffold tests (16) & Legacy C packet, varint and crypto helpers \\
 \toprule
 \textbf{Build type} & \textbf{Crypto} & \textbf{Passed / total} \\
 \midrule
-Debug & on & 206 / 206 \\
-Debug & off & 184 / 184 \\
-RelWithDebInfo & on & 206 / 206 \\
-RelWithDebInfo & off & 184 / 184 \\
+Debug & on & 220 / 220 \\
+Debug & off & 195 / 195 \\
+RelWithDebInfo & on & 220 / 220 \\
+RelWithDebInfo & off & 195 / 195 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -92,14 +93,14 @@ recv seq=3 [retransmit]  base=8  received_total=8
 \toprule
 \textbf{Condition} & \textbf{v7} & \textbf{v8} & \textbf{Change} \\
 \midrule
-Clean relay & 435.4 & 483.6 & $+11\%$ \\
-Loss 2\% & 75.6 & 206.8 & $\times 2.7$ \\
-Loss 5\% & 36.0 & 157.3 & $\times 4.4$ \\
-Delay 25 ms (50 ms RTT) & 57.5 & 51.4 & $-11\%$ \\
-Jitter $10\pm5$ ms & 2.7 & 2.8 & $+4\%$ \\
-Reorder 10\% at 10 ms & 3.8 & 4.1 & $+8\%$ \\
-Duplicate 3\% at 5 ms & 128.6 & 163.1 & $\times 1.3$ \\
-25 ms RTT $+$ 1\% loss & 6.8 & 5.2 & $-24\%$ \\
+Clean relay & 281.5 & 381.9 & $+36\%$ \\
+Loss 2\% & 66.4 & 181.1 & $\times 2.7$ \\
+Loss 5\% & 31.5 & 138.4 & $\times 4.4$ \\
+Delay 25 ms (50 ms RTT) & 55.6 & 52.0 & $-6\%$ \\
+Jitter $10\pm5$ ms & 2.7 & 2.7 & $0\%$ \\
+Reorder 10\% at 10 ms & 4.2 & 4.0 & $-5\%$ \\
+Duplicate 3\% at 5 ms & 167.3 & 152.9 & $-9\%$ \\
+25 ms RTT $+$ 1\% loss & 6.6 & 5.3 & $-20\%$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -108,8 +109,8 @@ Duplicate 3\% at 5 ms & 128.6 & 163.1 & $\times 1.3$ \\
 \centering
 \fitwidth{\begin{tikzpicture}[x=1.7cm,y=0.0085cm,font=\footnotesize]
   \foreach \y in {0,100,200,300,400,500} {\draw[black!15] (0.3,\y) -- (8.7,\y); \node[left] at (0.3,\y) {\y};}
-  \foreach \i/\n/\a/\b in {1/Clean/435.4/483.6,2/Loss\\2\%/75.6/206.8,3/Loss\\5\%/36.0/157.3,4/50 ms\\RTT/57.5/51.4,
-                           5/Jitter/2.7/2.8,6/Reorder/3.8/4.1,7/Dup\\3\%/128.6/163.1,8/RTT\\+ loss/6.8/5.2} {
+  \foreach \i/\n/\a/\b in {1/Clean/281.5/381.9,2/Loss\\2\%/66.4/181.1,3/Loss\\5\%/31.5/138.4,4/50 ms\\RTT/55.6/52.0,
+                           5/Jitter/2.7/2.7,6/Reorder/4.2/4.0,7/Dup\\3\%/167.3/152.9,8/RTT\\+ loss/6.6/5.3} {
     \fill[black!35] (\i-0.32,0) rectangle (\i-0.02,\a);
     \fill[blue!65] (\i+0.02,0) rectangle (\i+0.32,\b);
     \node[below,align=center] at (\i,0) {\n};
@@ -124,17 +125,16 @@ Duplicate 3\% at 5 ms & 128.6 & 163.1 & $\times 1.3$ \\
 
 \paragraph{Loss.} Version~8 gains most under loss: 2.7 times faster at 2\% and 4.4 times at 5\%. Selective
 acknowledgement stops the resending of blocks the receiver already holds, and the timeout repairs a burst of
-known holes at once instead of one block per timeout. The number of retransmissions stays roughly the same
-(about 700 at 2\%, 1,700 at 5\%), but they are now the right ones.
+known holes at once instead of one block per timeout. The number of retransmissions is similar (about 700--900
+at 2\%, 1,800--2,000 at 5\%), but they are now the right ones. The same ratios were measured on the code before
+the second review, so its replay window and reader-side checks cost nothing measurable here.
 
-\paragraph{Duplication.} Under duplication, version~8 makes no retransmissions at all, against 47 in version~7,
-because duplicates no longer disturb the loss signal.
-
-\paragraph{Jitter and reordering.} These are essentially unchanged. Both versions correctly treat a late block
+\paragraph{Jitter, reordering and duplication.} These are essentially unchanged; the differences of a few percent
+are within the run-to-run variation of this host. Both versions correctly treat a late block
 as late rather than lost until the reorder delay expires, and at these settings the relay's own reordering
 dominates.
 
-\paragraph{Long delay.} With or without loss, version~8 is 11--24\% slower. This is the intended consequence of
+\paragraph{Long delay.} With or without loss, version~8 is 6--20\% slower. This is the intended consequence of
 fix~\#8. Version~7's window counted blocks of whatever size they had grown to, so it silently held up to 13
 times more bytes than its nominal size. That inflated throughput on a clean long path, but it is unfair to
 competing traffic and fragile under loss. Version~8 must earn its window through slow start and additive
@@ -143,11 +143,12 @@ the ramp.
 
 \section{Loopback throughput}
 
-With 512~MiB over four lanes (median of three runs), version~7 reached 1,045~MB/s with 1,644 retransmissions and
-version~8 1,079~MB/s with 706 retransmissions. The hardening therefore cost no loopback throughput, even though
-every acknowledgement is now processed selectively. Flow control and selective acknowledgement more than halve
-the needless retransmissions, which on loopback come from the receiver's rings overflowing, not from the
-network.
+With 512~MiB over four lanes (median of five alternating runs), version~7 reached 729~MB/s and version~8
+924~MB/s, with median retransmission counts of 1,324 and 1,454. Loopback throughput on this shared host varies
+strongly from run to run (670--877~MB/s for version~7, 259--967~MB/s for version~8), and an earlier set of runs
+on the same host measured 1,045 and 1,079~MB/s. The conclusion is therefore only that the hardening costs no
+loopback throughput. On loopback, retransmissions come from the receiver's rings overflowing, not from the
+network, and their number varies too much between runs to compare the versions.
 
 \section{Earlier comparative benchmarks}
 
@@ -170,7 +171,9 @@ mechanisms, not as predictions for a wide-area network.
 \begin{itemize}
   \item All measurements are single-host: impairments are emulated by a user-space relay, and no physical
     two-host or real 1,500-MTU path has been measured yet.
-  \item Each cell of Table~\ref{tab:netem} is a single run; differences of a few percent are within noise.
+  \item Each cell of Table~\ref{tab:netem} is a single run, and absolute throughput on this shared host varies
+    by tens of percent between runs (for version~7, the clean relay measured 435~MB/s in an earlier run and
+    282~MB/s in this one). Ratios between the versions are stable; small differences are within noise.
   \item The relay itself limits absolute throughput at high rates, although it limits both versions equally.
   \item The comparison with QUIC predates version~8 and has not been repeated since.
 \end{itemize}

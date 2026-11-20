@@ -37,8 +37,10 @@ speed; batching amortises that cost.
 
 \code{path_mtu}\vviii{} connects a temporary socket to the destination and reads the kernel's route MTU
 (\code{IP_MTU} or \code{IPV6_MTU}). Together with the IP and UDP header overhead (28 bytes for IPv4, 48 for IPv6)
-it bounds how far the block size may grow. On macOS the MTU cannot be queried this way, so blocks do not grow
-there. Version~8 also opens each sending socket in the destination's address family; earlier versions always
+it bounds how far the block size may grow. This is the MTU of the route's \emph{first hop} as the kernel knows
+it, not a measurement of the whole path: nothing sets the don't-fragment bit or probes the path, so the bound is
+exact only where the first hop's MTU is the path's, as on loopback or a single LAN segment
+(Section~\ref{sec:blocksize}). On macOS the MTU cannot be queried this way, so blocks do not grow there. Version~8 also opens each sending socket in the destination's address family; earlier versions always
 opened IPv4 sockets, which made IPv6 hosts unreachable.
 
 \section{Sender registry and selective acknowledgement}\label{sec:registry}
@@ -356,11 +358,25 @@ force repeated derivations.
 
 \paragraph{Control-plane authentication\vviii.} A \code{ControlAuth} object per lane and side appends and
 verifies the GMAC trailer described in Section~\ref{sec:wirecrypto}, with its own key and a send counter that
-starts at one. Replaying an old authentic control message is harmless by construction:
+starts at one. The verifier also rejects replays. Because each sender's counter only grows, it keeps the
+highest counter accepted and a 1,024-bit bitmap of the counters below it, as an IPsec or DTLS receiver
+does~\cite{rfc6347}, and accepts each counter at most once. A counter older than the window is refused
+outright. The first version of this component assumed replay was harmless, on the grounds that acknowledgement
+bases only move forward. The second review showed otherwise (R2):
 \begin{itemize}
-  \item acknowledgement bases only ever move forward;
-  \item an abort can only be replayed if one was genuinely sent.
+  \item a single captured NACK, replayed every round trip, held the sender's congestion window at its floor;
+  \item an old ACK re-advertised a stale, small receive window.
 \end{itemize}
+Messages that are legitimately repeated, such as the FileDigest resent until it is echoed, are now signed
+afresh for every copy.
+
+\paragraph{Path validation as a shared component\vviii.} The logic that admits a new peer address only after
+it echoes a random challenge (Section~\ref{sec:path}) lives in its own header, \code{path_validator.hpp}, so the
+bulk transfer and the SDK use the same implementation. It tracks one candidate address at a time and resends
+its challenge at most every 50~ms.
+
+\paragraph{Key hygiene.} Session keys, epoch keys and HKDF's intermediate pseudorandom key are overwritten
+with \code{secure_zero}, a wipe the compiler may not optimise away, on every exit path.
 
 \paragraph{Security properties.} The per-session random salt gives \emph{key freshness}: two sessions never
 share a key. The pre-shared-key path does \emph{not} give forward secrecy. Anyone who records the traffic and

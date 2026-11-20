@@ -82,7 +82,7 @@
     Tavva Dinesh Reddy
   \end{tabular}\par}
   \vfill
-  {\small Source code: \code{https://github.com/kamalkoushikd/fuse-nw} (protocol version 8, commit \code{9706e21})\par}
+  {\small Source code: \code{https://github.com/kamalkoushikd/fuse-nw} (protocol version 8, commit \code{e5cb73a})\par}
 \end{titlepage}
 
 \pagenumbering{roman}
@@ -101,11 +101,13 @@ reorder-tolerant negative acknowledgements), per-stream congestion control with 
 retransmission timers and pacing, and three transports built on these pieces: a sharded, GSO-batched bulk
 transfer with resumable file reception, a message-oriented socket-style C API, and a multiplexed transfer
 serviced by an autoscaling worker pool. A full security and correctness review of the earlier version found 31
-problems. We present protocol version~8, which fixes every one outside the socket-style SDK and the HTTP
-mapping. Among the fixes are an AES-GCM nonce-reuse flaw on retransmission, an unauthenticated control plane,
-missing address and path validation, missing flow control, and an unused selective-acknowledgement bitmask.
+problems. We present protocol version~8, which fixes them in two passes. The first pass hardened the protocol
+core; a second review then checked those fixes, found eight further problems in them, and extended the same
+protections to the socket-style SDK and the HTTP mapping. Among the fixes are an AES-GCM nonce-reuse flaw on
+retransmission, an unauthenticated and replayable control plane, missing address and path validation, missing
+flow control, unbounded resource claims, and an unused selective-acknowledgement bitmask.
 
-All 206 tests pass (184 without the cryptographic backend). Under emulated packet loss, version~8 transfers 2.7
+All 220 tests pass (195 without the cryptographic backend). Under emulated packet loss, version~8 transfers 2.7
 times faster at 2\% loss and 4.4 times faster at 5\% loss than version~7, with byte-identical output in every
 experiment, and without loss of loopback throughput. We close with the limitations that remain and the work
 needed to address them.
