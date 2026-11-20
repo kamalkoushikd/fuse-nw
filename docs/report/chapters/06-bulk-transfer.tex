@@ -1,0 +1,423 @@
+\chapter{Bulk Transfer End to End}\label{ch:transfer}
+
+The bulk-transfer API (\code{fuse/transfer.hpp}, implemented in \code{src/proto/transfer.cpp}) is the most
+complete transport and the one that received the full version~8 hardening. This chapter follows a transfer
+from configuration to completion.
+
+\section{Interface and shape of a transfer}
+
+The API consists of four blocking calls: \code{send_buffer}, \code{receive_buffer}, \code{send_file} and
+\code{receive_file}. Each takes a \code{TransferConfig} (Appendix~\ref{app:config}) and returns a
+\code{TransferStatus}. The receiver must be started first, because it has to be bound before the sender's
+first message arrives.
+
+The data is split into \code{lanes} equal shards, four by default. Lane $i$ is an independent reliable stream
+with these properties:
+\begin{itemize}
+  \item it uses UDP port \code{base_port}$+i$ on the receiver, so the whole port range must be open;
+  \item it has its own thread on the sender;
+  \item it has its own reader thread on the receiver;
+  \item it has its own sequence space, window, registry, congestion controller and keys.
+\end{itemize}
+A configuration whose last port would exceed 65,535 is rejected\vviii; before version~8 the sum wrapped around
+to ports near zero.
+
+On the receiver, a lane's reader thread does not write data itself. It hands each new block to one of $K$ writer
+threads (\code{writer_threads}, two by default), or to a dedicated thread for retransmitted blocks, through
+lock-free rings (Figure~\ref{fig:pipeline}). The writers decrypt and write each block directly to its final
+position in the output. Only when a writer reports success does the reader admit the block to its window, so
+every acknowledgement the sender sees covers bytes that are both authentic and already written.
+
+\begin{figure}[H]
+\centering
+\fitwidth{\begin{tikzpicture}[font=\small]
+  \node[io,minimum height=1.2cm] (sock) at (0,0) {socket\\lane $i$};
+  \node[core,minimum height=2.4cm,minimum width=2.4cm] (rd) at (3.4,0) {reader\\(window,\\ACK, NACK)};
+  \node[box,minimum width=2.4cm] (w1) at (8,1.5) {writer 1};
+  \node[lbl] at (8,0.75) {$\vdots$};
+  \node[box,minimum width=2.4cm] (w2) at (8,0) {writer $K$};
+  \node[box,minimum width=2.4cm] (rt) at (8,-1.5) {retransmit consumer};
+  \node[io,minimum height=2.4cm,minimum width=2.4cm] (sink) at (12.4,0) {output\\(memory or\\\texttt{.part} file)};
+  \draw[arr] (sock) -- (rd);
+  \draw[arr] (rd.east|-w1) -- node[above,lbl]{new blocks} (w1.west);
+  \draw[arr] (rd.east|-w2) -- node[above,lbl]{new blocks} (w2.west);
+  \draw[arr] (rd.east|-rt) -- node[above,lbl]{retransmissions} (rt.west);
+  \draw[arr] (w1.east) -- (sink.west|-w1); \draw[arr] (w2.east) -- (sink.west|-w2); \draw[arr] (rt.east) -- (sink.west|-rt);
+  \node[lbl,below=3mm of rt] {each arrow from the reader is a ring; a matching ring carries each verdict back};
+\end{tikzpicture}}
+\caption{Receive pipeline of one lane. Solid arrows carry datagrams and dashed arrows carry verdicts back.
+Every ring has one producer and one consumer, so no mutex is needed.}\label{fig:pipeline}
+\end{figure}
+
+New blocks are routed to writer $\lfloor \mathit{seq}/64\rfloor \bmod K$: whole runs of 64 consecutive blocks go
+to the same writer, which can then write each run with a single \code{pwritev}. Round-robin routing
+($\mathit{seq}\bmod K$) left every writer's blocks non-adjacent, and was measured to be two to four times slower
+on a real disk. A full ring never blocks the reader: the datagram is dropped and recovered by the normal loss
+recovery.
+
+\section{Opening a lane}\label{sec:handshake}
+
+Figure~\ref{fig:handshake} shows how a lane is opened. The sender draws a random 64-bit lane nonce from a
+secure source and sends a StreamStart. Under a pre-shared key, the StreamStart carries the session salt and the
+control trailer.
+
+\begin{figure}[H]
+\centering
+\fitwidth{\begin{tikzpicture}[font=\small,yscale=0.9]
+  \node[box] at (0,0.4) {Sender lane $i$};
+  \node[box] at (9,0.4) {Receiver lane $i$};
+  \draw[thick,black!40] (0,0) -- (0,-11.6); \draw[thick,black!40] (9,0) -- (9,-11.6);
+  \draw[msg] (0,-0.6) -- node[above,sloped]{StreamStart(nonce, token $=0$)} (9,-1.2);
+  \node[lbl,right] at (9.1,-1.3) {token wrong:\\commit nothing};
+  \draw[msg] (9,-1.9) -- node[above,sloped]{Retry(nonce, token)\vviii} (0,-2.5);
+  \draw[msg] (0,-2.9) -- node[above,sloped]{StreamStart(nonce, token)} (9,-3.5);
+  \node[lbl,right] at (9.1,-3.9) {verify GMAC\vviii\\check sizes, prepare sink\\claim lane};
+  \draw[msg] (9,-4.5) -- node[above,sloped]{ResumeRanges(nonce)[parts]} (0,-5.1);
+  \draw[msg] (9,-5.4) -- node[above,sloped]{Ack(nonce)} (0,-6.0);
+  \draw[msg] (0,-6.5) -- node[above,sloped]{DATA \ldots} (9,-7.1);
+  \draw[msg] (9,-7.4) -- node[above,sloped]{Ack / Nack} (0,-8.0);
+  \draw[msg,dashed] (0,-8.5) -- node[above,sloped]{FileDigest (resumed only)} (9,-9.1);
+  \draw[msg,dashed] (9,-9.4) -- node[above,sloped]{FileDigest (echo)} (0,-10.0);
+  \draw[msg] (0,-10.5) -- node[above,sloped]{StreamClose(finished) $\times3$} (9,-11.1);
+\end{tikzpicture}}
+\caption{The life of a lane. Every reply carries the lane nonce; under a pre-shared key every message except
+Retry carries a control trailer.}\label{fig:handshake}
+\end{figure}
+
+\paragraph{Address validation\vviii.} On receiving a StreamStart, the receiver first computes
+\[
+\mathit{token}=\mathrm{SipHash\text{-}2\text{-}4}_{s}(\mathit{family}\,\|\,\mathit{port}\,\|\,\mathit{address}\,\|\,\mathit{nonce}),
+\]
+where $s$ is a 128-bit secret held only by this receiver lane. If the StreamStart does not carry this token, the
+receiver replies with a 20-byte Retry and does nothing else. It allocates nothing, claims nothing and sends
+nothing larger than the request. Only a sender that genuinely receives at its claimed address can echo the
+token. A spoofed StreamStart can therefore neither take over the lane nor turn the receiver into an amplifier
+aimed at a victim. This is the same mechanism as QUIC's Retry~\cite{rfc9000}.
+
+\paragraph{Key confirmation\vviii.} When a StreamStart with a valid token arrives and the lane has no session
+yet, the receiver authenticates it before allocating anything. It derives the session key from its own
+pre-shared key and the StreamStart's salt, creates a trial control authenticator, and verifies the trailer. Two
+outcomes are possible:
+\begin{itemize}
+  \item \emph{Verification fails.} This happens when the keys differ, when only one side has a key, or when a
+    plaintext receiver meets an encrypting sender. The receiver answers, unauthenticated and at most once per
+    100~ms, with StreamClose(reason~2). The sender then reports \code{AuthFailed} immediately, instead of after
+    twenty failed data blocks or a timeout.
+  \item \emph{Verification succeeds.} The receiver validates the sizes in an order that cannot overflow, namely
+    $\mathit{total\_bytes}\le\mathit{file\_total}$ and
+    $\mathit{base\_offset}\le\mathit{file\_total}-\mathit{total\_bytes}$. The first lane to succeed then sizes
+    the output with an atomic compare-and-swap, and every other lane must agree on the total. If the claimed
+    size cannot be allocated, the receiver fails with \code{ResourceLimit}.
+\end{itemize}
+
+\paragraph{Answer and retries.} The receiver then records the lane nonce and the sender's address, computes the
+byte ranges of the lane it still needs (all of it, unless it is resuming), and sends them as ResumeRanges
+followed by Ack messages. The sender considers the handshake complete only once it has an Ack and every
+ResumeRanges part carrying its nonce. It retries its StreamStart with exponential backoff from 1~ms to 200~ms,
+bounded by \code{connect_timeout_ms} (10~s by default); a retried StreamStart with the right nonce makes the
+receiver re-send its answer. The ranges are checked for order, overlap and bounds before use, and an
+inconsistent answer makes the sender send the whole lane instead.
+
+\section{The sender's main loop}\label{sec:sendloop}
+
+After the handshake the sender lane runs one loop until every byte is acknowledged or the lane gives up. Each
+iteration performs five steps.
+
+\begin{enumerate}
+  \item \textbf{Stop checks.} The loop first handles user cancellation and the shared \code{stop_all} flag, which
+    is set when a sibling lane has heard the peer abort.
+  \item \textbf{Window computation.} It advances the congestion controller and computes the bytes it may have in
+    flight:
+    \[
+    \mathit{window\_bytes}=\min\bigl(\max(4,\mathit{cwnd})\cdot\mathit{base\_block},\;\max(4,\mathit{rwnd})\cdot\mathit{block}\bigr).
+    \]
+    Here $\mathit{cwnd}$ is counted in units of the \emph{configured} block size\vviii{} and $\mathit{rwnd}$ is
+    the receiver's advertised window\vviii. The floor of four keeps a zero window from wedging the flow.
+  \item \textbf{Sending a batch.} If there is room in the window and in the 1,024-slot registry, and the pacing
+    time has passed, the sender builds a batch:
+    \begin{itemize}
+      \item It stores each block in the registry, seals it, encodes the DATA datagram into a staging buffer, and
+        sends the batch with segmentation offload, falling back to individual sends.
+      \item The batch is limited by the offload budget (about 60~KB), the registry, the window and a burst cap.
+        The cap is 16 datagrams once the path has a real round-trip time (above 1~ms), because a 64-datagram
+        line-rate burst overflows shallow router buffers.
+      \item The next batch is paced (Section~\ref{sec:cc}).
+    \end{itemize}
+  \item \textbf{Reading control traffic.} It drains up to 64 control datagrams. Under a pre-shared key, any
+    datagram without a valid trailer is discarded before it is even parsed. Otherwise:
+    \begin{itemize}
+      \item an \emph{Ack} with the right nonce is applied with \code{apply_ack}, its \code{rwnd} recorded, and a
+        new echoed send time fed to the RTT estimator;
+      \item a \emph{Nack} marks a loss in the controller and resends each listed block;
+      \item a \emph{StreamClose(aborted)} ends the lane with \code{PeerAborted};
+      \item a \emph{PathChallenge} is answered, and a \emph{PathResponse} completes a pending path validation
+        (Section~\ref{sec:path}).
+    \end{itemize}
+  \item \textbf{Timeout and adaptation.} It runs the retransmission timeout and the block-size adaptation
+    (Sections~\ref{sec:recovery} and~\ref{sec:blocksize}), and gives up with \code{Timeout} if no acknowledgement
+    has confirmed new data for \code{timeout_ms}.
+\end{enumerate}
+
+\paragraph{RTT samples from repeated echoes.} A repeated echo is never treated as a new RTT sample. The receiver
+only updates its echoed send time when a new highest block arrives, so its periodic acknowledgements repeat the
+same value. Counting each repeat as a fresh sample manufactured an ever-growing fake RTT whenever the sender was
+stalled on a gap, which stretched the timer exactly when it needed to stay responsive.
+
+\paragraph{The empty case.} A lane with nothing to send still needs a completion signal: an empty send, an
+uneven split, or a resumed lane that is already complete. The lane sends a single empty block marked LastBlock.
+
+\section{The life of one packet}\label{sec:life}
+
+To make the pieces concrete, we follow one encrypted block, number 4,711 of lane~2, from the sender's memory to
+the receiver's disk.
+
+\begin{enumerate}
+  \item \textbf{Admission.} The lane's congestion and receive windows have room and the pacing time has passed.
+    The block's bytes are copied into registry slot $4711 \bmod 1024$, together with their offset, length and
+    flags.
+  \item \textbf{Key and nonce.} The key schedule selects the cipher for epoch $4711\gg22=0$. The nonce is
+    $\langle 2, 4711, \text{0x0000}\rangle$, and the AAD is $\langle 2, 4711, \mathit{offset}, \mathit{flags}
+    \wedge\lnot\text{0x01}\rangle$.
+  \item \textbf{Sealing.} AES-256-GCM encrypts the payload into a scratch buffer and appends the tag; if sealing
+    fails, the batch stops.
+  \item \textbf{Framing.} The datagram is the outer header, the 21-byte block header with
+    \code{payload_len} including the tag, the send time plus the lane's secret offset, and the ciphertext.
+  \item \textbf{Transmission.} It joins up to 15 other datagrams in the staging buffer, and the batch leaves in
+    one \code{sendmsg} with \code{UDP_SEGMENT}. The kernel splits the buffer into individual datagrams.
+  \item \textbf{Reception.} On the receiver, the lane's reader collects it with up to 63 others in one
+    \code{recvmmsg}, peeks at the type, and decodes the header. It discards the block if the block is below the
+    base, beyond the window, already received, or currently held by a writer. Otherwise it copies the datagram
+    into the ring of writer $\lfloor4711/64\rfloor\bmod K$.
+  \item \textbf{Decryption and write.} The writer selects its own cipher for the lane and epoch, rebuilds the
+    AAD, and opens the block. On success it checks that
+    $\mathit{offset}\le\mathit{lane\_total}$ and $\mathit{len}\le\mathit{lane\_total}-\mathit{offset}$, merges
+    the block with any adjacent blocks in its batch, and writes the run with one \code{pwritev} at
+    $\mathit{lane\_base}+\mathit{offset}$. It posts the verdict to the reader's completion ring.
+  \item \textbf{Admission to the window.} The reader collects the verdict and calls \code{on_receive}. The bit
+    for 4,711 is set; if it was the first gap, the base slides forward. If the block came from a new source
+    address, a path challenge is sent there (Section~\ref{sec:path}).
+  \item \textbf{Acknowledgement.} After eight newly delivered blocks, or 200~\textmu s, or a window update, the
+    reader sends an Ack. The Ack carries the new base, the bitmask, the echoed send time, the nonce and the
+    current receive window, and is signed with the control trailer.
+  \item \textbf{Release.} The sender verifies the trailer and applies the Ack, releasing slot $4711\bmod 1024$.
+    The block's bytes now count towards progress, and the window may grow.
+\end{enumerate}
+
+\section{Loss recovery}\label{sec:recovery}
+
+Fuse recovers losses through three cooperating mechanisms.
+
+\paragraph{Negative acknowledgements.} The receiver reports gaps that have persisted beyond a reorder delay and
+were not reported within a re-NACK interval. Both intervals scale with the receiver's own estimate of the RTT:
+\begin{itemize}
+  \item the reorder delay is half the RTT, clamped to 1--100~ms;
+  \item the re-NACK interval is 1.5 times the RTT, clamped to 20--500~ms;
+  \item before any estimate exists, conservative wide-area defaults of 3~ms and 40~ms apply.
+\end{itemize}
+The receiver measures the RTT purely on its own clock, as the delay between sending a NACK and receiving the
+retransmission it requested, so no comparison between the two hosts' clocks is needed. Scaling matters: with
+fixed loopback-tight values, a wide-area path received a duplicate NACK every few milliseconds while the
+retransmission was still 50~ms away.
+
+\paragraph{Selective acknowledgement\vviii.} Every Ack confirms blocks above the base through its bitmask, so a
+NACK or timeout never resends a block the receiver already holds.
+
+\paragraph{Retransmission timeout\vviii.} If the base has not advanced for one RTO (Section~\ref{sec:cc}), the
+sender resends the base and up to seven further \emph{known holes}: unacknowledged blocks below
+\code{received_end}, the highest block the receiver is known to hold. After a burst loss, the rest of the burst
+is therefore repaired in one timeout rather than one timeout per block, without resending blocks that are merely
+in flight. A send that the kernel refuses, for example because the socket buffer is full, does not count as
+progress; otherwise the block would never be retransmitted and the transfer would stall.
+
+\section{Flow control}\label{sec:flow}
+
+Before version~8 there was no flow control. A receiver whose writers fell behind a fast sender (because of a
+slow disk, say) silently dropped blocks at its full rings. The sender interpreted the losses as network
+congestion: NACKs, retransmissions and a halved window.
+
+Now each Ack advertises the receive window, which is the free space in the lane's writer rings plus the blocks
+already handed over but not yet written, capped at 1,024. The sender keeps its bytes in flight within it. When
+the advertised window was low (below a quarter of the maximum) and has since at least doubled, the receiver
+sends an Ack immediately as a \emph{window update}. Without the update, a sender that paused for the receiver
+would sit idle until the next periodic acknowledgement. This is the behaviour that removed a throughput
+regression found while the feature was being developed.
+
+\section{Adaptive block size and the MTU}\label{sec:blocksize}
+
+The sender starts with the configured block size, 1,200 bytes by default, and doubles it after eight batches
+in a row that were confirmed by acknowledgements, up to a \emph{growth ceiling}\vviii. Any loss returns the
+block size to the configured value. Growth is counted in acknowledged batches rather than loop iterations, which
+can accumulate many times within one round trip, before any acknowledgement could have arrived.
+
+The growth ceiling is computed from the kernel's route MTU:
+\[
+\mathit{ceiling}=\min\bigl(\mathit{block\_ceiling},\;\mathit{mtu}-\mathit{ip\_udp}-31-\mathit{tag}\bigr),
+\]
+and is never below the starting size. An unknown MTU means no growth at all. On loopback, which reports a
+64~KiB MTU, blocks may still grow to 16~KiB; on an ordinary 1,500-byte path they stop at about 1,450 bytes.
+Before version~8, blocks grew to 16~KiB on any path. Above the MTU every such datagram is fragmented, and losing
+one fragment loses the whole datagram.
+
+On top of the MTU bound, a loss that occurs soon after a growth step makes the previous size the new ceiling,
+so on a path that drops large datagrams the size settles instead of oscillating. In the spirit of
+DPLPMTUD~\cite{rfc8899}, the larger size is probed again after a clean stretch, and that stretch doubles after
+each failed probe, up to 4,096 acknowledged batches. One transient loss therefore does not cap the lane
+permanently.
+
+The congestion window counts units of the \emph{configured} block size. Its cap is the number of units that
+1,024 blocks of the largest permitted size would occupy, so a long fat path can still be filled, but only by
+earning the window through slow start and additive increase. Previously the window counted blocks of whatever
+size they had grown to, so the same window could hold up to 13 times as many bytes. Slow start starts from 128
+units, about the 150~KB a lane used to begin with.
+
+\section{Path validation}\label{sec:path}
+
+A receiver whose peer is behind a NAT may see the sender's source address change in the middle of a transfer
+when the NAT rebinds. Before version~8, the bulk transfer simply re-anchored its peer address to the source of
+any accepted block. An attacker could then redirect a lane's acknowledgements, or reflect traffic at a third
+party, with a single spoofed datagram.
+
+Now, when authentic session traffic arrives from a new source, the side that sees it sends a PathChallenge with
+a fresh random 64-bit value to that source. It switches its peer address only when a matching PathResponse comes
+back \emph{from that source}. One candidate is validated at a time, and challenges are resent at most every
+50~ms. Data from the new source is accepted in the meantime, so a genuine rebinding costs no throughput. The
+mechanism is symmetric: the sender validates a new source of Acks in the same way.
+
+\section{Finishing a lane}
+
+The receiver knows a lane is complete when it has seen the block carrying LastBlock and the base has moved past
+it. The flag is trusted only after the block has authenticated.
+
+The receiver does not exit at once. It keeps sending acknowledgements on its normal schedule in case its last
+ones were lost, and it leaves at the first of three events:
+\begin{itemize}
+  \item the sender's StreamClose(finished) arrives;
+  \item the sender has been silent for 400~ms;
+  \item 1.5~s have passed since completion.
+\end{itemize}
+It then sends eight final acknowledgements. The lane's reported duration ends at completion rather than after
+this linger, so throughput figures are not diluted.
+
+For a resumed transfer, lane~0 also waits for the sender's whole-file digest. The sender computes the digest in a
+background thread that starts right after the handshake, overlapped with sending the missing data. It re-sends
+the digest every 50~ms until the receiver echoes it, and then sends StreamClose(finished) three times.
+
+\section{State machines of the two lane roles}
+
+Figures~\ref{fig:sendfsm} and~\ref{fig:recvfsm} summarise the behaviour described above.
+
+\begin{figure}[H]
+\centering
+\fitwidth{\begin{tikzpicture}[>={Stealth[length=2.2mm]},font=\small]
+  \node[st,minimum width=3.2cm] (hs) at (0,0) {Handshake\\(StreamStart, backoff)};
+  \node[st,minimum width=3.2cm] (sending) at (6.5,0) {Sending\\(window, pacing, RTO)};
+  \node[st,minimum width=2.4cm,fill=green!10] (ok) at (12.4,0) {Done: Ok};
+  \node[st,minimum width=3.2cm] (digest) at (6.5,-3.4) {Digest\\(lane 0, resumed)};
+  \node[st,minimum width=2.4cm,fill=red!8] (fail) at (0,-3.4) {Failed};
+  \draw[->,thick] (-2.6,0) -- (hs);
+  \draw[->,thick] (hs) -- node[lbl,below]{Ack and all\\ResumeRanges parts} (sending);
+  \draw[->,thick] (hs.north west) to[out=100,in=80,looseness=1.6] node[lbl,above]{Retry: echo the token} (hs.north east);
+  \draw[->,thick] (hs) -- node[lbl,left,align=right]{auth-failed close,\\version mismatch,\\connect timeout,\\cancel} (fail);
+  \draw[->,thick] (sending) -- node[lbl,above]{all acknowledged\\(fresh)} (ok);
+  \draw[->,thick] (sending) -- node[lbl,right]{all acknowledged (resumed)} (digest);
+  \draw[->,thick] (digest) -| node[lbl,below,pos=0.25]{digest echoed} (ok);
+  \draw[->,thick] (sending) -- node[lbl,below,sloped,pos=0.45]{abort, timeout, cancel} (fail);
+  \draw[->,thick] (digest) -- node[lbl,below]{abort, timeout} (fail);
+\end{tikzpicture}}
+\caption{Sender lane. Every transition to \emph{Failed} except a received abort sends StreamClose(aborted) to the peer.}\label{fig:sendfsm}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\fitwidth{\begin{tikzpicture}[>={Stealth[length=2.2mm]},font=\small]
+  \node[st,minimum width=2.8cm] (wait) at (0,0) {Waiting\\(no session)};
+  \node[st,minimum width=3.2cm] (recv) at (6,0) {Receiving\\(window, ACK, NACK)};
+  \node[st,minimum width=2.8cm] (linger) at (12,0) {Complete,\\lingering};
+  \node[st,minimum width=2.8cm,fill=green!10] (ok) at (12,-3.4) {Done: Ok\\or Incomplete};
+  \node[st,minimum width=2.8cm,fill=red!8] (fail) at (0,-3.4) {Failed};
+  \draw[->,thick] (-2.4,0) -- (wait);
+  \draw[->,thick] (wait.north west) to[out=100,in=80,looseness=1.6] node[lbl,above]{no token: Retry; bad auth: close(2)} (wait.north east);
+  \draw[->,thick] (wait) -- node[lbl,below]{valid token,\\authentic, sizes valid} (recv);
+  \draw[->,thick] (recv) -- node[lbl,above]{base passes\\the last block} (linger);
+  \draw[->,thick] (linger) -- node[lbl,right,align=left]{close(finished), or\\400 ms quiet, or 1.5 s} (ok);
+  \draw[->,thick] (wait) -- node[lbl,left,align=right]{unallocatable size:\\ResourceLimit} (fail);
+  \draw[->,thick] (recv) -- node[lbl,below,sloped,pos=0.45]{abort, idle timeout, cancel, I/O error} (fail);
+\end{tikzpicture}}
+\caption{Receiver lane. The final status is classified as \texttt{AuthFailed} if most blocks failed authentication.}\label{fig:recvfsm}
+\end{figure}
+
+\section{Cancellation, abort, timeout and combining statuses}
+
+\paragraph{Cancellation.} \code{TransferConfig::cancel} is an atomic flag that every lane polls. Its loop
+cadence is bounded by short socket timeouts, at most 20~ms on the receiver. When the flag is set, a lane sends
+StreamClose(aborted) three times and returns \code{Cancelled}, and its siblings stop as well. The peer returns
+\code{PeerAborted} instead of waiting out its timeout.
+
+\paragraph{Aborts before a session exists.} Under plaintext, an abort is accepted with any nonce, so a sender
+cancelled before its StreamStart arrived can still say ``I am not coming''. Under a pre-shared key, such an abort
+cannot be verified and is ignored.
+
+\paragraph{Timeouts.} The receiver gives up when no datagram has arrived for \code{timeout_ms} plus one second.
+The sender gives up when no acknowledgement has confirmed new data for \code{timeout_ms}.
+
+\paragraph{Detecting an active attack.} If at least 20 blocks have been seen and more than half of them failed
+authentication, the receiver reports \code{AuthFailed}. An active tampering attack fails most blocks, which is
+distinguishable from ordinary loss, and the caller should learn of it as such.
+
+\paragraph{Combining lane statuses.} The call's result is the most severe lane status, so that the caller sees
+the most actionable problem rather than whichever lane finished last. The ranking, from least to most severe,
+is:
+\begin{quote}\small
+Ok $<$ Incomplete $<$ Timeout $<$ PeerAborted $<$ Cancelled $<$ AuthFailed $<$ VerifyFailed $<$ ResourceLimit
+$<$ IoError $<$ SocketError $<$ VersionMismatch $<$ ConfigError, Unsupported.
+\end{quote}
+
+\section{Resumable file reception}\label{sec:resume}
+
+\code{receive_file} writes into \code{<path>.part} and renames it over \code{<path>} only after every byte has
+arrived and been synchronised to disk, so the destination file is always either untouched or complete. Behind
+the data, the \code{.part} file carries a trailer
+\[
+[\,\text{data}\,][\,\text{bitmap: one bit per chunk}\,][\,\mathit{file\_id},\mathit{total},\mathit{chunk},\mathit{nchunks},\mathit{checksum},\text{``FUSERSM1''}\,].
+\]
+Chunks are 64~KiB, doubled for very large files until there are at most $2^{23}$ of them. They are used rather
+than sequence numbers because the mapping from sequence number to offset changes with the block size, both
+during and between sessions. The trailer is rewritten every \code{resume_checkpoint_ms} (one second) and
+whenever a transfer ends without completing.
+
+A later \code{receive_file} of the same file adopts the partial copy. Its StreamStart must carry the same
+\code{file_id} and size; the receiver then asks only for the missing chunks, merging the closest ranges if the
+list would exceed 4,096. At the end it verifies the whole file against the sender's digest. On a mismatch it
+reports \code{VerifyFailed} and \emph{discards} the copy, since another resume would fail the same way.
+
+The file identity hashes the file's name, size, modification time, inode change time, inode number and
+device\vviii. Before version~8 it used only name, size and modification time, which missed a file rewritten in
+place with its modification time set back (by \code{touch -r} or a restore tool); a resume would then have
+stitched stale bytes into the result. The inode change time cannot be set back by user code.
+
+\section{Timers}
+
+\begin{table}[H]
+\centering\small
+\caption{Every timer of the bulk transfer.}\label{tab:timers}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{4.4cm}>{\raggedright\arraybackslash}p{3.6cm}X}
+\toprule
+\textbf{Timer} & \textbf{Value} & \textbf{Purpose} \\
+\midrule
+StreamStart retry & 1~ms doubling to 200~ms & handshake on any path RTT \\
+Connect timeout & \code{connect_timeout_ms} (10~s) & fail fast if no receiver \\
+No-progress timeout & \code{timeout_ms} (120~s) & sender: no acknowledged progress \\
+Receiver idle limit & \code{timeout_ms} $+$ 1~s & receiver: no datagrams at all \\
+Periodic ACK & every 8 blocks or 200~\textmu s & feedback cadence \\
+Quiet ACK limit & 3 to a silent peer\vviii & no endless reflection \\
+Reorder delay & RTT/2, 1--100~ms (3~ms initially) & late is not lost \\
+Re-NACK interval & 1.5 RTT, 20--500~ms (40~ms initially) & no duplicate repair \\
+RTO & Section~\ref{sec:cc}, 5~ms--1~s, backoff $\le 2^6$ & tail and burst losses \\
+Path challenge resend & 50~ms\vviii & validate a new address \\
+Version / auth reply limit & 100~ms\vviii & no reflection amplifier \\
+Digest resend & 50~ms & resumed transfers \\
+Completion linger & close, 400~ms quiet, or 1.5~s & lost final ACKs \\
+Resume checkpoint & \code{resume_checkpoint_ms} (1~s) & crash-safe progress \\
+\bottomrule
+\end{tabularx}
+\end{table}

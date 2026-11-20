@@ -1,0 +1,161 @@
+\chapter{The Socket-Style SDK and the Multiplexed Transfer}\label{ch:sdkmux}
+
+\section{The socket-style SDK}\label{sec:sdk}
+
+\subsection{Contract}
+
+\code{fuse/sdk.h} is a C API that will look familiar to anyone who has written a TCP server:
+\code{fuse_listen}, \code{fuse_accept}, \code{fuse_connect}, \code{fuse_send}, \code{fuse_recv} and
+\code{fuse_close}. Its semantics differ from TCP in four ways that a programmer must know:
+\begin{itemize}
+  \item \textbf{Messages, not a byte stream.} What one \code{fuse_send} delivers, exactly one \code{fuse_recv}
+    returns. Boundaries are preserved, as with \code{SOCK_SEQPACKET}, so there is no length prefixing and no
+    partial read.
+  \item \textbf{Reliable and ordered over UDP.} Loss is repaired underneath; the application sees either the
+    whole message or an error.
+  \item \textbf{Completion means delivery.} \code{fuse_send} returns once the peer has acknowledged the message,
+    not when it has been queued locally.
+  \item \textbf{Optional encryption.} The same pre-shared key on both ends seals every message with AES-256-GCM.
+\end{itemize}
+A message may be up to 64~MiB. A connection may be used from several threads, typically one sending and one
+receiving, and serialises its own operations internally.
+
+\subsection{Connecting: one listen port, a fresh port per connection}
+
+Figure~\ref{fig:sdkconnect} shows how a connection is established:
+\begin{enumerate}
+  \item The client sends HELLO($\mathit{salt}_c$, challenge) to the server's well-known port.
+  \item The server allocates a connection object, a fresh ephemeral socket and a pump thread.
+  \item It replies with HELLO\_ACK($\mathit{salt}_s$, proof) \emph{from the new socket}, and the client adopts
+    that source address as its peer.
+\end{enumerate}
+As in TFTP~\cite{rfc1350}, a single open port serves any number of connections without connection identifiers.
+
+The session key is derived with HKDF from the pre-shared key and the concatenation
+$\mathit{salt}_c\,\|\,\mathit{salt}_s$, so that neither side alone determines it. The server's salt was added
+in version~4 after a subtle problem was found. With only the client's salt, a HELLO retried before its first
+reply arrived could create two live connections with the same key, and both would start their sequence numbers
+at zero: an AES-GCM (key, nonce) collision. The proof is the client's challenge sealed under the session key, and
+it demonstrates that the server holds the key. The two directions of a connection use different stream
+identifiers (0 for client to server, 1 for server to client), and because the stream identifier is part of the
+nonce, the directions never share one.
+
+\begin{figure}[H]
+\centering
+\fitwidth{\begin{tikzpicture}[font=\small,yscale=0.85]
+  \node[box] at (0,0.4) {client (ephemeral port)};
+  \node[box] at (6,0.4) {server listen port};
+  \node[box] at (11,0.4) {server per-connection port};
+  \foreach \x in {0,6,11} \draw[thick,black!40] (\x,0) -- (\x,-5.2);
+  \draw[msg] (0,-0.7) -- node[above,sloped]{HELLO($\mathit{salt}_c$, challenge)} (6,-1.2);
+  \node[lbl,right] at (6.1,-1.6) {allocate connection,\\socket and pump thread};
+  \draw[msg] (11,-2.4) -- node[above,sloped,pos=0.6]{HELLO\_ACK($\mathit{salt}_s$, proof)} (0,-3.1);
+  \draw[msg,<->] (0,-3.9) -- node[above]{DATA / ACK / NACK} (11,-3.9);
+  \draw[msg,<->] (0,-4.8) -- node[above]{CLOSE} (11,-4.8);
+\end{tikzpicture}}
+\caption{SDK connection establishment. The client adopts the HELLO\_ACK's source address as its peer.}\label{fig:sdkconnect}
+\end{figure}
+
+\subsection{Inside a connection}
+
+Each connection has one UDP socket, one peer and a background \emph{pump} thread that does all the wire work:
+receiving, reassembling, acknowledging and retransmitting. Because of the pump, a blocked \code{fuse_recv} still
+sends acknowledgements and a blocked \code{fuse_send} still repairs loss. The application calls are thin. They
+hand a message to the pump, or take one from it, through a mutex and a condition variable.
+
+\paragraph{Framing.} A message is carried as a run of DATA blocks whose \code{offset} is the byte position
+within the message, with LastBlock on the final one. The receiver knows the message is complete when its window
+base passes the final block, so a truncated message can never reach the application.
+
+\paragraph{Backpressure.} Completed messages wait in an inbox capped at 256~MiB of undelivered data. When the cap
+is reached, new blocks are not admitted, and the sender's own retransmission logic stalls until the application
+drains the inbox.
+
+\paragraph{Closing.} \code{fuse_close} sends CLOSE, stops the pump, and waits for application threads still
+inside \code{fuse_send} or \code{fuse_recv}. The wait is limited to two seconds, which is one of the open issues.
+
+\subsection{Status and deferred work}
+
+The SDK was deliberately left out of the version~8 pass. Its remaining problems are listed in
+Table~\ref{tab:open} (Chapter~\ref{ch:conclusion}). The most important is that it still re-seals
+retransmissions with the retransmission bit inside the AAD, so it still has the nonce-reuse flaw that version~8
+fixed in the bulk transfer (Section~\ref{sec:nonce}). Its control messages are unauthenticated, and it
+re-anchors its peer address on any ACK, NACK or CLOSE. It is also stop-and-wait per message, and its registry
+uses about 17~MB per connection because each slot embeds a 16~KiB payload while the SDK only sends 1,200-byte
+blocks.
+
+\section{The multiplexed transfer}
+
+\subsection{Purpose}
+
+The bulk transfer ties one thread and one port to each lane. The multiplexed transfer
+(\code{fuse/mux_transfer.hpp}) instead carries $N$ logical streams over \emph{one} socket, serviced by a pool of
+worker threads whose size adapts to the load (Section~\ref{sec:orch}). It is the right choice when an
+application wants more logical streams than operating-system threads.
+
+\subsection{Session timeline}
+
+The transfer proceeds in five steps:
+\begin{enumerate}
+  \item \textbf{SETUP.} The sender opens one socket and runs the SETUP handshake (Section~\ref{sec:setup}),
+    offering $N$ streams. Every stream is \code{LOSSLESS}, with the configured block and window sizes and stream
+    identifiers $0,\ldots,N-1$.
+  \item \textbf{Validation.} The receiver validates the offer and, in particular, requires the identifiers to be
+    exactly $0,\ldots,N-1$\vviii, because it indexes its stream table with them.
+  \item \textbf{Streams.} Both sides build a fixed table of per-stream state. Each stream then runs its own
+    StreamStart, DATA, ACK and NACK exchange, with the shard split as in the bulk transfer.
+  \item \textbf{Workers.} The workers service the streams until all are done. A control thread calls
+    \code{tick} on the orchestrator and polls for completion and timeouts.
+  \item \textbf{Errors.} A version-mismatch reply during SETUP is reported as \code{VersionMismatch}\vviii{}
+    rather than a timeout.
+\end{enumerate}
+
+\subsection{What a worker does}
+
+Every worker runs the same task. It first tries, without blocking, to take the socket's receive lock. If it gets
+the lock, it receives a batch of datagrams and dispatches each one to its stream:
+\begin{itemize}
+  \item an ACK with the right nonce is applied with \code{apply_ack}\vviii;
+  \item a NACK queues the missing blocks on the stream's retransmission backlog, de-duplicated\vviii;
+  \item a duplicate SETUP reply is answered with another FINACK.
+\end{itemize}
+It then visits the streams round-robin, starting from a shared cursor, and performs one unit of work on the first
+stream that has any. In order of priority:
+\begin{enumerate}
+  \item (re)send the StreamStart, every 50~ms until acknowledged;
+  \item send one queued retransmission;
+  \item handle an expired RTO by resending the base and known holes\vviii;
+  \item send one new block if the window allows.
+\end{enumerate}
+Each stream has its own mutex, so any worker may service any stream. The table of streams is never resized
+after SETUP, so indexing it needs no lock.
+
+\subsection{Per-stream state machine}
+
+A sending stream moves through three states:
+\begin{itemize}
+  \item \emph{Starting}: StreamStart is sent every 50~ms until any ACK carrying the stream's nonce arrives.
+  \item \emph{Sending}: the window is filled, and NACKs and timeouts are serviced.
+  \item \emph{Done}: the base has reached the next sequence number and the last block has been sent.
+\end{itemize}
+The receiving side mirrors the bulk-transfer receiver without the pipeline. Blocks are copied into a per-stream
+buffer under the stream's mutex, and the stream is done when its base passes the last block.
+
+\subsection{Differences from the bulk transfer}
+
+The multiplexed transfer lacks several features of the bulk transfer:
+\begin{itemize}
+  \item encryption, and with it control-plane authentication;
+  \item address validation and NAT re-anchoring;
+  \item adaptive block size;
+  \item segmentation offload;
+  \item resume.
+\end{itemize}
+It shares the version~8 reliability improvements: selective acknowledgement, the RFC~6298 timer with backoff,
+slow start (starting at 16 blocks), and send times with a random offset. Several version~8 robustness fixes were
+specific to it:
+\begin{itemize}
+  \item a NACK for a block already waiting in the backlog is not queued twice;
+  \item a full backlog causes an immediate resend instead of a dropped request;
+  \item the stream identifiers are validated.
+\end{itemize}

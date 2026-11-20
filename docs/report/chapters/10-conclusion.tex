@@ -1,0 +1,113 @@
+\chapter{Limitations, Future Work and Conclusion}\label{ch:conclusion}
+
+\section{Limitations}
+
+\subsection{Open issues in the SDK and the HTTP mapping}
+
+The socket-style SDK and the HTTP mapping were deliberately left out of the version~8 pass, which concentrated
+on the protocol core. Their open findings are listed in Table~\ref{tab:open}. The first item in the table is
+the most serious: an application that uses the SDK with encryption is still exposed to the GCM authentication-key
+recovery described in Section~\ref{sec:nonce}, and fixing the SDK is the first item of future work.
+
+\begin{table}[H]
+\centering\small
+\caption{Findings still open in the SDK and the HTTP mapping.}\label{tab:open}
+\begin{tabularx}{\linewidth}{c>{\raggedright\arraybackslash}X}
+\toprule
+\textbf{\#} & \textbf{Issue} \\
+\midrule
+1 & SDK retransmissions re-seal with the retransmission bit in the AAD: the GCM nonce-reuse flaw remains in the SDK \\
+2, 3 & SDK control messages are unauthenticated, and the SDK re-anchors its peer on any ACK, NACK or CLOSE \\
+4 & The SDK server never authenticates the client, and allocates a connection, a socket and a thread per HELLO \\
+12 & Idle SDK connections have no liveness check (HEARTBEAT is never sent) \\
+13 & The SDK is stop-and-wait per message: only one message is in flight per direction \\
+26 & About 17~MB per SDK connection: registry slots embed 16~KiB payloads while the SDK sends 1,200-byte blocks \\
+27 & \code{fuse_close} frees the connection after two seconds even if a caller is still inside a call \\
+28 & \code{fuse_connect} takes the PSK through \code{strlen}, so a key containing a zero byte is truncated \\
+29 & HTTP: header injection (no CR/LF validation), timeout scope, reason truncation, detached threads, server status, and no tests \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Limitations of the protocol core}
+
+\begin{itemize}
+  \item \textbf{Fairness between lanes.} Every lane runs its own congestion controller, so a transfer with $N$
+    lanes competes with other traffic on a shared bottleneck like $N$ TCP flows. Per-stream congestion control
+    is the premise of the design, and it is what keeps a bulk stream from inflating the latency of a small one.
+    The flip side is that a bulk transfer's \emph{aggregate} share should probably be coupled across its lanes.
+  \item \textbf{Consecutive ports.} Bulk-transfer lanes need $N$ consecutive open UDP ports. A single-port
+    transfer requires reworking the receive pipeline to demultiplex lanes by stream identifier on one socket.
+  \item \textbf{Stragglers.} Static sharding means the slowest lane decides when the transfer completes; under
+    heavy loss one lane can lag behind the others. Dynamic re-sharding or work stealing between lanes would
+    address this.
+  \item \textbf{Stage~4 flags are not exposed.} Unreliable, unordered and coalescing streams exist as tested
+    primitives, and \code{fuse_bench} exercises a mixed session. No public transport offers them yet, so the
+    mixed loss-tolerant and loss-intolerant session that motivates the protocol is not yet available to
+    applications.
+  \item \textbf{Forward secrecy and passwords.} The PSK path provides no forward secrecy. The DTLS~1.2 ECDHE-PSK
+    component that would provide it is not wired into any transport. Accepting human-chosen passwords safely
+    would need a PAKE such as CPace.
+  \item \textbf{The multiplexed transfer} has no encryption, and therefore no control-plane authentication, and
+    no address validation.
+  \item \textbf{Platforms.} macOS uses one system call per datagram and cannot query the path MTU, so blocks do
+    not grow there.
+  \item \textbf{Evaluation.} All measurements are on one host with emulated impairments. There is no physical
+    two-host run and no run on a real 1,500-MTU path, and the QUIC comparison predates version~8.
+\end{itemize}
+
+\section{Future work}
+
+In order of priority, the next steps are:
+\begin{enumerate}
+  \item \textbf{Apply the version~8 hardening to the SDK}, reusing the bulk transfer's components rather than
+    re-implementing them:
+    \begin{itemize}
+      \item the AAD fix;
+      \item control-plane GMAC;
+      \item path validation;
+      \item Retry-style client validation before allocating per-connection state;
+      \item heartbeats;
+      \item a pipelined window instead of stop-and-wait;
+      \item registry slots sized to the block.
+    \end{itemize}
+  \item \textbf{Fix the HTTP mapping's input validation}, and add tests.
+  \item \textbf{Expose per-stream flags in a public API}, so an application can open a loss-tolerant and a
+    loss-intolerant stream in one session. This is the feature that motivates the protocol.
+  \item \textbf{Make the bulk transfer use a single port}, demultiplexing by stream identifier, and add work
+    stealing between lanes.
+  \item \textbf{Offer a forward-secret mode} by wiring the existing DTLS ECDHE-PSK handshake into session key
+    establishment, keeping the per-lane AEAD data path. Add a PAKE for password-based deployments.
+  \item \textbf{Couple congestion control across the lanes of one transfer}, so that the transfer as a whole is
+    fair to other flows while its streams remain isolated from one another.
+  \item \textbf{Evaluate on real networks}: two physical hosts, a 1,500-MTU wide-area path, and a fresh QUIC
+    comparison against version~8.
+  \item \textbf{Add fuzz testing of the decoders.} Every decoder is a natural fuzzing target, and none is fuzzed
+    today.
+\end{enumerate}
+
+\section{Conclusion}
+
+Fuse demonstrates that a transport whose reliability, ordering and congestion control are properties of
+individual streams can be built on UDP with modest code. Its central ingredients are:
+\begin{itemize}
+  \item a ring-indexed selective-acknowledgement window;
+  \item reorder-tolerant negative acknowledgements;
+  \item per-stream AIMD with slow start, RFC~6298 timers and pacing;
+  \item batched UDP I/O;
+  \item per-lane parallel AEAD.
+\end{itemize}
+Earlier measurements showed the latency benefit of per-stream congestion control under mixed load, and
+throughput competitive with a mature QUIC implementation.
+
+The security and correctness review of version~7 showed how easily a datagram protocol goes wrong in ways that
+tests of the happy path never reveal:
+\begin{itemize}
+  \item an innocuous flag in the AAD turned every retransmission into a key-recovery oracle;
+  \item a convenient address re-anchoring became a hijacking primitive;
+  \item an unused bitmask cost a factor of four in throughput under loss.
+\end{itemize}
+Protocol version~8 fixes all of these in the protocol core, mostly by adopting mechanisms whose design rationale
+is well established in QUIC and TCP: Retry tokens, path validation, AEAD usage limits, selective
+acknowledgement, RFC~6298 timers, pacing and MTU discovery. It does so without any loss of loopback throughput,
+and with large gains under loss. The remaining work, above all the SDK, is now well defined.

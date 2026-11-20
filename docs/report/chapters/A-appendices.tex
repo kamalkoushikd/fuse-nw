@@ -1,0 +1,127 @@
+\chapter{Configuration and Status Reference}\label{app:config}
+
+\begin{table}[H]
+\centering\small
+\caption{\texttt{TransferConfig} fields (\texttt{fuse/transfer.hpp}).}\label{tab:config}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{4.1cm}>{\raggedright\arraybackslash}p{2.6cm}X}
+\toprule
+\textbf{Field} & \textbf{Default} & \textbf{Meaning} \\
+\midrule
+\code{host}, \code{bind_address} & \code{127.0.0.1}, \code{0.0.0.0} & sender's destination; receiver's local address (IPv4 or IPv6) \\
+\code{base_port} & 4433 & lane $i$ uses \code{base_port}$+i$; the range must end at or below 65,535 \\
+\code{lanes} & 4 & parallel shards; throughput is not monotonic in lanes, so measure before raising \\
+\code{block_size} & 1,200 & starting payload per block; grows on clean paths up to the route MTU \\
+\code{pre_shared_key} & empty & non-empty enables AES-256-GCM; at least 16 random bytes \\
+\code{timeout_ms} & 120,000 & give up after this long without progress \\
+\code{connect_timeout_ms} & 10,000 & sender: give up reaching the receiver \\
+\code{cancel} & null & pointer to an atomic flag; setting it aborts both ends promptly \\
+\code{on_progress}, \code{progress_interval_ms} & none, 250 & progress callback, run on the caller's thread \\
+\code{writer_threads}, \code{ring_slots} & 2, 256 & receive pipeline size (about 51~MB of rings with 4 lanes) \\
+\code{resume_checkpoint_ms} & 1,000 & how often \code{receive_file} saves resume progress \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{table}[H]
+\centering\small
+\caption{\texttt{TransferStatus} values.}\label{tab:status}
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+\textbf{Status} & \textbf{Meaning} \\
+\midrule
+\code{Ok} & every byte delivered (and, for a resumed file, verified) \\
+\code{ConfigError} & invalid configuration (no lanes, port range past 65,535, short PSK, \ldots) \\
+\code{SocketError} & bind or socket failure \\
+\code{Timeout} & peer silent, or no progress \\
+\code{AuthFailed} & keys differ, or blocks failed authentication \\
+\code{Incomplete} & finished short of the expected bytes \\
+\code{Unsupported} & encryption requested from a build without cryptography \\
+\code{ResourceLimit} & the peer's claimed size could not be allocated \\
+\code{Cancelled}, \code{PeerAborted} & this side cancelled; the other side gave up and said so \\
+\code{IoError} & the output could not be written \\
+\code{VerifyFailed} & a resumed file did not match the sender's digest \\
+\code{VersionMismatch} & the peer speaks a different protocol version \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\chapter{Guide to the Repository}\label{app:files}
+
+\begingroup\small
+\begin{xltabular}{\linewidth}{>{\raggedright\arraybackslash}p{4.4cm}X}
+\caption{Files of the protocol core and the transports.}\label{tab:files}\\
+\toprule
+\textbf{File} & \textbf{Responsibility and key entry points} \\
+\midrule\endfirsthead
+\toprule
+\textbf{File} & \textbf{Responsibility and key entry points} \\
+\midrule\endhead
+\bottomrule\endfoot
+\code{wire.hpp} & Protocol version, message types, size limits, big-endian helpers, extension helpers \\
+\code{block.hpp/.cpp} & DATA codec, type dispatch (\code{peek_msg_type}), version-mismatch reply \\
+\code{control.hpp/.cpp} & Every control message's structure and codec \\
+\code{registry.hpp/.cpp} & Sender retransmit store; \code{apply_ack} \\
+\code{receiver.hpp/.cpp} & Receive window, gap timing, \code{collect_nacks} \\
+\code{congestion.hpp} & Per-stream AIMD, slow start, RTT and RTTVAR, RTO with backoff, pacing \\
+\code{setup.hpp/.cpp} & SETUP codec, validation, initiator and responder state machines \\
+\code{reassembly.hpp/.cpp} & Ordered and unordered delivery into a sink \\
+\code{send_queue.hpp} & Coalescing or back-pressuring send queue \\
+\code{spsc_ring.hpp} & Lock-free single-producer, single-consumer ring \\
+\code{orchestrator.hpp/.cpp} & Autoscaling worker pool \\
+\code{udp.hpp}, \code{udp_common.cpp}, \code{udp_linux.cpp}, \code{udp_darwin.cpp} & UDP socket, addresses, GSO send, batched receive, route MTU \\
+\code{session_crypto.hpp/.cpp} & HKDF, AES-256-GCM lane cipher, key epochs, control GMAC, secure random numbers \\
+\code{dtls.hpp/.cpp} & DTLS~1.2 ECDHE-PSK session (standalone) \\
+\code{digest.hpp/.cpp} & Whole-file and segmented SHA-256 (FNV fallback) \\
+\code{hash.hpp} & FNV-1a-64 and SipHash-2-4 \\
+\code{transfer.hpp}, \code{transfer.cpp} & Bulk transfer: sharding, lane handshake with address validation, sender loop, receive pipeline, sinks, resume, cancellation, status ranking \\
+\code{mux_transfer.hpp/.cpp} & Multiplexed transfer: SETUP, per-stream state, worker task, NACK backlog \\
+\code{sdk.h}, \code{sdk.cpp} & Socket-style C API: HELLO/HELLO\_ACK, pump thread, message framing, close \\
+\code{http.h}, \code{http.cpp} & One HTTP/1.1 exchange per SDK connection \\
+\code{fuse.h}, \code{packet.h}, \code{varint.h}, \code{src/*.c} & Legacy C scaffold, unused by the protocol \\
+\code{tests/proto/test_*.cpp} & One suite per component and transport \\
+\code{bench/} & \code{fuse_bench}, \code{fuse_filebench} and the QUIC baseline, \code{fuse_latbench}, \code{fuse_netem}, \code{RESULTS.md} \\
+\code{examples/} & Stage~1 sender and receiver demonstration; echo server and client \\
+\code{scripts/}, \code{.github/workflows/} & Install and release scripts, network simulation; CI matrix and releases \\
+\end{xltabular}
+\endgroup
+
+\chapter{Building and Reproducing the Results}\label{app:build}
+
+\begin{lstlisting}[language=bash]
+# Build and run the tests (wolfSSL is fetched automatically;
+# add -DFUSE_WITH_CRYPTO=OFF for a faster build without encryption)
+cmake --preset default
+cmake --build --preset default
+ctest --preset default -j8
+
+# Stage 1 demonstration: block 3 is dropped once and recovered by a NACK
+./build/default/examples/fuse_stage1_receiver 48000 &
+./build/default/examples/fuse_stage1_sender 127.0.0.1 48000 --drop 3 --count 8
+
+# A transfer through the network emulator: 4 lanes, 12 ms one-way delay, 1% loss
+./build/default/bench/fuse_netem 46000 4 127.0.0.1 45000 --delay-ms 12 --loss-pct 1 &
+#   receiver uses base_port 45000, sender uses base_port 46000 (see bench/README.md)
+\end{lstlisting}
+
+\chapter{Glossary}\label{app:glossary}
+
+\begin{description}[leftmargin=2.6cm,labelwidth=2.4cm,style=sameline,itemsep=1pt]
+  \item[AAD] Additional authenticated data: input to an AEAD that is authenticated but not encrypted.
+  \item[AEAD] Authenticated encryption with associated data, here AES-256-GCM.
+  \item[AIMD] Additive increase, multiplicative decrease: the congestion-control rule.
+  \item[Base] The lowest sequence number not yet received (receiver) or acknowledged (sender).
+  \item[Block] One DATA datagram, independently addressed and retransmittable.
+  \item[Epoch] A run of $2^{22}$ sequence numbers that share one data key.
+  \item[GMAC] GCM used with an empty plaintext, i.e.\ as a message authentication code.
+  \item[GSO] Generic segmentation offload: one large UDP send split into datagrams by the kernel.
+  \item[Lane] One shard of a bulk transfer: one port, one thread per side, one reliable stream.
+  \item[NACK] Negative acknowledgement: an explicit list of missing sequence numbers.
+  \item[PSK] Pre-shared key.
+  \item[RTO] Retransmission timeout.
+  \item[RTT, SRTT] Round-trip time; its smoothed estimate.
+  \item[rwnd] The receive window advertised in ACKs, for flow control.
+  \item[SACK] Selective acknowledgement: the ACK bitmask of blocks received above the base.
+  \item[SPSC] Single producer, single consumer: the lock-free ring.
+  \item[Stream] An independent sequence-numbered flow (SDK and multiplexed transfer); a lane in the bulk transfer.
+  \item[Token] The address-validation value a receiver issues in a Retry and expects back in the StreamStart.
+\end{description}
