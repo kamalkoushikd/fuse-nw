@@ -132,6 +132,18 @@ struct TransferConfig {
     uint16_t writer_threads = 2;
     uint32_t ring_slots = 256;
 
+    // Receiver only: the largest transfer this receiver will accept, in
+    // bytes. The size comes from the sender's StreamStart, and accepting it
+    // means allocating that much memory (receive_buffer) or disk
+    // (receive_file) up front, so a hostile or buggy sender must not be able
+    // to claim an arbitrary amount. A larger claim fails the call with
+    // TransferStatus::ResourceLimit.
+    //   0 (default): automatic -- half the machine's physical memory for
+    //     receive_buffer, the free space on the destination's filesystem
+    //     (plus what an earlier .part already holds) for receive_file.
+    //   UINT64_MAX: no limit.
+    uint64_t max_receive_bytes = 0;
+
     // Receiver only (receive_file): how often to save resume progress into
     // the .part file, in milliseconds. It is also saved whenever a transfer
     // ends without completing. 0 = only then. Each save syncs the data
