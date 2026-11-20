@@ -1,0 +1,137 @@
+% Fuse: a per-stream reliable transport over UDP -- project report (CS3530: Computer Networks)
+% Build:  latexmk -pdf report.tex      (or: pdflatex report.tex, run three times)
+\documentclass[11pt,a4paper,oneside]{report}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{array,booktabs,tabularx,longtable,multirow}
+\usepackage{xltabular}
+\usepackage{enumitem}
+\usepackage[table]{xcolor}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,shapes.multipart,fit,calc,automata,backgrounds,decorations.pathreplacing}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage[hidelinks]{hyperref}
+
+\setlist{itemsep=2pt,topsep=4pt}
+\setlength{\parskip}{3pt}
+\setlength{\emergencystretch}{3em}
+\captionsetup{font=small,labelfont=bf}
+\renewcommand{\arraystretch}{1.15}
+
+\definecolor{codebg}{RGB}{246,247,249}
+\lstset{basicstyle=\ttfamily\small,backgroundcolor=\color{codebg},frame=single,rulecolor=\color{black!15},
+        columns=fullflexible,keepspaces=true,breaklines=true,showstringspaces=false,
+        xleftmargin=4pt,xrightmargin=4pt,aboveskip=6pt,belowskip=6pt}
+
+\usepackage{url}
+\makeatletter\g@addto@macro\UrlBreaks{\do\_\do\:\do\]\do\,}\makeatother
+\DeclareUrlCommand\code{\urlstyle{tt}}
+\newcommand{\fitwidth}[1]{\resizebox{\ifdim\width>\linewidth\linewidth\else\width\fi}{!}{#1}}
+\newcommand{\vviii}{\textsuperscript{(v8)}}
+
+\titleformat{\chapter}[hang]{\normalfont\huge\bfseries}{\thechapter.}{0.6em}{}
+\titlespacing*{\chapter}{0pt}{-10pt}{18pt}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\nouppercase{\leftmark}}
+\fancyhead[R]{\small Fuse: a per-stream transport over UDP}
+\fancyfoot[C]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancypagestyle{plain}{\fancyhf{}\fancyfoot[C]{\small\thepage}\renewcommand{\headrulewidth}{0pt}}
+
+% TikZ styles shared by the figures
+\tikzset{
+  box/.style={draw,rounded corners=2pt,align=center,font=\small,inner sep=4pt,fill=white},
+  core/.style={box,fill=blue!6},
+  api/.style={box,fill=green!8},
+  io/.style={box,fill=orange!10},
+  arr/.style={-{Stealth[length=2.2mm]},thick},
+  msg/.style={-{Stealth[length=2mm]},semithick},
+  st/.style={draw,rounded corners=6pt,align=center,font=\small,minimum height=7mm,inner sep=3pt,fill=blue!5},
+  lbl/.style={font=\footnotesize,align=center},
+}
+
+\begin{document}
+
+\begin{titlepage}
+  \centering
+  \vspace*{3cm}
+  {\Huge\bfseries Fuse: A Per-Stream Reliable\\[4pt] Transport Protocol over UDP\par}
+  \vspace{0.8cm}
+  {\Large Design, Implementation, Security Hardening and Evaluation\\ of Protocol Version 8\par}
+  \vspace{2.2cm}
+  {\large Project Report\par}
+  \vspace{0.4cm}
+  {\large CS3530: Computer Networks\par}
+  \vspace{2.2cm}
+  {\large
+  \begin{tabular}{c}
+    Boreddy Sri Sai Abhinav Reddy\\[3pt]
+    Chiruvella Gagan Chandra Sai Ram\\[3pt]
+    Kamal Koushik Duppalapadi\\[3pt]
+    Tavva Dinesh Reddy
+  \end{tabular}\par}
+  \vfill
+  {\small Source code: \code{https://github.com/kamalkoushikd/fuse-nw} (protocol version 8, commit \code{9706e21})\par}
+\end{titlepage}
+
+\pagenumbering{roman}
+\begin{abstract}
+\noindent
+Applications that carry a mixture of loss-tolerant, latency-sensitive data and loss-intolerant,
+correctness-sensitive data over one session are served poorly by the standard transports. TCP serialises all of
+it behind a single ordered byte stream and a single congestion window, so one lost segment delays everything that
+follows. QUIC removes head-of-line blocking between streams but keeps congestion control connection-wide and
+makes TLS mandatory. This report describes \emph{Fuse}, a datagram transport built directly on UDP in which every
+stream owns its own sequence space, receive window, retransmission store and congestion controller, and in which
+reliability, ordering and coalescing are per-stream properties.
+
+We describe the wire format, the reliability core (a ring-indexed selective-acknowledgement window with
+reorder-tolerant negative acknowledgements), per-stream congestion control with slow start, RFC~6298
+retransmission timers and pacing, and three transports built on these pieces: a sharded, GSO-batched bulk
+transfer with resumable file reception, a message-oriented socket-style C API, and a multiplexed transfer
+serviced by an autoscaling worker pool. A full security and correctness review of the earlier version found 31
+problems. We present protocol version~8, which fixes every one outside the socket-style SDK and the HTTP
+mapping. Among the fixes are an AES-GCM nonce-reuse flaw on retransmission, an unauthenticated control plane,
+missing address and path validation, missing flow control, and an unused selective-acknowledgement bitmask.
+
+All 206 tests pass (184 without the cryptographic backend). Under emulated packet loss, version~8 transfers 2.7
+times faster at 2\% loss and 4.4 times faster at 5\% loss than version~7, with byte-identical output in every
+experiment, and without loss of loopback throughput. We close with the limitations that remain and the work
+needed to address them.
+\end{abstract}
+
+\tableofcontents
+\listoffigures
+\listoftables
+
+\clearpage
+\pagenumbering{arabic}
+
+\input{chapters/01-introduction}
+\input{chapters/02-background}
+\input{chapters/03-architecture}
+\input{chapters/04-wire-format}
+\input{chapters/05-components}
+\input{chapters/06-bulk-transfer}
+\input{chapters/07-sdk-mux}
+\input{chapters/08-security}
+\input{chapters/09-evaluation}
+\input{chapters/10-conclusion}
+
+\appendix
+\input{chapters/A-appendices}
+
+\input{chapters/references}
+
+\end{document}

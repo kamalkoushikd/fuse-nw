@@ -1,0 +1,253 @@
+\chapter{Security Model and the Version 8 Hardening}\label{ch:security}
+
+A full review of protocol version~7 in October 2026 found 31 issues of security, correctness and performance,
+numbered \#1--\#31 in the repository's roadmap~\cite{repo}. This chapter states the threat model, explains the
+most important findings in detail (what each allowed, how it was fixed, and why that fix was chosen over the
+alternatives), and then summarises every fix in one table. Each fix was made as its own commit with its own
+tests. The socket-style SDK and the HTTP mapping were deliberately excluded and are discussed in
+Chapter~\ref{ch:conclusion}.
+
+\section{Threat model}
+
+We consider three attackers:
+\begin{enumerate}
+  \item An \textbf{off-path attacker}, who can send datagrams with arbitrary, spoofed source addresses but cannot
+    see traffic between the endpoints.
+  \item An \textbf{on-path passive attacker}, who can observe all traffic.
+  \item An \textbf{on-path active attacker}, who can additionally drop, delay, reorder, modify, replay and inject
+    datagrams.
+\end{enumerate}
+
+In \emph{plaintext mode}, Fuse makes no confidentiality or integrity claim against an on-path attacker. It must
+still resist off-path attackers: they must not be able to hijack a session, inject acknowledgements that cause
+data loss, use an endpoint as a traffic amplifier, or crash or exhaust it with malformed input.
+
+Under a \emph{pre-shared key}, Fuse additionally aims for confidentiality and integrity of all data, and
+integrity of all control signals, against an active on-path attacker. Denial of service by an on-path attacker
+is out of scope, since such an attacker can always drop everything. So is forward secrecy, which the PSK path
+explicitly does not provide.
+
+\section{AES-GCM nonce reuse on retransmission (\#1)}\label{sec:nonce}
+
+\paragraph{Problem.} The AAD of an encrypted DATA block included its flags byte, and a retransmission sets the
+retransmission bit in that byte. A retransmitted block was therefore sealed under the \emph{same} key and the
+\emph{same} nonce $(\mathit{lane},\mathit{seq})$ as the original, but with a \emph{different} AAD.
+
+\paragraph{Consequence.} GCM's authentication tag is a polynomial in the secret hash key $H$ evaluated over the
+AAD and ciphertext. Two tags computed under one (key, nonce) pair over different inputs give an attacker two
+equations in $H$, from which $H$ can be recovered. With $H$ known, the attacker can forge valid tags for
+arbitrary blocks: this is the ``forbidden attack'' on GCM~\cite{joux,nist-gcm}. Every retransmission, which
+happens routinely on any lossy path, handed a passive observer such a pair.
+
+\paragraph{Fix.} The retransmission bit is masked out of the AAD (\code{build_aad}, \code{transfer.cpp:105}). A
+resend is now byte-for-byte the original ciphertext and tag, which reveals nothing new. The last-block bit
+remains authenticated, so it still cannot be flipped to end a lane early.
+
+\paragraph{Why this fix.} An alternative was to give every transmission a fresh nonce, as QUIC does by never
+reusing packet numbers. That requires a separate packet number on the wire and a mapping from packet numbers to
+blocks on both ends, a much larger change. The retransmission bit is only a hint used to measure RTT, so it does
+not need integrity protection.
+
+\section{Unauthenticated control plane under a pre-shared key (\#2)}
+
+\paragraph{Problem.} Only DATA payloads were protected. ACK, NACK, StreamStart, ResumeRanges, StreamClose and
+FileDigest were plaintext and unauthenticated even when encryption was enabled, so an active attacker could
+manipulate the control plane freely:
+\begin{itemize}
+  \item a forged ACK claims delivery of data the receiver never got, so the sender releases it and the transfer
+    ends incomplete;
+  \item a forged NACK halves the window;
+  \item a forged close ends a lane;
+  \item a forged ResumeRanges message makes the sender skip data.
+\end{itemize}
+
+\paragraph{Fix.} Every control datagram on the bulk-transfer path now carries a 24-byte trailer: a 64-bit
+counter and a GMAC tag over the whole datagram. The tag is computed under a \emph{control key} derived
+separately from the data keys, with a nonce space disjoint from that of the data (Section~\ref{sec:wirecrypto}).
+Unsigned control messages are discarded before they are parsed.
+
+\paragraph{Why this fix.} GMAC reuses the AES-GCM context the lane already has, costs one AES pass over a few
+dozen bytes, and adds no round trips. Running the control plane through DTLS would have reintroduced the
+record-layer state that the design avoids (Section~\ref{sec:crypto}). The counter need only be unique per
+sender, not checked for replay. Replaying an authentic control message is harmless: acknowledgement bases only
+move forward, and an abort can only be replayed if it was really sent.
+
+\paragraph{Exceptions.} Three messages remain unauthenticated by necessity. In each case forgery can only cause
+a denial of service that an on-path attacker could cause anyway.
+\begin{itemize}
+  \item \emph{Retry} is sent before any key is confirmed. A forged one can only make the token wrong, and the
+    receiver then answers again.
+  \item The \emph{version-mismatch reply} must be understood by any version.
+  \item \emph{StreamClose(auth failed)}: the receiver shares no key with a mis-keyed sender.
+\end{itemize}
+
+\section{Key confirmation (\#6)}
+
+\paragraph{Problem.} With mismatched pre-shared keys, a transfer only failed after twenty data blocks had failed
+authentication, or after a full timeout.
+
+\paragraph{Fix.} The StreamStart is now signed with a key derived from its own salt, so the receiver confirms
+the key before allocating anything. On failure it answers StreamClose(reason~2), and the sender reports
+\code{AuthFailed} at the handshake. The same check catches a plaintext receiver facing an encrypting sender, and
+the reverse.
+
+\section{Address validation and amplification (\#5, \#18)}
+
+\paragraph{Problem.} Two weaknesses combined. First, the first StreamStart to reach a receiver lane claimed it,
+whatever its source address, so an off-path attacker could race a legitimate sender. Second, the receiver
+answered StreamStarts with acknowledgements and ResumeRanges messages larger than the request, and kept sending
+periodic acknowledgements to a peer that never answered. Both made it a reflection amplifier: spoof a victim's
+address, and the receiver sends traffic to the victim.
+
+\paragraph{Fix.} The fix has two parts.
+\begin{itemize}
+  \item A StreamStart without a valid \emph{address token} receives only a 20-byte Retry, which is smaller than
+    the 80-byte request. The token is SipHash~\cite{siphash} of the source address and lane nonce under a
+    secret held by the receiver lane. Nothing is allocated or claimed until a StreamStart echoes the token, which
+    only a sender that receives at that address can do.
+  \item Timer-driven acknowledgements stop after three sent to a peer that has fallen silent.
+\end{itemize}
+
+\paragraph{Why this fix.} It is the mechanism QUIC uses for the same problem~\cite{rfc9000}, and it is
+stateless on the receiver: the token can be recomputed from the datagram, so validating an address needs no
+memory per sender. A cookie exchange that stored state per sender would itself be a resource-exhaustion
+target.
+
+\section{Path validation (\#3)}
+
+\paragraph{Problem.} To survive NAT rebinding, both ends re-anchored their peer address to the source of any
+accepted datagram. A single spoofed datagram could therefore redirect a lane's traffic: a hijack, or a
+reflection at a third party.
+
+\paragraph{Fix.} A new source address is adopted only after it echoes a random 64-bit challenge in a
+PathResponse (Section~\ref{sec:path}). Data from the new source is accepted in the meantime, so a genuine
+rebinding costs no throughput. The design follows QUIC's path validation.
+
+\section{Predictable nonces (\#20)}
+
+\paragraph{Problem.} Lane nonces and session nonces came from a seeded \code{mt19937_64}. Its future outputs can
+be predicted from a few observed ones. Since nonces were the only session check on several control messages, an
+attacker who observed a few could forge messages for later sessions.
+
+\paragraph{Fix.} \code{secure_random_u64()} draws from the cryptographic library's random generator, or from the
+kernel's \code{getrandom}/\code{getentropy} in builds without one, and aborts if no secure source exists.
+
+\section{Key usage limit (\#21)}
+
+\paragraph{Problem.} One AES-GCM key protected every block of a lane, without limit. RFC~9001 applies a
+confidentiality limit of about $2^{23}$ packets per key~\cite{rfc9001}, which a multi-gigabyte transfer
+approaches.
+
+\paragraph{Fix.} Data keys are derived per lane and per epoch of $2^{22}$ blocks, identically on both ends, with
+no messages on the wire (Section~\ref{sec:crypto}).
+
+\paragraph{Why this fix.} An explicit rekey exchange would need a new message, acknowledgement and transition
+logic, and its own failure modes. A deterministic schedule needs none of these, because both ends already agree
+on the sequence number of every block.
+
+\section{Weak pre-shared keys (\#19, \#28)}
+
+The pre-shared key is used directly as HKDF input, without stretching, so a human-chosen password could be
+guessed offline from one captured handshake at full speed. The bulk transfer now refuses keys shorter than 16
+bytes, and the documentation requires random keys. Accepting passwords safely would require a
+password-authenticated key exchange (PAKE), which remains open. Separately, keys longer than 256 bytes used to
+fail key derivation because of a fixed-size buffer; the key is now copied into a buffer of its own length.
+
+\section{Information leaks (\#31)}
+
+Two leaks were fixed:
+\begin{itemize}
+  \item DATA carried the raw monotonic clock, which reveals the host's uptime. It now carries the clock plus a
+    random per-stream offset (Section~\ref{sec:wirecrypto}).
+  \item The DTLS wrapper kept a debug copy of all wire traffic in the production path; this is now opt-in.
+\end{itemize}
+
+\section{Transport correctness and performance fixes}
+
+The remaining findings concerned the transport's behaviour rather than its security. In summary:
+\begin{itemize}
+  \item \textbf{\#10 SACK.} The bitmask in every acknowledgement was ignored. \code{apply_ack} now releases
+    blocks acknowledged selectively, and the timeout resends known holes (Sections~\ref{sec:registry}
+    and~\ref{sec:recovery}).
+  \item \textbf{\#23 Timer.} A fixed multiple of SRTT fired spuriously under jitter and never backed off. It is
+    replaced by $\max(\mathit{SRTT}+4\,\mathit{RTTVAR},2\,\mathit{SRTT})$ with exponential backoff and one
+    halving per run of timeouts.
+  \item \textbf{\#8 Window and slow start.} The window counted blocks, so it inflated up to 13 times as blocks
+    grew. It now counts units of the configured block size, and the transfers use slow start.
+  \item \textbf{\#22 Pacing.} Windows left in line-rate bursts. Sending is now paced over the round trip, with
+    smaller bursts on real paths.
+  \item \textbf{\#9 Flow control.} There was none. Acknowledgements now carry a receive window, with window
+    updates (Section~\ref{sec:flow}).
+  \item \textbf{\#7 MTU.} Blocks grew to 16~KiB regardless of the path, causing IP fragmentation. Growth is now
+    capped at the route MTU, with a ceiling after loss and later re-probing (Section~\ref{sec:blocksize}).
+  \item \textbf{\#16 and \#17 Algorithmic bounds.} Receiving was $O(W)$ and a reassembly set was unbounded. Both
+    now use rings bounded by the window.
+  \item \textbf{\#11 Versions and \#24 extensions.} Version mismatches were silent and every new field needed a
+    version bump. Version~8 adds the explicit mismatch reply and TLV extension areas.
+  \item \textbf{\#15 File identity.} A file rewritten in place could be resumed with stale data. The identity now
+    includes the inode change time, inode number and device.
+  \item \textbf{\#25 Ports.} \code{base_port + lane} wrapped past 65,535; this is now a configuration error.
+  \item \textbf{\#30 Validation.} SETUP was not validated, the multiplexed transfer indexed streams with
+    unchecked identifiers, NACKs could be duplicated or dropped, and \code{SendQueue(0)} divided by zero. All are
+    fixed.
+  \item \textbf{IPv6.} Senders always opened IPv4 sockets, so IPv6 hosts were unreachable. Sockets are now opened
+    in the destination's family.
+\end{itemize}
+
+\section{Summary of all fixes}
+
+\begingroup\small
+\begin{xltabular}{\linewidth}{c>{\raggedright\arraybackslash}p{4.6cm}>{\raggedright\arraybackslash}X}
+\caption{Every issue fixed in the protocol core for version~8.}\label{tab:fixes}\\
+\toprule
+\textbf{\#} & \textbf{Issue} & \textbf{Fix} \\
+\midrule\endfirsthead
+\toprule
+\textbf{\#} & \textbf{Issue} & \textbf{Fix} \\
+\midrule\endhead
+\bottomrule\endfoot
+1 & GCM nonce reuse on every retransmission & Retransmission bit masked out of the AAD; a resend is the identical ciphertext and tag \\
+2 & Control plane unauthenticated under a PSK & Counter plus GMAC trailer under a separate control key; unsigned messages ignored \\
+3 & Address migration without validation & PathChallenge/PathResponse before the peer address changes \\
+5 & No session binding without encryption; replayable SETUP & Retry tokens bind a lane to a validated address; SETUP responder nonce echoed in FINACK \\
+6 & No key confirmation & Signed StreamStart; mismatch reported as \code{AuthFailed} at the handshake \\
+7 & Block growth unaware of the MTU & Growth capped at the route MTU; ceiling after loss; DPLPMTUD-style re-probing \\
+8 & Window counted in blocks; no slow start & Window in configured-block units, capped by the largest permitted block; opt-in slow start \\
+9 & No flow control & \code{rwnd} in every ACK; the sender stays within it; window updates \\
+10 & SACK bitmask discarded & \code{apply_ack} releases selectively acknowledged blocks; RTO resends known holes \\
+11 & Silent version mismatch & Fixed-layout reply; \code{VersionMismatch} status \\
+15 & File identity from name, size and mtime only & Also hashes ctime, inode and device \\
+16 & $O(W)$ receive path & Ring-indexed receiver window \\
+17 & Unbounded set in reassembly & Window-bounded ring; capped trace \\
+18 & Amplification from the receiver & Retry before anything else; idle ACKs stop after three \\
+19 & PSK brute-forceable if a password & Keys under 16 bytes refused; random keys required (PAKE open) \\
+20 & Predictable nonces & Cryptographic RNG or \code{getrandom}; abort if neither \\
+21 & No AES-GCM usage limit & Lane keys rotate every $2^{22}$ blocks, derived on both ends \\
+22 & No pacing & Pacing over the RTT; smaller bursts on real-RTT paths \\
+23 & Aggressive RTO without backoff & $\max(\mathit{SRTT}+4\mathit{RTTVAR},2\mathit{SRTT})$, exponential backoff, one halving per run \\
+24 & No extension mechanism & TLV areas in StreamStart and SETUP with critical-bit semantics \\
+25 & Port number wrap-around & \code{ConfigError} \\
+28 & PSK over 256 bytes failed (core part) & Buffer sized to the key \\
+30 & Unvalidated SETUP; mux indexing; dropped NACKs; \code{SendQueue(0)} & Responder validation; identifiers $0..n-1$; NACK de-duplication with immediate resend; capacity clamp \\
+31 & Debug wire copy in DTLS; uptime in \code{send_time_ns} & Opt-in recording; random per-stream clock offset \\
+--- & IPv4-only sender sockets & Socket opened in the destination's family \\
+\end{xltabular}
+\endgroup
+
+\section{Security properties after version 8}
+
+Under a pre-shared key, the bulk transfer now provides the following properties:
+\begin{itemize}
+  \item confidentiality and integrity of data, with no nonce reuse;
+  \item integrity of every control decision the protocol acts upon;
+  \item key confirmation at the handshake;
+  \item bounded key usage;
+  \item resistance to off-path session hijacking, address redirection and reflection amplification.
+\end{itemize}
+
+In plaintext mode, address validation, path validation, unpredictable nonces and strict input validation still
+defeat the off-path attacks, but an on-path attacker can read and modify everything, which is inherent in
+plaintext.
+
+The pre-shared-key path still does not provide forward secrecy, and the socket-style SDK and the HTTP mapping do
+not yet have these protections (Chapter~\ref{ch:conclusion}).
