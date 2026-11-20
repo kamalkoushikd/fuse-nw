@@ -36,3 +36,4 @@ __pycache__/
 # Local tool state and generated caches
 .claude/
 graphify-out/
+.agents/

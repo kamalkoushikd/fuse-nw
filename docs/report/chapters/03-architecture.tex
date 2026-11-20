@@ -113,8 +113,8 @@ Unit & one buffer or file, split into \emph{lanes} & messages on a connection & 
 Ports & one per lane (\code{base_port}$+i$) & one listen port, then a fresh port per connection & one \\
 Threads & sender: one per lane; receiver: one reader per lane, $K$ writers, one retransmission consumer & one pump thread per connection & autoscaling pool \\
 Session setup & per-lane StreamStart with Retry token\vviii & HELLO / HELLO-ACK & SETUP, then per-stream StreamStart \\
-Encryption & AES-256-GCM per block; GMAC on control\vviii; key epochs\vviii & AES-256-GCM on DATA only & none \\
-v8 hardening & complete & deferred & SACK, RTO, slow start, validation \\
+Encryption & AES-256-GCM per block; GMAC on control\vviii; key epochs\vviii & AES-256-GCM per block; GMAC on control\vviii; key epochs\vviii & none \\
+v8 hardening & complete & complete except \#4, \#13, \#26 (Table~\ref{tab:open}) & SACK, RTO, slow start, validation \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -138,7 +138,7 @@ comment above the constant in \code{wire.hpp} records why (Table~\ref{tab:versio
 5 & Two-byte window size & Raise the window from 255 to 1,024 blocks; the old field capped throughput on any real bandwidth-delay product \\
 6 & Base offset and total size in StreamStart & Write each block directly to its final file position \\
 7 & File id, ResumeRanges, FileDigest & Resumable file reception with whole-file verification \\
-8 & Control-plane authentication, AAD fix, key epochs, Retry, path validation, SETUP nonce, receive window, extensions, version-mismatch reply & The security and correctness review (Chapter~\ref{ch:security}) \\
+8 & Control-plane authentication with replay protection, AAD fix, key epochs, Retry, path validation, SETUP nonce, receive window, extensions, version-mismatch reply, SDK heartbeats & The security and correctness review (Chapter~\ref{ch:security}) \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -218,9 +218,10 @@ thread.
 \begin{itemize}
   \item Sockets are move-only objects, and ciphers are uniquely owned.
   \item The digest thread of a sending lane is joined on every exit path by a small guard object.
-  \item The SDK counts the application threads inside \code{fuse_send} and \code{fuse_recv} with an RAII guard,
-    so that closing a connection can wait for them.
-  \item Key material is wiped after use.
+  \item An SDK connection is reference-counted by the application threads inside \code{fuse_send} and
+    \code{fuse_recv}, so the last thread to leave frees it and closing never pulls a connection out from under a
+    caller.
+  \item Key material, including HKDF's intermediate key, is wiped with \code{secure_zero} on every exit path.
 \end{itemize}
 Lane functions have a dozen early exits (cancellation, timeout, abort, authentication failure), and RAII is what
 keeps the cleanup correct on all of them.

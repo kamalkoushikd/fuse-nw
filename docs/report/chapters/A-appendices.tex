@@ -18,6 +18,7 @@
 \code{on_progress}, \code{progress_interval_ms} & none, 250 & progress callback, run on the caller's thread \\
 \code{writer_threads}, \code{ring_slots} & 2, 256 & receive pipeline size (about 51~MB of rings with 4 lanes) \\
 \code{resume_checkpoint_ms} & 1,000 & how often \code{receive_file} saves resume progress \\
+\code{max_receive_bytes} & 0 (automatic) & receiver: largest transfer a StreamStart may claim; automatic means half of RAM (buffer) or the free disk space (file); \code{UINT64_MAX} for no limit \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -36,7 +37,7 @@
 \code{AuthFailed} & keys differ, or blocks failed authentication \\
 \code{Incomplete} & finished short of the expected bytes \\
 \code{Unsupported} & encryption requested from a build without cryptography \\
-\code{ResourceLimit} & the peer's claimed size could not be allocated \\
+\code{ResourceLimit} & the peer's claimed size exceeds \code{max_receive_bytes} or could not be allocated \\
 \code{Cancelled}, \code{PeerAborted} & this side cancelled; the other side gave up and said so \\
 \code{IoError} & the output could not be written \\
 \code{VerifyFailed} & a resumed file did not match the sender's digest \\
@@ -68,15 +69,16 @@
 \code{send_queue.hpp} & Coalescing or back-pressuring send queue \\
 \code{spsc_ring.hpp} & Lock-free single-producer, single-consumer ring \\
 \code{orchestrator.hpp/.cpp} & Autoscaling worker pool \\
+\code{path_validator.hpp} & Path validation shared by the bulk transfer and the SDK \\
 \code{udp.hpp}, \code{udp_common.cpp}, \code{udp_linux.cpp}, \code{udp_darwin.cpp} & UDP socket, addresses, GSO send, batched receive, route MTU \\
-\code{session_crypto.hpp/.cpp} & HKDF, AES-256-GCM lane cipher, key epochs, control GMAC, secure random numbers \\
+\code{session_crypto.hpp/.cpp} & HKDF, AES-256-GCM lane cipher, key epochs, control GMAC with replay window, \code{secure_zero}, secure random numbers \\
 \code{dtls.hpp/.cpp} & DTLS~1.2 ECDHE-PSK session (standalone) \\
 \code{digest.hpp/.cpp} & Whole-file and segmented SHA-256 (FNV fallback) \\
 \code{hash.hpp} & FNV-1a-64 and SipHash-2-4 \\
 \code{transfer.hpp}, \code{transfer.cpp} & Bulk transfer: sharding, lane handshake with address validation, sender loop, receive pipeline, sinks, resume, cancellation, status ranking \\
 \code{mux_transfer.hpp/.cpp} & Multiplexed transfer: SETUP, per-stream state, worker task, NACK backlog \\
-\code{sdk.h}, \code{sdk.cpp} & Socket-style C API: HELLO/HELLO\_ACK, pump thread, message framing, close \\
-\code{http.h}, \code{http.cpp} & One HTTP/1.1 exchange per SDK connection \\
+\code{sdk.h}, \code{sdk.cpp} & Socket-style C API: HELLO/HELLO\_ACK, pump thread, message framing, signed control, heartbeats, path validation, reference-counted close \\
+\code{http.h}, \code{http.cpp} & One HTTP/1.1 exchange per SDK connection, with grammar validation and a bounded server \\
 \code{fuse.h}, \code{packet.h}, \code{varint.h}, \code{src/*.c} & Legacy C scaffold, unused by the protocol \\
 \code{tests/proto/test_*.cpp} & One suite per component and transport \\
 \code{bench/} & \code{fuse_bench}, \code{fuse_filebench} and the QUIC baseline, \code{fuse_latbench}, \code{fuse_netem}, \code{RESULTS.md} \\
