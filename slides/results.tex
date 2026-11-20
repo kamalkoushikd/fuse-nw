@@ -4,15 +4,15 @@
 % from bench/RESULTS.md (16-core host, protocol v5-v7).
 \newcommand{\FUSEONE}{729}      % Fuse, 1 lane, MB/s
 \newcommand{\FUSEFOUR}{751}     % Fuse, 4 lanes
-\newcommand{\TCPONE}{1933}      % TCP, 1 connection
-\newcommand{\TCPFOUR}{5759}     % TCP, 4 connections
-\newcommand{\UDPRAW}{467}       % raw UDP send rate (no reliability)
-\newcommand{\UDPDELTWO}{45.7}   % raw UDP, % of datagrams delivered through 2% emulated loss, sent at line rate
-\newcommand{\UDPDELFIVE}{32.3}  % same, 5% loss
+\newcommand{\TCPONE}{6023}      % TCP, 1 connection
+\newcommand{\TCPFOUR}{5189}     % TCP, 4 connections
+\newcommand{\UDPRAW}{552}       % raw UDP send rate (no reliability)
+\newcommand{\UDPDELTWO}{48.2}   % raw UDP, % of datagrams delivered through 2% emulated loss, sent at line rate
+\newcommand{\UDPDELFIVE}{46.3}  % same, 5% loss
 \newcommand{\FUSELATIDLEA}{46.7}  \newcommand{\FUSELATIDLEB}{169.8}  % Fuse idle p50 / p99 (us)
 \newcommand{\FUSELATLOADA}{8.3}   \newcommand{\FUSELATLOADB}{769.9}  % Fuse under 4-lane bulk (2.3 GB/s)
-\newcommand{\TCPLATIDLEA}{54.9}   \newcommand{\TCPLATIDLEB}{180.1}   % TCP idle
-\newcommand{\TCPLATSAMEA}{964.5}  \newcommand{\TCPLATSAMEB}{11329.6} % TCP, probes on a bulk connection
-\newcommand{\TCPLATSEPA}{7.4}     \newcommand{\TCPLATSEPB}{4358.9}   % TCP, probes on their own connection
+\newcommand{\TCPLATIDLEA}{40.8}   \newcommand{\TCPLATIDLEB}{130.6}   % TCP idle
+\newcommand{\TCPLATSAMEA}{15.0}  \newcommand{\TCPLATSAMEB}{15015.9} % TCP, probes on a bulk connection
+\newcommand{\TCPLATSEPA}{25.2}     \newcommand{\TCPLATSEPB}{835.6}   % TCP, probes on their own connection
 \newcommand{\QUICJIT}{0.6}      % QUIC MB/s under 10+-5 ms jitter (bench/RESULTS.md)
 \newcommand{\FUSEJIT}{50}       % Fuse MB/s under the same jitter (bench/RESULTS.md)
