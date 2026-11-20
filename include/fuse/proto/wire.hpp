@@ -52,7 +52,11 @@ namespace fuse::proto {
 // datagram carries a ctr+GMAC trailer, see session_crypto.hpp ControlAuth),
 // takes the retransmission bit out of the DATA AAD, rotates data keys per
 // 2^22-block epoch, and adds StreamClose reason "auth failed" so a key
-// mismatch is diagnosed at the handshake.
+// mismatch is diagnosed at the handshake. Before v8 was released, the SDK
+// (sdk.cpp) got the same treatment: retransmission bit out of the AAD,
+// per-epoch data keys, signed and replay-checked Ack/Nack/Close, path
+// validation, and Heartbeat-based liveness. Those changes are part of v8
+// too, not a v9.
 inline constexpr uint8_t  kProtocolVersion = 8;
 
 // The default block payload (kDefaultPayloadSize) sits under a typical
