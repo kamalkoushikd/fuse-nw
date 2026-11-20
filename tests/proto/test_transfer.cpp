@@ -351,6 +351,75 @@ TEST(Transfer, HugeStreamStartSizeFailsCleanlyInsteadOfCrashing) {
     EXPECT_EQ(rs, fuse::TransferStatus::ResourceLimit) << fuse::to_string(rs);
 }
 
+// A size claim that is allocatable but above max_receive_bytes is refused
+// up front. Before the limit existed a claim of, say, 50 GB would be
+// zero-filled by receive_buffer, and on Linux overcommit means that ends in
+// the OOM killer rather than a bad_alloc this code could catch.
+TEST(Transfer, ClaimAboveMaxReceiveBytesIsRefused) {
+    using namespace fuse::proto;
+    for (const bool to_file : {false, true}) {
+        const uint16_t port = next_port();
+        fuse::TransferConfig rx;
+        rx.bind_address = "127.0.0.1";
+        rx.base_port = port;
+        rx.lanes = 1;
+        rx.timeout_ms = 3000;
+        rx.max_receive_bytes = 1 << 20;
+
+        const std::string path = (std::filesystem::temp_directory_path() /
+                                  ("fuse-limit-" + std::to_string(port))).string();
+        std::vector<uint8_t> got;
+        fuse::TransferStatus rs = fuse::TransferStatus::Ok;
+        std::thread receiver([&] {
+            rs = to_file ? fuse::receive_file(rx, path, nullptr)
+                         : fuse::receive_buffer(rx, &got, nullptr);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        UdpSocket atk;
+        ASSERT_TRUE(atk.open("127.0.0.1", 0));
+        PeerAddr dst;
+        ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", port, &dst));
+        StreamStart ss;
+        ss.stream_id = 0;
+        ss.total_bytes = 64ull << 20; // easily allocatable, but over the limit
+        ss.file_total_bytes = ss.total_bytes;
+        ss.nonce = 0x6;
+        ASSERT_TRUE(send_stream_start_v8(atk, dst, ss));
+
+        receiver.join();
+        EXPECT_EQ(rs, fuse::TransferStatus::ResourceLimit) << fuse::to_string(rs) << to_file;
+        std::filesystem::remove(path + ".part");
+    }
+}
+
+// receive_file must not follow a symlink planted at the predictable .part
+// path (a shared directory such as /tmp): that would truncate and overwrite
+// the link's target with whatever the sender sends.
+TEST(Transfer, PartFileSymlinkIsNotFollowed) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("fuse-symlink-" + std::to_string(next_port()));
+    fs::create_directories(dir);
+    const fs::path victim = dir / "victim";
+    {
+        std::ofstream(victim) << "precious";
+    }
+    const fs::path out = dir / "out";
+    fs::create_symlink(victim, out.string() + ".part");
+
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = next_port();
+    rx.lanes = 1;
+    rx.timeout_ms = 1000;
+    EXPECT_EQ(fuse::receive_file(rx, out.string(), nullptr), fuse::TransferStatus::ConfigError);
+    std::ifstream in(victim);
+    std::string content;
+    in >> content;
+    EXPECT_EQ(content, "precious");
+    fs::remove_all(dir);
+}
+
 // --- Progress reporting and graceful exit ----------------------------------
 
 namespace fakepeer {
@@ -800,6 +869,10 @@ public:
         large_threshold_ = threshold;
         large_one_in_ = one_in;
     }
+    // Answers the sender's first StreamStart with a forged version-mismatch
+    // reply from the receiver's own address (as seen by the sender), before
+    // forwarding it. Set before traffic starts.
+    void forge_version_mismatch() { forge_mismatch_ = true; }
     uint64_t data_datagrams() const { return data_total_.load(); }
     uint64_t large_datagrams() const { return data_large_.load(); }
     // Blocks seen more than once (a retransmission of an earlier seq), and
@@ -841,6 +914,15 @@ private:
                     seen_start_ = true;
                     sender_seen_ = from;
                     nonce_seen_ = start.nonce;
+                    if (forge_mismatch_ && !mismatch_sent_) {
+                        uint8_t reply[kVersionMismatchSize];
+                        const uint8_t other = static_cast<uint8_t>(kProtocolVersion + 1);
+                        reply[0] = other;
+                        reply[1] = kVersionMismatchMarker;
+                        reply[2] = other;
+                        front_.send_to(reply, sizeof(reply), from);
+                        mismatch_sent_ = true;
+                    }
                 }
                 BlockHeader h;
                 uint64_t st = 0;
@@ -898,6 +980,7 @@ private:
     uint64_t large_seen_ = 0;
     std::atomic<uint64_t> data_total_{0}, data_large_{0};
     bool rebound_ = false;
+    bool forge_mismatch_ = false, mismatch_sent_ = false;
     std::atomic<bool> stop_{false};
     std::atomic<uint64_t> dropped_{0};
     std::atomic<uint64_t> resends_{0}, changed_resends_{0};
@@ -1263,10 +1346,62 @@ TEST(Transfer, VersionMismatchIsReported) {
         const uint8_t byte = 1;
         const auto t0 = fakepeer::Clock::now();
         EXPECT_EQ(fuse::send_buffer(tx, &byte, 1), fuse::TransferStatus::VersionMismatch);
-        EXPECT_LT(fakepeer::ms_since(t0), 1000.0);
+        // The reply is unauthenticated, so it is only acted on after a short
+        // grace period (about 1 s) in which a real receiver could still
+        // answer in our version -- still far below the connect timeout.
+        EXPECT_LT(fakepeer::ms_since(t0), 2500.0);
         stop.store(true);
         fake.join();
     }
+}
+
+// A version-mismatch reply is unauthenticated, so a forged one -- whether
+// spoofing the receiver's address or sent from anywhere else -- must not
+// abort a transfer to a receiver that really speaks our version.
+TEST(Transfer, ForgedVersionMismatchDoesNotAbort) {
+    using namespace fuse::proto;
+    const auto payload = make_payload(2 * 1024 * 1024);
+    const uint16_t rx_port = next_port();
+    const uint16_t relay_port = next_port();
+    fuse::TransferConfig rx;
+    rx.bind_address = "127.0.0.1";
+    rx.base_port = rx_port;
+    rx.lanes = 1;
+    rx.timeout_ms = 20000;
+    fuse::TransferConfig tx = rx;
+    tx.host = "127.0.0.1";
+    tx.base_port = relay_port;
+
+    pipeline_test::LossyRelay relay(relay_port, rx_port, 1 << 30);
+    relay.forge_version_mismatch(); // from the receiver's address
+    std::vector<uint8_t> got;
+    fuse::TransferStatus rs = fuse::TransferStatus::Incomplete, ss = rs;
+    std::thread receiver([&] { rs = fuse::receive_buffer(rx, &got, nullptr); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    std::atomic<bool> done{false};
+    std::thread sender([&] {
+        ss = fuse::send_buffer(tx, payload.data(), payload.size(), nullptr);
+        done.store(true);
+    });
+    // And from an unrelated address, for as long as the transfer runs.
+    UdpSocket atk;
+    ASSERT_TRUE(atk.open("127.0.0.1", 0));
+    PeerAddr victim{};
+    uint64_t nonce = 0;
+    while (!relay.observed(&victim, &nonce) && !done.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const uint8_t other = static_cast<uint8_t>(kProtocolVersion + 1);
+    const uint8_t forged[kVersionMismatchSize] = {other, kVersionMismatchMarker, other};
+    while (!done.load()) {
+        atk.send_to(forged, sizeof(forged), victim);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    sender.join();
+    receiver.join();
+    EXPECT_EQ(ss, fuse::TransferStatus::Ok) << fuse::to_string(ss);
+    EXPECT_EQ(rs, fuse::TransferStatus::Ok) << fuse::to_string(rs);
+    EXPECT_EQ(got, payload);
 }
 
 // ROADMAP #9: a receiver whose pipeline is the bottleneck (tiny rings, one

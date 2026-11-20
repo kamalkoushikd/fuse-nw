@@ -27,6 +27,13 @@ bool session_crypto_available() {
     return FUSE_PROTO_WITH_DTLS != 0;
 }
 
+void secure_zero(void *p, size_t len) {
+    // Volatile stores: the compiler must perform every one of them, even
+    // when `p` is about to go out of scope (where a memset may be elided).
+    volatile uint8_t *v = static_cast<volatile uint8_t *>(p);
+    while (len-- > 0) *v++ = 0;
+}
+
 uint64_t secure_random_u64() {
     uint8_t b[8] = {};
     bool ok = random_bytes(b, sizeof(b));
@@ -73,7 +80,7 @@ bool LaneCipher::open(uint16_t, uint64_t, const uint8_t *, size_t, const uint8_t
 bool derive_lane_epoch_key(const uint8_t *, uint16_t, uint64_t, uint8_t *) { return false; }
 bool ControlAuth::init(const uint8_t *, uint16_t, uint8_t) { return false; }
 size_t ControlAuth::seal(uint8_t *, size_t, size_t) { return 0; }
-bool ControlAuth::open(const uint8_t *, size_t, size_t *) const { return false; }
+bool ControlAuth::open(const uint8_t *, size_t, size_t *) { return false; }
 
 #else
 
@@ -126,16 +133,19 @@ bool derive_session_key(const uint8_t *psk, size_t psk_len, const uint8_t *salt,
                                                  WC_SHA256) == 0;
     wc_ForceZero(ikm.data(), ikm.size());
     if (!extracted) {
+        wc_ForceZero(prk, sizeof(prk));
         return false;
     }
 
     static const char kProtocol[] = "fuse2 ";
     static const char kLabel[] = "session key";
-    return wc_Tls13_HKDF_Expand_Label(out_key, static_cast<word32>(kSessionKeyLen), prk,
-                                      sizeof(prk), reinterpret_cast<const byte *>(kProtocol),
-                                      sizeof(kProtocol) - 1,
-                                      reinterpret_cast<const byte *>(kLabel), sizeof(kLabel) - 1,
-                                      nullptr, 0, WC_SHA256) == 0;
+    const bool ok = wc_Tls13_HKDF_Expand_Label(out_key, static_cast<word32>(kSessionKeyLen), prk,
+                                               sizeof(prk), reinterpret_cast<const byte *>(kProtocol),
+                                               sizeof(kProtocol) - 1,
+                                               reinterpret_cast<const byte *>(kLabel),
+                                               sizeof(kLabel) - 1, nullptr, 0, WC_SHA256) == 0;
+    wc_ForceZero(prk, sizeof(prk));
+    return ok;
 }
 
 LaneCipher::LaneCipher() = default;
@@ -274,7 +284,46 @@ size_t ControlAuth::seal(uint8_t *dg, size_t len, size_t cap) {
     return len + kControlTrailerLen;
 }
 
-bool ControlAuth::open(const uint8_t *dg, size_t len, size_t *body_len) const {
+bool ControlAuth::accept_counter(uint64_t ctr) {
+    constexpr size_t kWords = kControlReplayWindow / 64;
+    if (ctr == 0) {
+        return false; // seal() never uses 0
+    }
+    if (ctr > highest_ctr_) {
+        // Slide the window up by `shift`; bit 0 becomes the new highest.
+        const uint64_t shift = ctr - highest_ctr_;
+        if (shift >= kControlReplayWindow) {
+            for (uint64_t &w : seen_) w = 0;
+        } else {
+            const size_t words = static_cast<size_t>(shift / 64);
+            const unsigned bits = static_cast<unsigned>(shift % 64);
+            for (size_t i = kWords; i-- > 0;) {
+                uint64_t v = 0;
+                if (i >= words) {
+                    v = seen_[i - words] << bits;
+                    if (bits != 0 && i > words) v |= seen_[i - words - 1] >> (64 - bits);
+                }
+                seen_[i] = v;
+            }
+        }
+        highest_ctr_ = ctr;
+        seen_[0] |= 1;
+        return true;
+    }
+    const uint64_t age = highest_ctr_ - ctr;
+    if (age >= kControlReplayWindow) {
+        return false; // too old to tell apart from a replay
+    }
+    uint64_t &word = seen_[age / 64];
+    const uint64_t bit = 1ull << (age % 64);
+    if (word & bit) {
+        return false; // already accepted once: a replay
+    }
+    word |= bit;
+    return true;
+}
+
+bool ControlAuth::open(const uint8_t *dg, size_t len, size_t *body_len) {
     if (!cipher_ || dg == nullptr || len < kControlTrailerLen || len > UINT32_MAX) {
         return false;
     }
@@ -288,11 +337,17 @@ bool ControlAuth::open(const uint8_t *dg, size_t len, size_t *body_len) const {
                          static_cast<word32>(body + 8)) != 0) {
         return false;
     }
+    // Only after the tag verifies, so forged counters can't move the window.
+    if (!accept_counter(ctr)) {
+        return false;
+    }
     if (body_len) *body_len = body;
     return true;
 }
 
 #endif // FUSE_PROTO_WITH_DTLS
+
+LaneKeySchedule::~LaneKeySchedule() { secure_zero(key_, sizeof(key_)); }
 
 bool LaneKeySchedule::init(const uint8_t session_key[kSessionKeyLen], uint16_t lane) {
     if (ready_ || session_key == nullptr || !session_crypto_available()) {
@@ -317,7 +372,7 @@ const LaneCipher *LaneKeySchedule::cipher_for(uint64_t seq) {
     uint8_t k[kSessionKeyLen];
     auto c = std::make_unique<LaneCipher>();
     const bool ok = derive_lane_epoch_key(key_, lane_, epoch, k) && c->init(k);
-    std::memset(k, 0, sizeof(k));
+    secure_zero(k, sizeof(k));
     if (!ok) {
         return nullptr;
     }

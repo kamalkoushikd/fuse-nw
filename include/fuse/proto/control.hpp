@@ -55,9 +55,11 @@ struct StreamStart {
     // v6: where this stream sits in the whole transfer, so a receiver can
     // write each block straight to its final place in the output (a file,
     // written as blocks arrive) instead of buffering the stream and
-    // concatenating streams at the end. Unauthenticated like the rest of
-    // StreamStart: a receiver must check total_bytes <= file_total_bytes and
-    // stream_base_offset <= file_total_bytes - total_bytes before using them.
+    // concatenating streams at the end. A sender's claim like the rest of
+    // StreamStart (signed under a PSK since v8, but a peer holding the key
+    // can still lie): a receiver must check total_bytes <= file_total_bytes
+    // and stream_base_offset <= file_total_bytes - total_bytes before using
+    // them, and the total against its own size limit.
     uint64_t stream_base_offset = 0;
     uint64_t file_total_bytes   = 0;
     // v7: identifies the file being sent (from its name, size and
@@ -116,8 +118,9 @@ struct Nack {
 };
 
 // Ends one bulk-transfer lane. Carries the lane's StreamStart nonce so a
-// stale close from an earlier session on the same port is ignored. Like Ack,
-// it is not authenticated under a PSK — the nonce is the only session check.
+// stale close from an earlier session on the same port is ignored. Under a
+// PSK it is signed like every other control message (v8); in plaintext the
+// nonce is the only session check.
 inline constexpr uint8_t kStreamCloseFinished = 0; // sender: every byte acknowledged
 inline constexpr uint8_t kStreamCloseAborted  = 1; // either side: giving up on this lane
 // Receiver -> sender (v8): the StreamStart failed authentication, i.e. the

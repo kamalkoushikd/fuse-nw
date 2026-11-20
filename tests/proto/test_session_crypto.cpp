@@ -268,3 +268,50 @@ TEST(SessionCrypto, KeyEpochsRotateDeterministically) {
     EXPECT_NE(std::memcmp(k0, k1, sizeof(k0)), 0);
     EXPECT_NE(std::memcmp(k0, other_lane, sizeof(k0)), 0);
 }
+
+#if FUSE_PROTO_WITH_DTLS
+
+// A control datagram is accepted at most once: an authentic Nack replayed
+// every RTT would otherwise pin the sender's window at its floor.
+TEST(SessionCrypto, ControlAuthRejectsReplays) {
+    const Keyed k = make_keys();
+    ControlAuth sender, receiver;
+    ASSERT_TRUE(sender.init(k.key, 2, /*local_dir=*/1));
+    ASSERT_TRUE(receiver.init(k.key, 2, /*local_dir=*/0));
+
+    std::vector<std::vector<uint8_t>> sent;
+    for (int i = 0; i < 5; ++i) {
+        std::vector<uint8_t> dg(64, static_cast<uint8_t>(i));
+        const size_t n = sender.seal(dg.data(), 20, dg.size());
+        ASSERT_EQ(n, 20 + kControlTrailerLen);
+        dg.resize(n);
+        sent.push_back(dg);
+    }
+    size_t body = 0;
+    // Out of order is fine, each exactly once.
+    for (int i : {1, 0, 3, 2, 4}) {
+        EXPECT_TRUE(receiver.open(sent[i].data(), sent[i].size(), &body)) << i;
+        EXPECT_EQ(body, 20u);
+    }
+    for (const auto &dg : sent) EXPECT_FALSE(receiver.open(dg.data(), dg.size(), &body));
+
+    // Anything older than the window is refused even if never seen.
+    std::vector<uint8_t> old(64, 0xAA);
+    old.resize(sender.seal(old.data(), 20, old.size()));
+    for (uint64_t i = 0; i < kControlReplayWindow + 1; ++i) {
+        std::vector<uint8_t> dg(64, 0);
+        dg.resize(sender.seal(dg.data(), 20, dg.size()));
+        ASSERT_TRUE(receiver.open(dg.data(), dg.size(), &body));
+    }
+    EXPECT_FALSE(receiver.open(old.data(), old.size(), &body));
+
+    // A forged counter (bad tag) doesn't move the window.
+    std::vector<uint8_t> forged = sent[0];
+    forged[20 + 7] = 0xFF; // counter far ahead
+    EXPECT_FALSE(receiver.open(forged.data(), forged.size(), &body));
+    std::vector<uint8_t> next(64, 1);
+    next.resize(sender.seal(next.data(), 20, next.size()));
+    EXPECT_TRUE(receiver.open(next.data(), next.size(), &body));
+}
+
+#endif

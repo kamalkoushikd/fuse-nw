@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -24,6 +25,7 @@
 #include "fuse/proto/control.hpp"
 #include "fuse/proto/digest.hpp"
 #include "fuse/proto/hash.hpp"
+#include "fuse/proto/path_validator.hpp"
 #include "fuse/proto/receiver.hpp"
 #include "fuse/proto/registry.hpp"
 #include "fuse/proto/session_crypto.hpp"
@@ -143,43 +145,12 @@ size_t seal_ctl(ControlAuth *auth, uint8_t *buf, size_t n, size_t cap) {
 
 // True if a received control datagram may be acted on: always in plaintext
 // sessions (auth == nullptr), and only with a valid trailer under a key.
-bool ctl_authentic(const ControlAuth *auth, const uint8_t *dg, size_t len) {
+// Each authentic datagram is accepted only once (ControlAuth's replay
+// window), so call this at most once per received datagram.
+bool ctl_authentic(ControlAuth *auth, const uint8_t *dg, size_t len) {
     return auth == nullptr || auth->open(dg, len, nullptr);
 }
 
-// Path validation (v8, ROADMAP #3). A peer's address is only replaced by a
-// new source after that source echoes a random challenge, so a datagram
-// with a spoofed or merely different source address cannot redirect where
-// this lane sends its traffic (no hijack, no reflection at a third party).
-// One candidate at a time; challenges are resent at most every 50 ms.
-class PathValidator {
-public:
-    // Authentic traffic arrived from `src`, which is not the current peer.
-    // Returns true (and fills *probe) if a challenge should be sent to it now.
-    bool want_probe(const PeerAddr &src, uint64_t now, uint64_t *challenge) {
-        if (!(active_ && candidate_ == src)) {
-            active_ = true;
-            candidate_ = src;
-            challenge_ = secure_random_u64();
-            sent_ns_ = 0;
-        }
-        if (sent_ns_ != 0 && now - sent_ns_ < 50'000'000ull) return false;
-        sent_ns_ = now;
-        *challenge = challenge_;
-        return true;
-    }
-    // A PathResponse arrived; true if it validates the candidate.
-    bool validated(const PeerAddr &src, uint64_t value) {
-        if (!active_ || !(src == candidate_) || value != challenge_) return false;
-        active_ = false;
-        return true;
-    }
-
-private:
-    PeerAddr candidate_{};
-    uint64_t challenge_ = 0, sent_ns_ = 0;
-    bool active_ = false;
-};
 
 // Sends a PathChallenge/PathResponse for `lane`, signed under a PSK.
 void send_path_probe(UdpSocket &sock, const PeerAddr &to, MsgType type, uint16_t lane,
@@ -217,7 +188,18 @@ struct LaneResult {
     std::atomic<bool> finished{false};
 };
 
+// Wipes a key buffer when it goes out of scope, on every exit path.
+struct ZeroOnExit {
+    void *p;
+    size_t n;
+    ~ZeroOnExit() { secure_zero(p, n); }
+};
+
 struct Keys {
+    Keys() = default;
+    Keys(const Keys &) = default;
+    Keys &operator=(const Keys &) = default;
+    ~Keys() { secure_zero(key, sizeof(key)); }
     bool enabled = false;
     uint8_t key[kSessionKeyLen] = {};
     uint8_t salt[kSessionSaltLen] = {};
@@ -285,11 +267,18 @@ public:
 // receive_buffer: straight into the caller's vector. Never resumes.
 class MemorySink final : public Sink {
 public:
-    explicit MemorySink(std::vector<uint8_t> *out) : out_(out) { out_->clear(); }
+    // `limit`: the largest size accepted (TransferConfig::max_receive_bytes,
+    // with 0 already resolved to half of physical memory).
+    MemorySink(std::vector<uint8_t> *out, uint64_t limit) : out_(out), limit_(limit) {
+        out_->clear();
+    }
 
     bool prepare(uint64_t total_bytes, uint64_t) override {
-        // total_bytes is the sender's unauthenticated claim: a hostile value
-        // must fail this transfer, not throw out of a lane thread.
+        // total_bytes is the sender's claim: a hostile value must fail this
+        // transfer, not throw out of a lane thread. Checked against the limit
+        // first: on Linux, with memory overcommit, a huge assign() does not
+        // throw bad_alloc -- zero-filling it gets the process OOM-killed.
+        if (total_bytes > limit_) return false;
         try {
             out_->assign(total_bytes, 0);
         } catch (const std::bad_alloc &) {
@@ -316,6 +305,7 @@ public:
 
 private:
     std::vector<uint8_t> *out_;
+    uint64_t limit_;
 };
 
 // receive_file: blocks go to "<path>.part" as they arrive; the finished file
@@ -339,25 +329,48 @@ private:
 // seq -> offset mapping) changes during a transfer and between sessions.
 class FileSink final : public Sink {
 public:
-    explicit FileSink(std::string path) : path_(std::move(path)), part_(path_ + ".part") {}
+    // `limit`: TransferConfig::max_receive_bytes (0 = automatic: the free
+    // space on the destination's filesystem, see prepare()).
+    FileSink(std::string path, uint64_t limit)
+        : path_(std::move(path)), part_(path_ + ".part"), limit_(limit) {}
 
     ~FileSink() override {
         if (fd_ >= 0) ::close(fd_); // finish() never ran; leave the file as it is
     }
 
     bool open() {
+        // The .part path is predictable, so in a directory other users can
+        // write to (e.g. /tmp) one could plant a symlink or hard link there
+        // and have us truncate and overwrite its target, or plant a file we
+        // would adopt as resume state. So: never follow a symlink, create
+        // exclusively when it doesn't exist, and only reuse an existing one
+        // that is a plain, singly-linked file we own. Mode 0600: the file
+        // holds decrypted data, and the final rename keeps this mode.
+        constexpr int kFlags = O_RDWR | O_CLOEXEC | O_NOFOLLOW;
+        fd_ = ::open(part_.c_str(), kFlags);
+        existed_ = fd_ >= 0;
+        if (fd_ < 0) {
+            if (errno != ENOENT) return false; // ELOOP: a symlink is in the way
+            fd_ = ::open(part_.c_str(), kFlags | O_CREAT | O_EXCL, 0600);
+            if (fd_ < 0) return false;
+        }
         struct stat st {};
-        existed_ = ::stat(part_.c_str(), &st) == 0;
+        if (::fstat(fd_, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != ::geteuid() ||
+            st.st_nlink != 1) {
+            ::close(fd_);
+            fd_ = -1;
+            return false;
+        }
         // No O_TRUNC: an existing .part may be an earlier session's progress,
         // and is only discarded once prepare() knows it's for another file.
-        fd_ = ::open(part_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-        if (fd_ < 0) return false;
         if (existed_) load_trailer();
         return true;
     }
 
     bool prepare(uint64_t total_bytes, uint64_t file_id) override {
         if (total_bytes > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) return false;
+        // The size is the sender's claim; don't reserve more than allowed.
+        if (!within_limit(total_bytes)) return false;
         // 64 KiB chunks, doubled for very large files so the bitmap stays
         // under ~1 MB (8M chunks).
         uint64_t chunk = 64 * 1024;
@@ -522,6 +535,22 @@ private:
     static constexpr size_t kFooterLen = 48;
     static constexpr char kMagic[9] = "FUSERSM1";
 
+    // An explicit limit is checked as is. Automatic (0): the claim must fit
+    // in the filesystem's free space plus what the .part already occupies
+    // (a resumed transfer reuses those blocks).
+    bool within_limit(uint64_t total_bytes) const {
+        if (limit_ != 0) return total_bytes <= limit_;
+        struct statvfs vfs {};
+        struct stat st {};
+        if (::fstatvfs(fd_, &vfs) != 0 || ::fstat(fd_, &st) != 0) return false;
+        const uint64_t frsize = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+        const uint64_t avail = static_cast<uint64_t>(vfs.f_bavail);
+        const uint64_t free_bytes =
+            avail > UINT64_MAX / frsize ? UINT64_MAX : avail * frsize;
+        const uint64_t held = static_cast<uint64_t>(st.st_blocks) * 512u;
+        return total_bytes <= free_bytes || total_bytes - free_bytes <= held;
+    }
+
     static uint64_t chunk_len(uint64_t i, uint64_t chunk, uint64_t total) {
         return std::min(chunk, total - i * chunk);
     }
@@ -577,6 +606,7 @@ private:
     }
 
     std::string path_, part_;
+    uint64_t limit_ = 0;
     int fd_ = -1;
     bool existed_ = false;
 
@@ -622,6 +652,7 @@ using DoneRing = SpscRing<Completion>;
 // block), read by consumers. The ring's release/acquire already orders the
 // key before any block that needs it; `ready` just makes that explicit.
 struct LaneKey {
+    ~LaneKey() { secure_zero(key, sizeof(key)); }
     uint8_t key[kSessionKeyLen] = {};
     std::atomic<bool> ready{false};
 };
@@ -921,6 +952,27 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
     std::vector<uint64_t> dispatched(kWindow, UINT64_MAX);
     uint64_t pending = 0; // blocks handed to consumers, result not yet back
 
+    // Under a PSK, a data block from a source other than the validated peer
+    // is authenticated here, on the reader, before it may take a dispatch
+    // mark or a ring slot. Otherwise anyone could send forged blocks for
+    // in-window sequence numbers: each would hold its seq's mark while a
+    // consumer rejects it, so the genuine copy arriving meanwhile would be
+    // dropped (and NACKed, halving the sender's window). Blocks from the
+    // peer itself, i.e. nearly all of them, are not decrypted twice; only a
+    // rebinding sender's blocks are, until the new address is validated.
+    LaneKeySchedule reader_keys;
+    std::vector<uint8_t> reader_plain(kMaxPayloadSize);
+    const auto authentic_block = [&](const BlockHeader &hdr, const uint8_t *payload) {
+        if (!p->keys[lane].ready.load(std::memory_order_acquire)) return false;
+        if (!reader_keys.ready() && !reader_keys.init(p->keys[lane].key, lane)) return false;
+        const LaneCipher *cipher = reader_keys.cipher_for(hdr.seq_no);
+        uint8_t aad[19];
+        const size_t al = build_aad(aad, lane, hdr.seq_no, hdr.offset, hdr.flags);
+        return cipher != nullptr && payload != nullptr && hdr.payload_len >= kAeadTagLen &&
+               cipher->open(lane, hdr.seq_no, aad, al, payload, hdr.payload_len,
+                            reader_plain.data());
+    };
+
     uint64_t lane_base = 0, shard_bytes = 0, final_seq = UINT64_MAX, written = 0;
     // This session's share of the lane: what we asked the sender for (all
     // of it unless resuming), and that answer, encoded — resent whenever the
@@ -1141,6 +1193,7 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
                     bool salted = false;
                     for (uint8_t b : ss.session_salt) salted |= (b != 0);
                     uint8_t session_key[kSessionKeyLen] = {};
+                    const ZeroOnExit wipe_session_key{session_key, sizeof(session_key)};
                     std::unique_ptr<ControlAuth> trial;
                     bool authentic = !want_crypto && !salted;
                     if (want_crypto && salted) {
@@ -1310,6 +1363,7 @@ void recv_lane(const TransferConfig &cfg, uint16_t lane, RxPipeline *p, LaneResu
             if (rel >= kWindow || rx.is_received(rel)) continue;
             uint64_t &mark = dispatched[hdr.seq_no % kWindow];
             if (mark == hdr.seq_no) continue;
+            if (want_crypto && !(srcs[i] == peer) && !authentic_block(hdr, payload)) continue;
 
             PacketRing &ring = (hdr.flags & kFlagRetransmission)
                                    ? *p->rtx_rings[lane]
@@ -1512,11 +1566,26 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     const uint64_t hs_limit_ns =
         static_cast<uint64_t>(std::min(cfg.connect_timeout_ms, cfg.timeout_ms)) * 1000000ull;
     uint64_t resend_every_ns = 1'000'000, next_send_ns = 0;
+    // Version-mismatch replies are unauthenticated by necessity (the peer
+    // can't share our framing, let alone our key), so one is only a hint:
+    // a forged 3-byte datagram must not abort the transfer. A hint from the
+    // receiver's address shortens the handshake to kVersionHintGraceNs, and
+    // is reported as VersionMismatch only if nothing in our own version
+    // arrived from the receiver by then. Once the receiver has answered in
+    // our version, hints are ignored altogether.
+    constexpr uint64_t kVersionHintGraceNs = 1'000'000'000ull;
+    bool version_hint = false, heard_receiver = false;
+    uint64_t hs_end_ns = hs_begin + hs_limit_ns;
     while (!started) {
         const uint64_t t = now_ns();
         const bool cancelled = cancel_requested(cfg);
         const bool sibling_stopped = stop_all->load(std::memory_order_acquire);
-        if (cancelled || sibling_stopped || t - hs_begin > hs_limit_ns) {
+        if (!cancelled && !sibling_stopped && t > hs_end_ns && version_hint && !heard_receiver) {
+            res->status.store(static_cast<int>(TransferStatus::VersionMismatch));
+            stop_all->store(true, std::memory_order_release);
+            return;
+        }
+        if (cancelled || sibling_stopped || t > hs_end_ns) {
             // The receiver may already have accepted an earlier StreamStart
             // whose Ack we just haven't seen yet — or never seen one at all
             // (it accepts a pre-session abort too): either way, tell it
@@ -1537,15 +1606,22 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
         }
         size_t got = 0;
         MsgType mt;
-        const bool received = sock.recv_from(ctl.data(), ctl.size(), &got, nullptr);
+        PeerAddr from;
+        const bool received = sock.recv_from(ctl.data(), ctl.size(), &got, &from);
         uint8_t peer_version = 0;
         if (received && decode_version_mismatch(ctl.data(), got, &peer_version)) {
-            res->status.store(static_cast<int>(TransferStatus::VersionMismatch));
-            stop_all->store(true, std::memory_order_release);
-            return;
+            if (from == dst && !heard_receiver && !version_hint) {
+                version_hint = true;
+                hs_end_ns = std::min(hs_end_ns, now_ns() + kVersionHintGraceNs);
+            }
+            continue;
         }
         if (received && peek_msg_type(ctl.data(), got, &mt)) {
             const bool authentic = ctl_authentic(auth.get(), ctl.data(), got);
+            // Anything well-formed in our version from the receiver's address
+            // (a Retry, an auth-failed close, or any signed reply) shows it
+            // speaks our version, whatever a mismatch reply claimed.
+            if (from == dst) heard_receiver = true;
             if (mt == MsgType::StreamClose) {
                 // The receiver could not authenticate our StreamStart: the
                 // keys differ. Unsigned by necessity (it has no key it
@@ -2043,8 +2119,6 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
     // receiver echoes it back.
     if (resumed && lane == 0) {
         digester.join(); // started right after the handshake
-        const size_t dn = seal_ctl(auth.get(), rtx.data(), encode_digest(dm, rtx.data(), rtx.size()),
-                                   rtx.size());
         const uint64_t begin = now_ns();
         uint64_t next_send = 0;
         for (bool echoed = false; !echoed;) {
@@ -2063,7 +2137,12 @@ void send_lane(const TransferConfig &cfg, uint16_t lane, const Keys &keys, const
                 return;
             }
             if (t >= next_send) {
-                sock.send_to(rtx.data(), dn, dst);
+                // Sealed afresh for every resend: the receiver accepts each
+                // control counter once, so resending the same signed bytes
+                // after a lost echo would be dropped as a replay.
+                const size_t dn = seal_ctl(auth.get(), rtx.data(),
+                                           encode_digest(dm, rtx.data(), rtx.size()), rtx.size());
+                if (dn) sock.send_to(rtx.data(), dn, dst);
                 next_send = t + 50'000'000ull;
             }
             size_t got = 0;
@@ -2448,6 +2527,20 @@ TransferStatus send_buffer(const TransferConfig &cfg, const uint8_t *data, size_
     return send_impl(cfg, data, len, /*file_id=*/0, stats);
 }
 
+namespace {
+
+// TransferConfig::max_receive_bytes for receive_buffer, with 0 resolved to
+// half of physical memory.
+uint64_t memory_limit(const TransferConfig &cfg) {
+    if (cfg.max_receive_bytes != 0) return cfg.max_receive_bytes;
+    const long pages = ::sysconf(_SC_PHYS_PAGES);
+    const long page = ::sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page <= 0) return 1ull << 30; // unknown: 1 GiB
+    return static_cast<uint64_t>(pages) / 2 * static_cast<uint64_t>(page);
+}
+
+} // namespace
+
 TransferStatus receive_buffer(const TransferConfig &cfg, std::vector<uint8_t> *out,
                               TransferStats *stats) {
     if (out == nullptr) return TransferStatus::ConfigError;
@@ -2455,7 +2548,7 @@ TransferStatus receive_buffer(const TransferConfig &cfg, std::vector<uint8_t> *o
     if (st != TransferStatus::Ok) return st;
     // Blocks are written straight into *out; it is only left populated if
     // the whole transfer succeeds.
-    MemorySink sink(out);
+    MemorySink sink(out, memory_limit(cfg));
     return receive_to_sink(cfg, &sink, stats);
 }
 
@@ -2480,7 +2573,7 @@ TransferStatus receive_file(const TransferConfig &cfg, const std::string &path,
     if (st != TransferStatus::Ok) return st;
     // Opened before the transfer starts, so an unwritable destination fails
     // at once instead of after the whole file has crossed the network.
-    FileSink sink(path);
+    FileSink sink(path, cfg.max_receive_bytes);
     if (!sink.open()) return TransferStatus::ConfigError;
     return receive_to_sink(cfg, &sink, stats);
 }

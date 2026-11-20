@@ -47,6 +47,10 @@ bool session_crypto_available();
 // back to a predictable salt.
 bool random_bytes(uint8_t *out, size_t len);
 
+// Overwrites `len` bytes at `p` with zeros in a way the compiler may not
+// optimise away. For key material on the stack or in long-lived objects.
+void secure_zero(void *p, size_t len);
+
 // An unpredictable 64-bit value for protocol nonces and tokens (StreamStart
 // nonces, path challenges, address-validation secrets). Available in every
 // build: it uses the crypto backend's RNG when there is one and the
@@ -112,10 +116,16 @@ private:
 // with nonce  lane:2 || ctr:8 || dir:1 || 0x01.  Data nonces end in 0x0000,
 // so the two nonce spaces are disjoint even before the keys differ. `dir`
 // separates the two ends (0 = data sender, 1 = data receiver), which share
-// the key and the lane. The counter only has to be unique per sender;
-// replaying an old authentic control message is harmless (ACK bases only
-// move forward, and an abort can only be replayed if one was really sent).
+// the key and the lane.
+//
+// Replay. The counter is unique per sender and only grows, so the verifier
+// keeps a sliding window of the counters it has accepted (as an IPsec/DTLS
+// receiver does) and rejects any it has seen before, or any older than the
+// window. Replaying an authentic message is NOT harmless: one captured Nack
+// replayed every RTT would hold the sender's congestion window at its
+// floor, and an old Ack would re-advertise a stale (small) receive window.
 inline constexpr size_t kControlTrailerLen = 8 + kAeadTagLen;
+inline constexpr uint64_t kControlReplayWindow = 1024; // counters tracked behind the highest
 
 class ControlAuth {
 public:
@@ -132,15 +142,24 @@ public:
     // room for len + kControlTrailerLen). Returns the new length, 0 on failure.
     size_t seal(uint8_t *dg, size_t len, size_t cap);
 
-    // Verifies a received datagram's trailer. On success returns true and
-    // sets *body_len to the datagram length without the trailer.
-    bool open(const uint8_t *dg, size_t len, size_t *body_len) const;
+    // Verifies a received datagram's trailer and that its counter has not
+    // been accepted before (see "Replay" above); an authentic datagram is
+    // accepted at most once. On success returns true and sets *body_len to
+    // the datagram length without the trailer.
+    bool open(const uint8_t *dg, size_t len, size_t *body_len);
 
 private:
+    // True (and the counter recorded) if `ctr` is new and within the window.
+    bool accept_counter(uint64_t ctr);
+
     std::unique_ptr<LaneCipher> cipher_;
     uint16_t lane_ = 0;
     uint8_t dir_ = 0;
     uint64_t next_ctr_ = 1;
+    // Replay window: highest counter accepted, and a bitmap of the
+    // kControlReplayWindow counters at and below it (bit i = highest - i).
+    uint64_t highest_ctr_ = 0;
+    uint64_t seen_[kControlReplayWindow / 64] = {};
 };
 
 // Key usage limit (ROADMAP #21). One AES-GCM key must not protect an
@@ -162,10 +181,12 @@ bool derive_lane_epoch_key(const uint8_t session_key[kSessionKeyLen], uint16_t l
 class LaneKeySchedule {
 public:
     LaneKeySchedule() = default;
+    ~LaneKeySchedule();
     LaneKeySchedule(const LaneKeySchedule &) = delete;
     LaneKeySchedule &operator=(const LaneKeySchedule &) = delete;
 
     bool init(const uint8_t session_key[kSessionKeyLen], uint16_t lane);
+    bool ready() const { return ready_; }
 
     // The cipher for the epoch `seq` belongs to; nullptr if it could not be
     // derived (which callers must treat as an authentication failure).

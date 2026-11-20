@@ -251,16 +251,31 @@ bool MuxSender::run_setup_handshake() {
     size_t n = init_->start(out, sizeof(out), now_ns());
     if (n == 0 || !sock_.send_to(out, n, dst_)) return false;
 
-    const uint64_t deadline = now_ns() + static_cast<uint64_t>(cfg_.timeout_ms) * 1000000ull;
+    // Only datagrams from the responder's address take part in the
+    // handshake. A version-mismatch reply is unauthenticated, so it is a
+    // hint, not a verdict: it shortens the wait to one second and is
+    // reported only if the responder sends nothing in our version by then
+    // (see the same logic in transfer.cpp's send_lane).
+    uint64_t deadline = now_ns() + static_cast<uint64_t>(cfg_.timeout_ms) * 1000000ull;
+    bool version_hint = false, heard_responder = false;
     while (!init_->is_matched() && !init_->is_failed()) {
-        if (now_ns() > deadline) return false;
+        if (now_ns() > deadline) {
+            version_mismatch_ = version_hint && !heard_responder; // ROADMAP #11
+            return false;
+        }
         size_t got = 0;
         uint8_t peer_version = 0;
-        if (sock_.recv_from(in, sizeof(in), &got, nullptr)) {
-            if (decode_version_mismatch(in, got, &peer_version)) {
-                version_mismatch_ = true; // ROADMAP #11: say so, don't time out
-                return false;
+        PeerAddr from;
+        const bool received = sock_.recv_from(in, sizeof(in), &got, &from);
+        if (received && from == dst_ && decode_version_mismatch(in, got, &peer_version)) {
+            if (!heard_responder && !version_hint) {
+                version_hint = true;
+                deadline = std::min<uint64_t>(deadline, now_ns() + 1'000'000'000ull);
             }
+            n = 0;
+        } else if (received && from == dst_) {
+            MsgType mt;
+            if (peek_msg_type(in, got, &mt)) heard_responder = true;
             n = init_->on_datagram(in, got, out, sizeof(out), now_ns());
         } else {
             n = init_->on_timeout(out, sizeof(out), now_ns());
