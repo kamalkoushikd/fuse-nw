@@ -12,8 +12,9 @@ historical. The wire format as it exists today is documented in
 [PROTOCOL.md](PROTOCOL.md). Status below reflects what is actually built and
 verified by the test suite, not what is planned.
 
-*Last reviewed: 2026-10-24, at protocol version 8, project version 0.2.0. The
-protocol-core fixes made since the 2026-10-19 review are summarised under
+*Last reviewed: 2026-11-20, at protocol version 8 (unreleased), project
+version 0.2.0. The fixes made since the 2026-10-19 review, including a
+second review of the v8 code and the SDK/HTTP pass, are summarised under
 [Known protocol issues](#known-protocol-issues).*
 
 ## Implemented
@@ -46,7 +47,7 @@ The SDK, mux transfer and HTTP layers are built from this repo (targets
 `fuse::sdk`, `fuse::http`) but are not installed by it. They are released
 from [fuse-sdk](https://github.com/kamalkoushikd/fuse-sdk).
 
-The test suite has 206 tests with the crypto backend (184 without), all
+The test suite has 220 tests with the crypto backend (195 without), all
 passing, including under `ctest -j`.
 
 ### Key design points
@@ -95,8 +96,10 @@ jumbo-frame paths (see the IP fragmentation issue below).
 
 Found in a full code review on 2026-10-19 (numbers kept for reference). The
 protocol-core pass that followed fixed everything outside the socket-style
-SDK (`sdk.cpp`) and the HTTP mapping (`http.cpp`), which were deliberately
-left for their own pass. Each fix has its own commit, and tests next to it.
+SDK (`sdk.cpp`) and the HTTP mapping (`http.cpp`). Each fix has its own
+commit, and tests next to it. A second review on 2026-11-20 checked those
+fixes, found the problems listed as R1–R8 below, and fixed them together
+with the SDK and HTTP halves of the original list.
 
 ### Fixed in the protocol core (v8)
 
@@ -107,7 +110,7 @@ left for their own pass. Each fix has its own commit, and tests next to it.
 | 3 | Address migration without path validation (transfer) | `PathChallenge`/`PathResponse`: a new source must echo a random challenge before the peer address moves |
 | 5 | No session binding without encryption; replayable SETUP | Retry tokens bind a lane to a validated address; SETUP replies carry a fresh responder nonce the FINACK must echo |
 | 6 | No key confirmation (transfer) | The StreamStart's signature confirms the key; a mismatch returns `AuthFailed` at the handshake |
-| 7 | Block growth not MTU-aware | Growth capped at the route MTU (kernel-reported); a loss after growth sets a ceiling, re-probed DPLPMTUD-style |
+| 7 | Block growth not MTU-aware | **Partly.** Growth is capped at the route MTU the kernel reports, which is the first hop's, and a loss after growth sets a ceiling that is later re-probed. Nothing sets DF or probes the real path, so see "Still open" |
 | 8 | Window counted in blocks; no slow start | Window in configured-block bytes, capped by the path's largest block; opt-in slow start (used by transfer and mux) |
 | 9 | No flow control | ACKs carry `rwnd`; the transfer sender stays within it, and the receiver sends window updates |
 | 10 | SACK bitmask discarded | `apply_ack()` releases SACKed blocks; RTO resends the base plus known holes |
@@ -134,26 +137,60 @@ byte-identical), against the v7 code: 2% loss 81 → 220 MB/s, 5% loss
 6.7 → 5.6 MB/s (the window no longer inflates with block size, #8);
 jitter and reordering unchanged. Loopback throughput is unchanged.
 
+### Fixed in the second pass (2026-11-20)
+
+Problems in the v8 code itself, found by the second review:
+
+| # | Issue | Fix |
+|---|---|---|
+| R1 | One forged 3-byte version-mismatch reply, from any address, aborted any transfer or mux handshake, even under a PSK (the reply is unauthenticated and the sender sockets are unconnected) | It's now a hint. It counts only from the receiver's address, shortens the handshake to 1 s, and yields `VersionMismatch` only if the receiver sent nothing in our version by then. Mux SETUP also ignores replies from other addresses |
+| R2 | Signed control messages could be replayed: a captured Nack replayed every RTT pinned the sender's window at its floor, and an old Ack re-advertised a stale `rwnd` | `ControlAuth` keeps a 1024-counter sliding replay window, and each counter is accepted once. FileDigest resends are re-signed (they used to reuse one signature, which the window would now drop) |
+| R3 | A forged data block for an in-window seq held that seq's dispatch slot while a consumer rejected it, so the genuine copy arriving meanwhile was dropped and NACKed | Under a PSK, blocks from a source other than the validated peer are authenticated on the reader before they're queued |
+| R4 | `receive_buffer` zero-filled whatever size `StreamStart` claimed (on Linux that means the OOM killer, not `bad_alloc`), and `receive_file` sized the `.part` to it | `TransferConfig::max_receive_bytes`. The default is half of RAM (buffer) or the free disk space (file). A larger claim fails with `ResourceLimit` |
+| R5 | `<path>.part` was opened following symlinks, at mode 0644. In a shared directory a planted symlink or hard link redirected the write, and decrypted data was world-readable | `O_NOFOLLOW`, `O_CREAT\|O_EXCL`, mode `0600`. An existing `.part` must be a regular, singly linked file owned by us |
+| R6 | Session and epoch keys left in memory | Wiped on every exit path (`secure_zero`, also HKDF's PRK) |
+| R7 | The SDK still used one AES-GCM key per connection (#21, SDK half) | Same per-epoch data keys as the transfer API. Out-of-window blocks are dropped before decryption, so forged far-off seqs can't force key derivations |
+| R8 | A plaintext SDK block with an offset near 64 MiB grew the reassembly buffer to 64 MiB | Block `seq` must sit at `(seq − first_seq) × 1200` |
+
+The SDK and HTTP halves of the original list:
+
+| # | Issue | Fix |
+|---|---|---|
+| 1 (SDK) | GCM nonce reuse on every SDK retransmission | Retransmission bit masked out of the AAD |
+| 2 (SDK) | SDK control messages unauthenticated | Ack, Nack, Close, Heartbeat and path probes are signed and replay-checked under a PSK. In plaintext they're only acted on from the peer's address (a 2-byte Close from anywhere used to end a connection) |
+| 3 (SDK) | SDK re-anchored its peer on any Ack, Nack or new block | Path validation: the address moves only after the new source answers a challenge |
+| 12 | No liveness on idle SDK connections | Heartbeat every second while idle. A peer silent for `max(timeout_ms, 3 s)` is lost, and blocked calls return `FUSE_ERR_TIMEOUT` |
+| 27 | `fuse_close` freed the connection after 2 s even with a caller inside | Reference counted: the last thread out frees it |
+| 28 (SDK) | SDK PSK taken through `strlen` | `fuse_config::pre_shared_key_len` for binary keys |
+| 29 | HTTP header injection, timeout scope, reason truncation, `user_data` lifetime, serve status, no tests | Method, path, headers and reason are checked against the RFC 9110 grammar (a request is refused with `FUSE_ERR_CONFIG`, a bad handler response becomes a 500, a malformed received header block is rejected). `timeout_ms` is a budget for connect + send + receive. The status line is built as a string. `fuse_http_serve` waits for in-flight handlers and reports accept failures. `tests/proto/test_http.cpp` covers this |
+| 4 (part) | Unauthenticated clients could hold server threads forever | Not fixed (see below), but bounded: heartbeats end a connection whose client never answers, `fuse_http_serve` gives each connection `timeout_ms` to send its request, and it serves at most 256 at once |
+
 ### Still open
 
-**Socket-style SDK and HTTP mapping (next pass).** These were left untouched
-on purpose, and still have:
+**Socket-style SDK, needing redesign rather than a fix:**
 
-- #1 (SDK half): `retransmit_locked` re-seals with the retransmission bit in
-  the AAD, so the **SDK still has the GCM nonce-reuse flaw**.
-- #2, #3 (SDK half): SDK control messages are unauthenticated, and the SDK
-  re-anchors its peer on any Ack, Nack or Close.
-- #4: the SDK server never authenticates the client and allocates per HELLO.
-- #12: no liveness on idle SDK connections (Heartbeat is never sent).
+- #4: the SDK server still allocates a socket, a connection and a thread for
+  every HELLO, before the client proves anything. That is now bounded in
+  time (heartbeats) and, for HTTP, in count, but not prevented. The fix is a
+  stateless cookie exchange (like the transfer's `Retry`), plus a
+  client-side key proof before `fuse_accept` returns.
 - #13: the SDK is stop-and-wait per message.
 - #26: about 17 MB per SDK connection (its registry slots embed 16 KiB
   payloads while it only sends 1200-byte blocks).
-- #27: `fuse_close` deletes after 2 s even if a caller is still inside.
-- #28 (SDK half): `fuse_connect` takes the PSK through `strlen`.
-- #29: HTTP header injection, timeout scope, reason truncation, detached
-  threads, `fuse_http_serve` status, and no HTTP tests.
+- In plaintext, SDK path validation only proves that the new address can
+  receive. An attacker sending from their own address, who guesses the
+  connection's port and an in-window sequence number, can still inject data
+  or move the connection. Plaintext has no integrity at all; use a PSK.
 
 **Protocol core, needing redesign rather than a fix:**
+
+- #7 (rest): real path-MTU discovery. Setting DF (`IP_PMTUDISC_PROBE`)
+  alone is not safe: a block too large for the path would then be dropped
+  on every retransmission, because a stored block can't be re-cut smaller,
+  and the transfer would stall. Doing it properly needs DPLPMTUD probe
+  packets (RFC 8899) that are separate from data, or re-chunkable
+  retransmissions. Until then, block growth past ~1450 bytes is only safe
+  where the first hop's MTU is the path's (loopback, a single LAN segment).
 
 - #8 (part): every lane still runs its own controller, so N lanes compete
   like N flows on a shared bottleneck. That is the per-stream design premise.
