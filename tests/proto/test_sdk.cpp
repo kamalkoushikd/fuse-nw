@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <sys/socket.h>
+#include <sys/time.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -9,6 +12,7 @@
 #include <vector>
 
 #include "fuse/proto/block.hpp"
+#include "fuse/proto/control.hpp"
 #include "fuse/proto/udp.hpp"
 #include "fuse/sdk.h"
 #include "test_ports.hpp"
@@ -499,6 +503,105 @@ TEST(Sdk, ConcurrentSendsDoNotCorruptMessages) {
     fuse_close(srv);
 }
 
+// In plaintext a Close (or Ack/Nack) is only listened to from the peer's
+// own address: a 2-byte Close from anywhere else used to end the
+// connection for anyone who guessed its port.
+TEST(Sdk, CloseFromAnotherAddressIsIgnored) {
+    using namespace fuse::proto;
+    Server s;
+    fuse_conn *srv = nullptr;
+    std::thread acceptor([&] { srv = fuse_accept(s.l, 5000, nullptr); });
+    fuse_conn *cli = client_connect(s.port, nullptr, nullptr);
+    acceptor.join();
+    ASSERT_NE(cli, nullptr);
+    ASSERT_NE(srv, nullptr);
+
+    uint16_t target_port = 0;
+    ASSERT_EQ(fuse_conn_peer(cli, nullptr, 0, &target_port), FUSE_OK);
+    UdpSocket atk;
+    ASSERT_TRUE(atk.open("127.0.0.1", 0));
+    PeerAddr dst;
+    ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", target_port, &dst));
+    const uint8_t bye[2] = {kProtocolVersion, static_cast<uint8_t>(MsgType::Close)};
+    for (int i = 0; i < 5; ++i) ASSERT_TRUE(atk.send_to(bye, sizeof(bye), dst));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    EXPECT_EQ(fuse_conn_is_closed(srv), 0);
+    const std::string msg = "still open";
+    ASSERT_EQ(fuse_send(cli, msg.data(), msg.size()), FUSE_OK);
+    char buf[64];
+    size_t n = 0;
+    ASSERT_EQ(fuse_recv(srv, buf, sizeof(buf), &n, 5000), FUSE_OK);
+    EXPECT_EQ(std::string(buf, n), msg);
+    fuse_close(cli);
+    fuse_close(srv);
+}
+
+// ROADMAP #12: a peer that vanishes without a Close is noticed. A fake
+// server completes the handshake and then never sends again; the client's
+// fuse_recv(-1) must give up instead of waiting forever.
+TEST(Sdk, SilentPeerIsDetected) {
+    using namespace fuse::proto;
+    UdpSocket fake;
+    const uint16_t port = next_port();
+    ASSERT_TRUE(fake.open("127.0.0.1", port));
+    std::thread server([&] {
+        uint8_t in[256];
+        size_t n = 0;
+        PeerAddr from;
+        timeval tv{5, 0};
+        setsockopt(fake.fd(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        if (!fake.recv_from(in, sizeof(in), &n, &from)) return;
+        uint8_t ack[2 + 16 + 24] = {kProtocolVersion, static_cast<uint8_t>(MsgType::HelloAck)};
+        fake.send_to(ack, sizeof(ack), from); // plaintext: zero salt, zero proof
+    });
+
+    fuse_config cfg;
+    fuse_config_init(&cfg);
+    cfg.host = "127.0.0.1";
+    cfg.port = port;
+    cfg.timeout_ms = 500; // the dead-peer interval is at least 3 s anyway
+    fuse_status err = FUSE_OK;
+    fuse_conn *cli = fuse_connect(&cfg, &err);
+    server.join();
+    ASSERT_NE(cli, nullptr) << fuse_strerror(err);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    char buf[16];
+    size_t n = 0;
+    EXPECT_EQ(fuse_recv(cli, buf, sizeof(buf), &n, -1), FUSE_ERR_TIMEOUT);
+    const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+    EXPECT_GE(waited, 2500);
+    EXPECT_LT(waited, 6000);
+    EXPECT_NE(fuse_conn_is_closed(cli), 0);
+    fuse_close(cli);
+}
+
+// An idle but healthy connection is kept alive by heartbeats: neither side
+// declares the other lost while both are merely waiting.
+TEST(Sdk, IdleConnectionStaysAlive) {
+    Server s;
+    fuse_conn *srv = nullptr;
+    std::thread acceptor([&] { srv = fuse_accept(s.l, 5000, nullptr); });
+    fuse_conn *cli = client_connect(s.port, nullptr, nullptr);
+    acceptor.join();
+    ASSERT_NE(cli, nullptr);
+    ASSERT_NE(srv, nullptr);
+    char buf[16];
+    size_t n = 0;
+    // Longer than the dead-peer interval (5 s timeout here).
+    EXPECT_EQ(fuse_recv(srv, buf, sizeof(buf), &n, 6000), FUSE_ERR_TIMEOUT);
+    EXPECT_EQ(fuse_conn_is_closed(srv), 0);
+    EXPECT_EQ(fuse_conn_is_closed(cli), 0);
+    const std::string msg = "after a long silence";
+    ASSERT_EQ(fuse_send(cli, msg.data(), msg.size()), FUSE_OK);
+    ASSERT_EQ(fuse_recv(srv, buf, sizeof(buf), &n, 5000), FUSE_ERR_BUFFER);
+    fuse_close(cli);
+    fuse_close(srv);
+}
+
 #if FUSE_PROTO_WITH_DTLS
 
 TEST(Sdk, EncryptedRoundTrip) {
@@ -552,6 +655,95 @@ TEST(Sdk, WrongKeyIsRejectedAtConnect) {
     EXPECT_EQ(cli, nullptr) << "a mismatched pre-shared key must not connect";
     EXPECT_EQ(err, FUSE_ERR_AUTH);
     if (cli) fuse_close(cli);
+}
+
+// Under a PSK, control messages must be signed: an unsigned Close, Ack or
+// Nack -- even one from the peer's own address -- changes nothing.
+TEST(Sdk, UnsignedControlIsIgnoredUnderPsk) {
+    using namespace fuse::proto;
+    const char *psk = "control-signing-test-key";
+    Server s(psk);
+    fuse_conn *srv = nullptr;
+    std::thread acceptor([&] { srv = fuse_accept(s.l, 5000, nullptr); });
+    fuse_conn *cli = client_connect(s.port, psk, nullptr);
+    acceptor.join();
+    ASSERT_NE(cli, nullptr);
+    ASSERT_NE(srv, nullptr);
+
+    uint16_t target_port = 0;
+    ASSERT_EQ(fuse_conn_peer(cli, nullptr, 0, &target_port), FUSE_OK);
+    UdpSocket atk;
+    ASSERT_TRUE(atk.open("127.0.0.1", 0));
+    PeerAddr dst;
+    ASSERT_TRUE(UdpSocket::resolve("127.0.0.1", target_port, &dst));
+    const uint8_t bye[2] = {kProtocolVersion, static_cast<uint8_t>(MsgType::Close)};
+    Ack ack;
+    ack.stream_id = 0;
+    ack.base_seq_no = 1000;
+    uint8_t abuf[512];
+    const size_t an = encode_ack(ack, abuf, sizeof(abuf));
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_TRUE(atk.send_to(bye, sizeof(bye), dst));
+        ASSERT_TRUE(atk.send_to(abuf, an, dst));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(fuse_conn_is_closed(srv), 0);
+
+    const std::string msg = make_payload(5000);
+    ASSERT_EQ(fuse_send(srv, msg.data(), msg.size()), FUSE_OK);
+    void *got = nullptr;
+    size_t n = 0;
+    ASSERT_EQ(fuse_recv_alloc(cli, &got, &n, 5000), FUSE_OK);
+    EXPECT_EQ(std::string(static_cast<char *>(got), n), msg);
+    fuse_free(got);
+    fuse_close(cli);
+    fuse_close(srv);
+}
+
+// ROADMAP #28: a binary key may contain NUL bytes; every byte counts.
+TEST(Sdk, BinaryPreSharedKeyWithNulBytes) {
+    static const char key[] = {'k', '\0', 'e', 'y', '-', 'w', 'i', 't', 'h',
+                               '-', 'n', 'u', 'l', '\0', '!', '!'};
+    static const char other[] = {'k', '\0', 'X', 'X', 'X', 'X', 'X', 'X', 'X',
+                                 'X', 'X', 'X', 'X', '\0', 'X', 'X'};
+    for (const bool same : {true, false}) {
+        fuse_config scfg;
+        fuse_config_init(&scfg);
+        scfg.bind_address = "127.0.0.1";
+        scfg.port = next_port();
+        scfg.pre_shared_key = key;
+        scfg.pre_shared_key_len = sizeof(key);
+        scfg.timeout_ms = 2000;
+        fuse_listener *l = fuse_listen(&scfg, nullptr);
+        ASSERT_NE(l, nullptr);
+        fuse_conn *srv = nullptr;
+        std::thread acceptor([&] { srv = fuse_accept(l, 2000, nullptr); });
+        fuse_config ccfg;
+        fuse_config_init(&ccfg);
+        ccfg.host = "127.0.0.1";
+        ccfg.port = scfg.port;
+        ccfg.pre_shared_key = same ? key : other; // equal up to the first NUL
+        ccfg.pre_shared_key_len = sizeof(key);
+        ccfg.timeout_ms = 2000;
+        fuse_status err = FUSE_OK;
+        fuse_conn *cli = fuse_connect(&ccfg, &err);
+        acceptor.join();
+        if (same) {
+            ASSERT_NE(cli, nullptr) << fuse_strerror(err);
+            const std::string msg = "binary keys work";
+            ASSERT_EQ(fuse_send(cli, msg.data(), msg.size()), FUSE_OK);
+            char buf[64];
+            size_t n = 0;
+            ASSERT_EQ(fuse_recv(srv, buf, sizeof(buf), &n, 2000), FUSE_OK);
+            EXPECT_EQ(std::string(buf, n), msg);
+        } else {
+            EXPECT_EQ(cli, nullptr);
+            EXPECT_EQ(err, FUSE_ERR_AUTH);
+        }
+        fuse_close(cli);
+        fuse_close(srv);
+        fuse_listener_close(l);
+    }
 }
 
 #endif // FUSE_PROTO_WITH_DTLS

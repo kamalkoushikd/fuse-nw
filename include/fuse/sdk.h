@@ -102,8 +102,19 @@ typedef struct fuse_config {
     const char *pre_shared_key;
 
     /* How long an operation waits before giving up. 0 selects the default
-     * (10s). Individual calls can override with their own timeout. */
+     * (10s). Individual calls can override with their own timeout. A peer
+     * that has sent nothing at all (connections exchange a heartbeat every
+     * second while idle) for max(timeout_ms, 3s) is treated as gone: blocked
+     * calls then return FUSE_ERR_TIMEOUT. */
     uint32_t timeout_ms;
+
+    /* Length of pre_shared_key in bytes, for binary keys that may contain
+     * NUL bytes. 0 (the default) means pre_shared_key is a NUL-terminated
+     * string. Use at least 16 bytes of real randomness, never a password.
+     * Under a key, control messages (acks, closes, heartbeats) are signed
+     * too, and the peer's address only changes after it answers a
+     * challenge. */
+    size_t pre_shared_key_len;
 } fuse_config;
 
 /* Fills cfg with defaults. Always call this first, then override fields —
