@@ -1,0 +1,237 @@
+\chapter{Wire Format}\label{ch:wire}
+
+This chapter specifies the datagrams Fuse exchanges. The normative description is \code{docs/PROTOCOL.md} in
+the repository~\cite{repo}; here we explain the purpose of each field and the code that reads it. All
+multi-byte integers are big-endian and all sizes are in bytes.
+
+\section{Outer header and message types}
+
+Every datagram begins with a two-byte outer header, \code{[version:1][msg_type:1]}. A receiver rejects any
+datagram whose version it does not understand before it interprets a single further byte. A receive loop
+dispatches on the message type by peeking at the header alone. Table~\ref{tab:msgtypes} lists the message types.
+
+\begin{table}[H]
+\centering\small
+\caption{Message types (\texttt{wire.hpp}). Sizes exclude the 24-byte authentication trailer (Section~\ref{sec:wirecrypto}).}\label{tab:msgtypes}
+\begin{tabular}{rllll}
+\toprule
+\textbf{Type} & \textbf{Name} & \textbf{Direction} & \textbf{Used by} & \textbf{Size} \\
+\midrule
+0 & DATA & sender $\to$ receiver & all & $31+\text{payload}$ \\
+1 & HEARTBEAT & either & none (defined only) & 12 \\
+2 & ACK & receiver $\to$ sender & all & 160 \\
+3 & NACK & receiver $\to$ sender & all & $6+8n$ \\
+4 & SETUP\_DATA & initiator $\to$ responder & mux & $7+9s+2+\text{ext}$ \\
+5 & SETUP\_HASH\_REPLY & responder $\to$ initiator & mux & 18 \\
+6 & SETUP\_FINACK & initiator $\to$ responder & mux & 18 \\
+7 & STREAM\_START & sender $\to$ receiver & transfer, mux & $80+\text{ext}$ \\
+8 & HELLO & client $\to$ server & SDK & 26 \\
+9 & HELLO\_ACK & server $\to$ client & SDK & 42 \\
+10 & CLOSE & either & SDK & 2 \\
+11 & STREAM\_CLOSE & either & transfer & 13 \\
+12 & RESUME\_RANGES & receiver $\to$ sender & transfer & $19+16n$ \\
+13 & FILE\_DIGEST & both (echoed) & transfer & 44 \\
+14 & RETRY\vviii & receiver $\to$ sender & transfer & 20 \\
+15 & PATH\_CHALLENGE\vviii & either & transfer & 20 \\
+16 & PATH\_RESPONSE\vviii & either & transfer & 20 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Version mismatch\vviii}
+
+Before version~8, a datagram carrying an unknown version was met with silence, and the peer's user eventually
+saw only a timeout. A receiver now answers such a datagram, at most once per 100~ms, with a three-byte reply
+\code{[our_version][0xFF][our_version]}. This layout is fixed permanently, independently of the protocol
+version, so any future version can recognise it.
+\begin{itemize}
+  \item The reply is never larger than the datagram that triggered it, so it cannot be used to amplify an attack.
+  \item A mismatch reply is itself never answered; otherwise two mismatched peers would exchange replies forever.
+  \item The bulk-transfer and multiplexed senders report the condition as \code{VersionMismatch}.
+\end{itemize}
+
+\subsection{Extensions\vviii}
+
+STREAM\_START and SETUP\_DATA end in an extension area,
+\code{[ext_len:2]} followed by entries \code{[type:2][len:2][value]}, at most 256 bytes in total. The
+rules are:
+\begin{itemize}
+  \item a receiver ignores extension types it does not know;
+  \item it refuses the whole message if it finds an unknown \emph{critical} type (top bit set,
+    $\mathit{type}\ge\text{0x8000}$);
+  \item version~8 defines no types, so every critical type is refused today.
+\end{itemize}
+Before this mechanism, any new field required a version change, and a version change breaks interoperability
+outright. A type-length-value area with a critical bit is the established remedy, used by IPv6 options, TLS
+extensions and QUIC transport parameters~\cite{rfc9000}.
+
+\section{Data plane}
+
+\subsection{DATA}
+
+\begin{lstlisting}
+[version:1][type=0:1]
+[stream_id:2][seq_no:8][flags:1][payload_len:2][offset:8]      21-byte block header
+[send_time_ns:8]                                               echoed for RTT measurement
+[payload: payload_len bytes]                                   ciphertext + 16-byte tag under a PSK
+\end{lstlisting}
+
+The fields are:
+\begin{itemize}
+  \item \code{stream_id} identifies the lane, stream or direction.
+  \item \code{seq_no} is per stream, starts at zero and is never reused; a retransmission keeps its original
+    number.
+  \item \code{flags} has two bits: 0x01 marks a retransmission, 0x02 marks the last block of a stream.
+  \item \code{payload_len} is at most 16,384 and includes the authentication tag when encrypted.
+  \item \code{offset} is the block's byte position within its stream. It has been carried explicitly since
+    version~2 because the block size changes during a transfer, so it cannot be derived from the sequence
+    number.
+\end{itemize}
+
+The 31-byte prefix plus the default 1,200-byte payload, the 28 bytes of IPv4 and UDP headers and a 16-byte tag
+come to 1,275 bytes, safely below a 1,500-byte MTU.
+
+\code{send_time_ns} is the sender's clock \emph{plus a random per-stream offset}\vviii. Only the sender ever
+interprets the value; the receiver merely echoes it. Placing the raw monotonic clock on the wire would reveal
+the host's uptime to any observer. The round-trip time is computed as a wrap-safe difference in the same offset
+domain, and an echo from the future or older than one minute is discarded.
+
+\subsection{ACK}
+
+\begin{lstlisting}
+[outer][stream_id:2][base_seq_no:8][received_bitmask:16 x 8][echoed_send_time:8][nonce:8][rwnd:4]
+\end{lstlisting}
+
+\begin{itemize}
+  \item \code{base_seq_no} is cumulative: every block below it has been received and written.
+  \item Bit $i$ of the 1,024-bit \code{received_bitmask} reports block $\mathit{base}+i$. This is the selective
+    part of the acknowledgement.
+  \item \code{echoed_send_time} is the send time of the highest-numbered block accepted so far.
+  \item \code{nonce} echoes the StreamStart nonce, so that a stale acknowledgement from an earlier session on
+    the same port cannot confirm a new one.
+  \item \code{rwnd}\vviii{} is the number of further unacknowledged blocks the receiver can currently hold;
+    0xFFFFFFFF means unlimited.
+\end{itemize}
+
+\subsection{NACK and HEARTBEAT}
+
+A NACK, \code{[outer][stream_id:2][count:2][missing_seq_no:8]}$\times$\code{count}, names up to 1,024
+missing sequence numbers. Its length is bounded by the window, because nothing outside the window can be
+tracked, so a full-window NACK (8,198 bytes) is the largest control datagram and receive buffers are sized for
+it. A HEARTBEAT, \code{[outer][stream_id:2][highest_seq_no:8]}, is defined but never sent today, so idle SDK
+connections have no liveness signal (Chapter~\ref{ch:conclusion}).
+
+\section{Bulk-transfer control messages}
+
+\begin{table}[H]
+\centering\small
+\caption{STREAM\_START (80 bytes plus extensions).}\label{tab:streamstart}
+\begin{tabularx}{\linewidth}{lcX}
+\toprule
+\textbf{Field} & \textbf{Size} & \textbf{Meaning} \\
+\midrule
+\code{stream_id} & 2 & lane index \\
+\code{total_blocks} & 8 & always 0 from the transfer API (the block size adapts) \\
+\code{block_size} & 2 & initial block size \\
+\code{total_bytes} & 8 & length of this lane's shard \\
+\code{session_salt} & 16 & HKDF salt; all zero means unencrypted \\
+\code{nonce} & 8 & random per lane and attempt; echoed in every reply \\
+\code{stream_base_offset} & 8 & where the shard sits in the whole file \\
+\code{file_total_bytes} & 8 & size of the whole transfer \\
+\code{file_id} & 8 & identity of the file, for resume; 0 means not resumable \\
+\code{token} & 8 & address-validation token from the receiver's RETRY; 0 on the first attempt\vviii \\
+\code{ext_len} + ext & $2+n$ & extension area\vviii \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{description}[style=nextline,leftmargin=1.2cm]
+  \item[RETRY (20 bytes)\vviii] \code{[stream_id:2][nonce:8][token:8]}. It is deliberately smaller than the
+    StreamStart it answers, so a spoofed source address gains no amplification.
+  \item[PATH\_CHALLENGE, PATH\_RESPONSE (20 bytes each)\vviii] \code{[stream_id:2][nonce:8][challenge:8]}; the
+    response echoes the challenge.
+  \item[RESUME\_RANGES ($19+16n$ bytes)] \code{[stream_id:2][nonce:8][flags:1][part:2][parts:2][count:2]}
+    followed by \code{count} pairs \code{(offset:8, length:8)}. The pairs are the parts of the lane the
+    receiver still needs, relative to the stream. A long list is split across datagrams of at most 64 ranges
+    each, about 1~KB. Flag 0x01 means the transfer is resuming. A fresh transfer answers with one range covering
+    the whole lane.
+  \item[STREAM\_CLOSE (13 bytes)] \code{[stream_id:2][nonce:8][reason:1]}. The reason is 0 for finished, 1 for
+    aborted, or 2 for authentication failed\vviii. The message is sent three times and never acknowledged.
+  \item[FILE\_DIGEST (44 bytes)] \code{[stream_id:2][nonce:8][digest:32]}. It is sent on lane~0 at the end of a
+    resumed transfer, and the receiver's echo serves as the acknowledgement.
+\end{description}
+
+\section{SDK and SETUP messages}
+
+\begin{itemize}
+  \item \textbf{HELLO} (26 bytes, \code{salt_c:16, challenge:8}) arrives on the server's listen port.
+  \item \textbf{HELLO\_ACK} (42 bytes, \code{salt_s:16, proof:24}) is sent from a fresh per-connection socket.
+    Under a pre-shared key, the proof is the client's challenge sealed with the new session key, which shows the
+    server holds the key. The client adopts the source address of the HELLO\_ACK as its peer. This is how a
+    single listen port serves many connections without connection identifiers, as in TFTP~\cite{rfc1350}.
+  \item \textbf{CLOSE} (2 bytes) is a graceful teardown.
+\end{itemize}
+
+SETUP\_DATA carries:
+\begin{itemize}
+  \item \code{[protocol_version:1][num_workers:2][num_streams:2]};
+  \item then, for each of at most 64 streams, \code{[stream_id:2][worker_id:2][flags:1][block_size:2][window_size:2]};
+  \item then the extension area\vviii.
+\end{itemize}
+The stream flags are 0x01 \code{LOSSLESS}, 0x02 \code{ORDERED} and 0x04 \code{COALESCE}. SETUP\_HASH\_REPLY and
+SETUP\_FINACK both carry \code{[hash:8][responder_nonce:8]}. The hash is FNV-1a-64~\cite{fnv} of the SETUP body
+exactly as the responder received it. The responder nonce\vviii{} is drawn fresh for each configuration offered,
+and the FINACK must echo it.
+
+\section{Encryption on the wire}\label{sec:wirecrypto}
+
+Table~\ref{tab:crypto} summarises the cryptographic constructions of the bulk-transfer path.
+
+\begin{table}[H]
+\centering\small
+\caption{Cryptographic constructions (\texttt{session\_crypto.cpp}, \texttt{transfer.cpp}).}\label{tab:crypto}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{2.7cm}X}
+\toprule
+\textbf{Item} & \textbf{Construction} \\
+\midrule
+Session key & HKDF-SHA256~\cite{rfc5869}: Extract(salt, PSK), then Expand-Label(\code{"fuse2 "}, \code{"session key"}, empty context, 32 bytes). The salt is the StreamStart salt (transfer) or $\mathit{salt}_c\,\|\,\mathit{salt}_s$ (SDK). \\
+Data key\vviii & Expand-Label(session key, \code{"lane key"}, $\mathit{lane}{:}2\,\|\,(\mathit{seq}\gg22){:}8$) \\
+Control key\vviii & Expand-Label(session key, \code{"control key"}, empty) \\
+DATA AEAD & AES-256-GCM~\cite{nist-gcm}. Nonce $=\mathit{lane}{:}2\,\|\,\mathit{seq}{:}8\,\|\,\text{0x0000}$. AAD $=\mathit{lane}\,\|\,\mathit{seq}\,\|\,\mathit{offset}\,\|\,\mathit{flags}$, with the retransmission bit cleared\vviii. The 16-byte tag follows the ciphertext. \\
+Control trailer\vviii & $\mathit{ctr}{:}8\,\|\,\mathit{tag}{:}16$ appended to every control datagram except RETRY, the version-mismatch reply and STREAM\_CLOSE(reason~2). The tag is a GMAC (GCM with empty plaintext) over the whole datagram including \code{ctr}. Nonce $=\mathit{lane}{:}2\,\|\,\mathit{ctr}{:}8\,\|\,\mathit{dir}{:}1\,\|\,\text{0x01}$, where $\mathit{dir}$ is 0 for the data sender and 1 for the data receiver. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent Three properties keep the nonce spaces disjoint:
+\begin{itemize}
+  \item data nonces end in 0x0000 and control nonces in 0x01, so the two spaces cannot meet even before the keys
+    differ;
+  \item the direction byte separates the two endpoints, which share the key and the lane;
+  \item a pair $(\mathit{lane},\mathit{seq})$ never repeats within a session, and the session key is fresh for
+    every salt.
+\end{itemize}
+
+\section{Constants}
+
+\begin{table}[H]
+\centering\small
+\caption{Constants worth remembering.}\label{tab:constants}
+\begin{tabular}{llr>{\raggedright\arraybackslash}p{5.6cm}}
+\toprule
+\textbf{Constant} & \textbf{Defined in} & \textbf{Value} & \textbf{Meaning} \\
+\midrule
+\code{kProtocolVersion} & \code{wire.hpp} & 8 & first byte of every datagram \\
+\code{kDefaultPayloadSize} & \code{wire.hpp} & 1,200 & safe under a 1,500-byte MTU \\
+\code{kMaxPayloadSize} & \code{wire.hpp} & 16,384 & block growth ceiling \\
+\code{kMaxWindow} & \code{wire.hpp} & 1,024 & blocks in flight per stream \\
+\code{kDataPrefixSize} & \code{wire.hpp} & 31 & DATA bytes before the payload \\
+\code{kMaxExtensionBytes} & \code{wire.hpp} & 256 & extension area limit \\
+\code{kMaxStreams} & \code{setup.hpp} & 64 & streams per SETUP \\
+\code{kDefaultSetupTimeoutNs} & \code{setup.hpp} & 50 ms & SETUP retransmission interval \\
+\code{kControlTrailerLen} & \code{session_crypto.hpp} & 24 & counter plus GMAC tag \\
+\code{kKeyEpochShift} & \code{session_crypto.hpp} & 22 & $2^{22}$ blocks per data key \\
+\code{kMinPreSharedKeyLen} & \code{transfer.cpp} & 16 & shorter keys are refused \\
+\bottomrule
+\end{tabular}
+\end{table}

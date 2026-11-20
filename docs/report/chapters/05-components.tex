@@ -1,0 +1,374 @@
+\chapter{Building Blocks of the Protocol Core}\label{ch:components}
+
+Each component below is a small class or set of functions in \code{include/fuse/proto/}, with its own test file
+in \code{tests/proto/}. None of them owns a thread or reads a clock.
+
+\section{UDP socket with batched I/O}\label{sec:udp}
+
+\code{UdpSocket} (\code{udp.hpp}) is a move-only wrapper around one bound UDP socket. Its receive buffers are
+large enough for the biggest datagram, so the kernel never truncates a block. Peer addresses are carried in an
+opaque, comparable \code{PeerAddr} that may hold an IPv4 or an IPv6 address.
+
+Its two batched operations carry the data path:
+
+\begin{description}[style=nextline,leftmargin=1.2cm]
+  \item[\code{send_segmented}] passes the kernel one buffer of back-to-back datagrams in a single
+    \code{sendmsg}, tagged with the \code{UDP_SEGMENT} control message (generic segmentation offload,
+    Linux~4.18)~\cite{gso}. The kernel or the network card cuts it into ordinary datagrams, so the wire sees
+    normal MTU-sized packets.
+    \begin{itemize}
+      \item If the kernel refuses the call (EIO, ENOTSUP or EINVAL), a flag latches and the caller falls back to
+        one \code{sendto} per datagram.
+      \item The bulk transfer caps a batch at 64 segments. With a small block size a batch could otherwise
+        exceed the kernel's per-call segment limit, and the resulting EINVAL cannot be told apart from ``this
+        route has no offload'', so offload would be disabled for the rest of the transfer.
+    \end{itemize}
+  \item[\code{recv_batch}] receives up to $N$ datagrams in one \code{recvmmsg}~\cite{recvmmsg} with
+    \code{MSG_WAITFORONE}, and records the source address of \emph{every} datagram.
+    \begin{itemize}
+      \item Without \code{MSG_WAITFORONE}, the call would block until all $N$ datagrams had arrived.
+      \item The per-datagram source address is what allows path validation to notice a NAT rebinding in the
+        middle of a batch.
+    \end{itemize}
+\end{description}
+
+One system call per datagram limits a modern host to about 213,000 datagrams per second whatever the link
+speed; batching amortises that cost.
+
+\code{path_mtu}\vviii{} connects a temporary socket to the destination and reads the kernel's route MTU
+(\code{IP_MTU} or \code{IPV6_MTU}). Together with the IP and UDP header overhead (28 bytes for IPv4, 48 for IPv6)
+it bounds how far the block size may grow. On macOS the MTU cannot be queried this way, so blocks do not grow
+there. Version~8 also opens each sending socket in the destination's address family; earlier versions always
+opened IPv4 sockets, which made IPv6 hosts unreachable.
+
+\section{Sender registry and selective acknowledgement}\label{sec:registry}
+
+The \code{SenderRegistry} is the store from which lost blocks are resent. It is a circular array of
+$W$ slots (the stream's window size) indexed by $\mathit{seq}\bmod W$. Each slot holds:
+\begin{itemize}
+  \item the sequence number, send time, byte offset and length;
+  \item the block's original flags and a validity bit;
+  \item the payload itself, embedded in a 16~KiB array.
+\end{itemize}
+
+The registry has three operations:
+\begin{itemize}
+  \item \code{store} overwrites the slot a sequence number maps to.
+  \item \code{lookup} returns the slot only if it is valid \emph{and} still holds exactly that sequence number.
+    Otherwise the requested block has already been confirmed or overwritten.
+  \item \code{confirm} releases a slot once an acknowledgement covers it.
+\end{itemize}
+The flags are stored because a retransmission must add the retransmission bit without losing the last-block
+bit: a retransmitted last block is still the last block, and the receiver has no other way to learn that the
+stream has ended.
+
+\paragraph{Applying an acknowledgement\vviii.} Every sender digests acknowledgements through one function,
+\code{apply_ack} (\code{registry.cpp:52}), which works in three steps:
+\begin{enumerate}
+  \item \emph{Cumulative part.} If the acknowledgement's base exceeds the sender's base, every slot up to
+    $\min(\mathit{ack.base}, \mathit{next\_seq})$ is confirmed. The clamp matters: an unauthenticated
+    acknowledgement must not confirm blocks that were never sent.
+  \item \emph{Selective part.} Every set bit $i$ of the bitmask, enumerated with a count-trailing-zeros
+    instruction, confirms block $\mathit{ack.base}+i$ if it is below \code{next_seq}.
+  \item \emph{Result.} The function returns the number of payload bytes newly confirmed, and raises
+    \code{received_end} to one past the highest block the acknowledgement shows as received.
+\end{enumerate}
+
+Before version~8 the bitmask was ignored, so burst losses were repaired by NACKs alone and blocks the receiver
+already held were resent. The \code{received_end} value lets the retransmission timer distinguish blocks that
+are lost (unacknowledged, below it) from blocks that may still be in flight (above it). This is the same
+distinction SACK-based recovery makes in TCP~\cite{rfc2018} and QUIC~\cite{rfc9002}.
+
+\section{Receiver window and loss detection}\label{sec:receiver}
+
+\code{ReceiverStream} tracks one incoming stream. Its state is:
+\begin{itemize}
+  \item a base sequence number, below which everything has been delivered;
+  \item a bitmask of received blocks;
+  \item the highest sequence number seen, and the send time to echo;
+  \item two timers per window position: when the gap at that position was first seen, and when it was last
+    reported.
+\end{itemize}
+In version~8 the bitmask and the timers are \emph{rings} indexed by $\mathit{seq}\bmod 1024$
+(Figure~\ref{fig:ring}). Earlier versions shifted whole arrays every time the base moved, which made each
+receive $O(W)$.
+
+\begin{figure}[H]
+\centering
+\fitwidth{\begin{tikzpicture}[x=6.2mm,y=6.2mm,font=\footnotesize]
+  \foreach \i/\c in {0/green!35,1/green!35,2/white,3/green!35,4/green!35,5/white,6/white,7/green!35,8/white,9/white,10/white,11/white,12/white,13/white,14/white,15/white}{
+    \draw[fill=\c] (\i,0) rectangle ++(1,1);
+  }
+  \node at (2.5,0.5) {\textbf{?}}; \node at (5.5,0.5) {\textbf{?}}; \node at (6.5,0.5) {\textbf{?}};
+  \draw[arr] (2.5,-1.3) node[below,lbl]{base\\(first gap)} -- (2.5,-0.1);
+  \draw[arr] (7.5,2.3) node[above,lbl]{highest received} -- (7.5,1.1);
+  \draw[decorate,decoration={brace,amplitude=4pt,mirror}] (2,-0.15) -- (8,-0.15) node[midway,below=5pt,lbl]{gaps eligible for NACK after the reorder delay};
+  \draw[decorate,decoration={brace,amplitude=4pt}] (0,1.15) -- (16,1.15) node[midway,above=5pt,lbl] {ring of 1,024 bits, position $=\mathit{seq}\bmod 1024$ (16 shown)};
+\end{tikzpicture}}
+\caption{The receive window. Green positions have arrived. The base sits on the first gap; positions between
+the base and the highest block received are candidate losses.}\label{fig:ring}
+\end{figure}
+
+\paragraph{Receiving a block.} \code{on_receive} (\code{receiver.cpp:135}) handles one arriving sequence
+number:
+\begin{enumerate}
+  \item Below the base, it returns \emph{Duplicate}.
+  \item A full window or more beyond the base, it returns \emph{OutOfWindow} and counts the overflow.
+  \item Already marked received, it returns \emph{Duplicate}.
+  \item Otherwise it marks the block received. If the block is a new highest, every position between the
+    previous highest and this block has just become a gap, and each gets its first-missing timestamp, exactly
+    once.
+  \item Finally it slides the base over the contiguous received prefix, clearing each bit and both timers
+    exactly once as it passes. This keeps the invariant that positions below the base are always clear, which
+    is what makes the ring unambiguous.
+\end{enumerate}
+Each position is touched a constant number of times over its life, so receiving is $O(1)$ amortised. The
+relative bitmask an acknowledgement needs, in which bit $i$ means $\mathit{base}+i$, is assembled from the ring
+word by word with two shifts per word.
+
+\paragraph{Reporting losses.} \code{collect_nacks} walks the clear bits between the base and the highest block
+received, a word at a time. It reports a gap only if two conditions hold:
+\begin{itemize}
+  \item the gap has lasted longer than a \emph{reorder delay};
+  \item the gap was not reported within a \emph{re-NACK interval}.
+\end{itemize}
+A stream that is not \code{LOSSLESS} never reports losses. The two conditions exist because a block that is
+merely late must not be treated as lost, and re-reporting a gap before its retransmission could possibly arrive
+only causes duplicate retransmissions. The bulk-transfer receiver scales both intervals with its own estimate of
+the round-trip time (Section~\ref{sec:recovery}).
+
+\section{Congestion control}\label{sec:cc}
+
+Each \code{LOSSLESS} stream has its own \code{CongestionController} (\code{congestion.hpp}). Keeping congestion
+state per stream rather than per connection is the deliberate difference from QUIC on which the design rests.
+The controller's window is in abstract units: the bulk transfer interprets them as units of the configured
+block size\vviii, and the multiplexed transfer as blocks.
+
+\paragraph{RTT estimation.} The controller follows RFC~6298~\cite{rfc6298}. The first sample $R$ sets
+$\mathit{SRTT}=R$ and $\mathit{RTTVAR}=R/2$. Each later sample updates
+\[
+\mathit{RTTVAR}\leftarrow\tfrac34\mathit{RTTVAR}+\tfrac14\lvert \mathit{SRTT}-R\rvert,\qquad
+\mathit{SRTT}\leftarrow\tfrac78\mathit{SRTT}+\tfrac18R .
+\]
+
+\paragraph{AIMD epochs and slow start.} The controller makes one decision per elapsed SRTT
+(Figure~\ref{fig:ccfsm}):
+\begin{itemize}
+  \item If a loss (a NACK, or the first timeout of a run) was observed during the epoch, the window halves, but
+    not below a floor of two, and slow start ends.
+  \item In slow start\vviii, a clean epoch doubles the window up to the cap.
+  \item In congestion avoidance, a run of clean epochs adds a fixed step. Both transports grow by 16 units after
+    one clean epoch.
+\end{itemize}
+Slow start was added because, without it, the window had to climb from one eighth of the cap a few units per
+round trip, which takes many round trips on a long path. It is opt-in, so existing users of the component keep
+their behaviour unchanged.
+
+\begin{figure}[H]
+\centering
+\fitwidth{\begin{tikzpicture}[node distance=2.2cm and 4.2cm, >={Stealth[length=2.2mm]}, every edge/.style={draw,thick}]
+  \node[st,minimum width=2.6cm] (ss) {Slow start};
+  \node[st,minimum width=2.6cm,right=of ss] (ca) {Congestion\\avoidance};
+  \node[lbl,left=1.3cm of ss] (s0) {\code{enable_slow_start}};
+  \node[lbl,above=0.9cm of ca] (s1) {default start\\(window $=$ cap/8)};
+  \draw[->,thick] (s0) -- (ss);
+  \draw[->,thick] (s1) -- (ca);
+  \path[->] (ss) edge[loop below] node[lbl,below] {clean epoch: $w\leftarrow\min(2w,\mathit{cap})$} (ss)
+            (ss) edge[bend left=12] node[lbl,above] {loss: $w\leftarrow\max(w/2,2)$, or $w=\mathit{cap}$} (ca)
+            (ca) edge[loop below] node[lbl,below,align=center] {loss: $w\leftarrow\max(w/2,2)$\\$n$ clean epochs: $w\leftarrow\min(w+\mathit{step},\mathit{cap})$} (ca);
+\end{tikzpicture}}
+\caption{The congestion controller's states. One decision is made per SRTT epoch.}\label{fig:ccfsm}
+\end{figure}
+
+\paragraph{Retransmission timeout\vviii.} The timeout is computed as
+\[
+\mathit{RTO}=\max\bigl(\mathit{SRTT}+\max(4\,\mathit{RTTVAR},1\,\mathrm{ms}),\;2\,\mathit{SRTT}\bigr)\cdot 2^{b},
+\]
+clamped to $[5\,\mathrm{ms}, 1\,\mathrm{s}]$. It is 1~s before any sample, and the backoff exponent $b\le6$ is
+reset whenever new data is acknowledged. Only the first timeout of a run counts as a loss: an outage of any
+length halves the window once, and later timeouts only back off. Each term has a reason:
+\begin{itemize}
+  \item The variance term replaces a fixed multiple of SRTT, which fired spuriously under jitter.
+  \item The $2\,\mathit{SRTT}$ floor exists because NACK-driven repair needs about half a round trip of reorder
+    tolerance plus a full round trip; a timer that fires earlier only duplicates that repair. We found this by
+    measurement.
+  \item Exponential backoff keeps a dead or overloaded path from being probed at a fixed rate.
+\end{itemize}
+
+\paragraph{Pacing\vviii.} After sending $b$ bytes with a window of $B$ bytes, the sender waits
+$0.8\cdot b\cdot\mathit{SRTT}/B$. This spreads a window over one round trip at 1.25 times the window rate
+instead of releasing it as one line-rate burst, which overflows shallow router buffers and turns congestion
+control into a loss generator. The factor 1.25 keeps pacing itself from becoming the bottleneck.
+
+\section{Lock-free single-producer, single-consumer ring}
+
+\code{SpscRing<T>} is a bounded ring with exactly one producer and one consumer thread. Its capacity is rounded
+up to a power of two so that an index is a bit mask. The head and tail counters increase monotonically and sit
+on separate 64-byte cache lines to avoid false sharing. The protocol is:
+\begin{enumerate}
+  \item The producer fills slots and then publishes the tail with release ordering.
+  \item The consumer reads the tail with acquire ordering, reads the slots, and publishes the head with release
+    ordering.
+  \item The producer reads the head with acquire ordering before reusing a slot.
+\end{enumerate}
+Each side caches the other's counter and re-reads the shared variable only when the ring appears full or empty,
+so in steady state each side touches the other's cache line once per batch rather than once per item.
+
+There is no mutex and no compare-and-swap, so neither side ever waits for the other. A full ring is simply
+reported to the producer. The bulk-transfer receiver then drops the datagram and lets the normal recovery
+resend it, rather than stall the socket reader behind a slow disk.
+
+\section{Stage 4 primitives: send queue and reassembly}
+
+\code{SendQueue} is a bounded ring of sequence numbers waiting to be sent, and its behaviour depends on the
+stream's \code{COALESCE} flag:
+\begin{itemize}
+  \item \code{COALESCE=1}: when the queue is full, the oldest unsent entry is dropped to admit the newest, and
+    the drop is counted. Fresh data supersedes stale data.
+  \item \code{COALESCE=0}: a full queue refuses the push, and the producer backs off.
+\end{itemize}
+A capacity of zero, which used to cause a division by zero, is now clamped to one.
+
+\code{ReassemblyStream} delivers received blocks according to the \code{ORDERED} flag:
+\begin{itemize}
+  \item \code{ORDERED=1}: blocks are buffered and released in sequence order.
+  \item \code{ORDERED=0}: each block is released as soon as it arrives.
+\end{itemize}
+Both modes write to the same sink at the block's explicit offset, so the completed result is identical and only
+the order of delivery differs. Version~8 replaced its unbounded duplicate set with a window-bounded ring.
+
+These two primitives implement the per-stream flags that motivate the whole protocol. Today they are exercised
+by the tests and the \code{fuse_bench} harness but not exposed by any public transport
+(Chapter~\ref{ch:conclusion}).
+
+\section{Autoscaling worker pool}\label{sec:orch}
+
+\code{WorkerOrchestrator} runs a task supplied by the caller on a pool of threads and resizes the pool the way a
+Kubernetes horizontal pod autoscaler does.
+\begin{itemize}
+  \item Each worker repeatedly calls the task, which reports whether it did useful work, and accumulates its
+    busy and total time. An idle call sleeps 200~\textmu s, and the sleep is counted as idle time.
+  \item Periodically, \code{tick} computes the mean utilisation since the previous tick and resets the
+    counters:
+    \begin{itemize}
+      \item above 0.70 utilisation, with fewer than the maximum number of workers, it adds a worker;
+      \item below 0.30, with more than the minimum, it retires the newest worker, which finishes its current
+        call (a graceful drain) and is joined outside the lock;
+      \item no two actions may be closer together than a 200~ms stabilisation window.
+    \end{itemize}
+\end{itemize}
+The two separate thresholds and the stabilisation window prevent the pool from oscillating.
+
+This component replaced Stage~6, which pinned each worker to a fixed CPU core. Pinning was measured to be about
+6\% slower, with a higher median latency, because pinning the senders while their peers float prevents the
+scheduler from placing communicating threads together. Throughput also proved not to be monotonic in the number
+of workers: four lanes beat eight on the test host. The right degree of concurrency is something to discover at
+run time.
+
+\section{The SETUP handshake}\label{sec:setup}
+
+Before any data flows, the multiplexed transfer agrees on the stream table using a three-way handshake
+(Figure~\ref{fig:setup}).
+\begin{enumerate}
+  \item The initiator sends SETUP\_DATA.
+  \item The responder validates it, hashes the body exactly as received, draws a fresh nonce\vviii, and replies
+    with SETUP\_HASH\_REPLY(hash, nonce).
+  \item If the hash matches its own, the initiator answers with SETUP\_FINACK(hash, nonce), which completes the
+    handshake on the responder.
+\end{enumerate}
+A lost SETUP\_DATA or reply is recovered by the initiator, which retransmits every 50~ms up to five times. A lost
+FINACK is recovered by the responder, which re-sends its reply; the initiator answers a duplicate reply with
+another FINACK.
+
+\begin{figure}[H]
+\centering
+\fitwidth{\begin{tikzpicture}[font=\small]
+  \node[box] (i) at (0,0) {Initiator (sender)};
+  \node[box] (r) at (8,0) {Responder (receiver)};
+  \draw[thick,black!40] (0,-0.4) -- (0,-5.2); \draw[thick,black!40] (8,-0.4) -- (8,-5.2);
+  \draw[msg] (0,-1) -- node[above,sloped] {SETUP\_DATA(config)} (8,-1.6);
+  \node[lbl,right] at (8.1,-1.9) {validate; $h=$FNV-1a(body)\\nonce $=$ random\vviii};
+  \draw[msg] (8,-2.6) -- node[above,sloped] {SETUP\_HASH\_REPLY($h$, nonce)} (0,-3.2);
+  \node[lbl,left] at (-0.1,-3.4) {$h$ equals hash of\\my config?};
+  \draw[msg] (0,-4.0) -- node[above,sloped] {SETUP\_FINACK($h$, nonce)} (8,-4.6);
+  \node[lbl,right] at (8.1,-4.8) {$h$ and nonce match:\\complete};
+\end{tikzpicture}}
+\caption{The SETUP handshake. Retransmission timers on both sides recover any single loss.}\label{fig:setup}
+\end{figure}
+
+The responder echoes its \emph{own} hash of what it received rather than a simple ``ok''. A corrupted datagram
+therefore produces a mismatched hash, so the handshake does not complete, whereas a corruptible boolean could
+not detect that.
+
+The responder nonce\vviii{} closes a replay attack: without it, a recorded SETUP\_DATA and SETUP\_FINACK pair
+could be replayed later to complete a new handshake.
+
+The responder also validates the offered configuration and ignores, without ever confirming, a SETUP that
+violates any of these rules:
+\begin{itemize}
+  \item the protocol version must be its own;
+  \item stream identifiers must be unique;
+  \item block sizes must lie in 1--16,384;
+  \item windows must lie in 1--1,024.
+\end{itemize}
+The multiplexed receiver additionally requires stream identifiers $0,\ldots,n-1$, because it indexes an array
+with them. Both endpoints are pure state machines driven by received datagrams and timer calls.
+
+\section{Hashing}
+
+Two hash functions are provided:
+\begin{itemize}
+  \item \textbf{FNV-1a-64}~\cite{fnv}, a fast non-cryptographic hash. It serves as the SETUP checksum, as the
+    file identity, and as the digest fallback in builds without cryptography.
+  \item \textbf{SipHash-2-4}~\cite{siphash}, a keyed pseudorandom function. It computes the address-validation
+    tokens\vviii, which must be unforgeable without the receiver's secret yet cheap enough to compute for every
+    incoming StreamStart, including spoofed ones. SipHash was designed for exactly this kind of short keyed
+    input, and it is available even in builds without wolfSSL.
+\end{itemize}
+
+\section{Session cryptography}\label{sec:crypto}
+
+\paragraph{Why not one DTLS session per lane.} The obvious way to encrypt a sharded transfer is to give each
+lane its own DTLS session. The implementation rejects this for two reasons, documented in
+\code{session_crypto.hpp}:
+\begin{itemize}
+  \item A DTLS session owns record-layer state: sequence numbers, epoch, replay window and cipher state. That
+    state cannot be shared across lanes without a mutex, which would serialise exactly the parallelism sharding
+    creates.
+  \item Writing through DTLS hands the socket to the library one record at a time, which destroys segmentation
+    offload.
+\end{itemize}
+Instead, keys are derived once per session, and every lane encrypts independently with the same session key and
+a nonce unique to the pair (lane, sequence number). Encrypted blocks remain fixed-size datagrams and pack into an
+offload batch exactly as plaintext does. Fast QUIC implementations have the same shape: per-packet AEAD, followed
+by batching of already-encrypted packets.
+
+\paragraph{The lane cipher.} \code{LaneCipher} wraps one AES-256-GCM context. The tag is written directly after
+the ciphertext so the datagram stays contiguous. A second initialisation is refused, because re-keying an
+existing object is exactly how a (key, nonce) pair could repeat.
+
+\paragraph{Key epochs\vviii.} One AES-GCM key should not protect an unbounded number of records; RFC~9001
+applies a confidentiality limit of about $2^{23}$ packets~\cite{rfc9001}. Rather than adding rekeying messages,
+each lane's key is derived deterministically from the session key, the lane and the epoch
+$\mathit{seq}\gg22$, so both ends change keys at the same sequence number with nothing on the wire. A small
+schedule keeps the two most recently used epochs, so that retransmissions from just before a boundary do not
+force repeated derivations.
+
+\paragraph{Control-plane authentication\vviii.} A \code{ControlAuth} object per lane and side appends and
+verifies the GMAC trailer described in Section~\ref{sec:wirecrypto}, with its own key and a send counter that
+starts at one. Replaying an old authentic control message is harmless by construction:
+\begin{itemize}
+  \item acknowledgement bases only ever move forward;
+  \item an abort can only be replayed if one was genuinely sent.
+\end{itemize}
+
+\paragraph{Security properties.} The per-session random salt gives \emph{key freshness}: two sessions never
+share a key. The pre-shared-key path does \emph{not} give forward secrecy. Anyone who records the traffic and
+later obtains the key can decrypt it.
+
+\paragraph{Digest and DTLS.} The digest used to verify resumed files is SHA-256 over the list of
+per-64-MiB-segment SHA-256 values plus the file length, which allows the segments to be hashed in parallel.
+
+A DTLS~1.2 wrapper with ECDHE-PSK cipher suites~\cite{rfc6347,rfc4279}, which does give forward secrecy, exists
+as a standalone component and is tested, but no transport uses it yet. Version~8 made its debug copy of the wire
+traffic opt-in.
