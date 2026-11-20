@@ -1,0 +1,113 @@
+\chapter{Introduction}\label{ch:intro}
+
+\section{Problem statement}
+
+Many networked applications send two kinds of data at the same time. The first kind is \emph{loss-tolerant and
+latency-sensitive}: telemetry samples, media frames, game or robot state, position updates. For this data a
+newer value supersedes an older one, and waiting for the retransmission of a lost packet is worse than simply
+skipping it. The second kind is \emph{loss-intolerant and correctness-sensitive}: files, configuration, logs,
+commands. Here every byte must arrive, and arrive intact, but small delays are acceptable.
+
+When both kinds share one transport connection, the transport must make the right trade-off for each of them
+independently. The two standard choices cannot do this:
+
+\begin{itemize}
+  \item \textbf{TCP}~\cite{rfc9293} provides one ordered byte stream per connection. A single lost segment holds
+    back every byte behind it until it is retransmitted (\emph{head-of-line blocking}). All data on the
+    connection also shares one congestion window, so a loss in the bulk transfer slows the latency-sensitive
+    traffic too. Opening several TCP connections avoids the blocking but multiplies handshakes and offers no
+    shared session.
+  \item \textbf{QUIC}~\cite{rfc9000,quic-design} multiplexes independent streams over UDP, so a loss on one
+    stream no longer blocks another. Its congestion control is still defined per connection~\cite{rfc9002}, so
+    the streams still compete for one window. It also makes TLS~1.3 mandatory~\cite{rfc9001}, which is a fixed
+    cost even on a trusted link, and unreliable delivery is a separate extension rather than a property of a
+    stream.
+\end{itemize}
+
+\noindent The problem this project addresses is therefore:
+
+\begin{quote}
+\emph{Design and build a transport protocol over UDP in which reliability, ordering and congestion control are
+properties of each individual stream rather than of the connection, so that loss-tolerant and loss-intolerant
+traffic can share one session without either one degrading the other. The protocol must remain fast enough for
+bulk data and secure enough to be used on untrusted networks.}
+\end{quote}
+
+\section{Approach in brief}
+
+Fuse is a datagram transport built directly on UDP. Every stream has its own sequence-number space, its own
+receive window, its own retransmission store and its own congestion controller. Three per-stream flags,
+negotiated when a session is set up, decide how the stream behaves:
+\begin{itemize}
+  \item \code{LOSSLESS} decides whether missing blocks are retransmitted;
+  \item \code{ORDERED} decides whether blocks are delivered in sequence or as soon as they arrive;
+  \item \code{COALESCE} decides whether a full send queue drops its oldest entry or makes the producer wait.
+\end{itemize}
+
+Encryption is optional and configured locally: when both ends hold the same pre-shared key, every block is
+sealed with AES-256-GCM and, since version~8, every control message is authenticated. Throughput comes from
+batched system calls (UDP generic segmentation offload and \code{recvmmsg}~\cite{gso,recvmmsg}), fixed-size
+storage with no allocation on the per-packet path, and per-lane parallel encryption.
+
+On top of a common core of building blocks, the repository offers three transports:
+\begin{itemize}
+  \item a sharded bulk transfer for buffers and files, with resumable file reception;
+  \item a socket-style, message-oriented C API;
+  \item a multiplexed transfer that services many streams with an autoscaling pool of worker threads.
+\end{itemize}
+
+\section{Contributions of this work}
+
+The protocol existed at version~7 when this work began. Our contributions are:
+
+\begin{enumerate}
+  \item \textbf{A complete study of the design and implementation.} We read the entire repository and document
+    the wire format, every building block, the three transports, their state machines and the engineering
+    principles they follow (Chapters~\ref{ch:arch}--\ref{ch:sdkmux}).
+  \item \textbf{A security and correctness hardening of the protocol core, released as protocol version~8.} A
+    review of version~7 found 31 issues. We fixed every one of them in the protocol core, deliberately leaving
+    the socket-style SDK and the HTTP mapping for a later pass. Each fix was its own commit, with tests. The
+    most significant fixes are:
+    \begin{itemize}
+      \item an AES-GCM nonce-reuse flaw on every retransmission;
+      \item an unauthenticated control plane under a pre-shared key;
+      \item address and path validation;
+      \item flow control;
+      \item use of the selective-acknowledgement bitmask;
+      \item RFC~6298 timers with backoff;
+      \item slow start, a byte-based window and pacing;
+      \item MTU-bounded block growth;
+      \item AES-GCM key usage limits;
+      \item an extension mechanism and an explicit version-mismatch reply (Chapter~\ref{ch:security}).
+    \end{itemize}
+  \item \textbf{An evaluation} of version~8 against version~7: the full test suite in four build
+    configurations, loopback throughput, and a matrix of emulated network impairments, with every transferred
+    byte checked (Chapter~\ref{ch:eval}).
+  \item \textbf{An account of the remaining limitations} and the work needed to address them
+    (Chapter~\ref{ch:conclusion}).
+\end{enumerate}
+
+\section{Organisation of this report}
+
+\begin{itemize}
+  \item Chapter~\ref{ch:background} reviews TCP, QUIC and related transports, and explains where they fall short
+    for mixed traffic.
+  \item Chapter~\ref{ch:arch} presents the architecture of Fuse and the programming principles its
+    implementation follows.
+  \item Chapter~\ref{ch:wire} specifies the wire format.
+  \item Chapter~\ref{ch:components} describes each building block of the protocol core.
+  \item Chapter~\ref{ch:transfer} follows a bulk transfer end to end, including the life of a single packet and
+    the state machines of both ends.
+  \item Chapter~\ref{ch:sdkmux} covers the socket-style SDK and the multiplexed transfer.
+  \item Chapter~\ref{ch:security} presents the threat model and the version~8 hardening, explaining for each
+    finding what it allowed, how it was fixed, and why that fix was chosen.
+  \item Chapter~\ref{ch:eval} describes the testing and the measured results.
+  \item Chapter~\ref{ch:conclusion} discusses limitations and future work, and concludes.
+  \item The appendices give a configuration reference, a file-by-file guide to the repository and a glossary.
+\end{itemize}
+
+\paragraph{Conventions.} ``Sender'' and ``receiver'' always refer to the direction of the data. A
+\emph{block} is one DATA datagram. A \emph{lane} (bulk transfer) and a \emph{stream} (SDK and multiplexed
+transfer) denote the same idea: one independent sequence-numbered flow with its own window and congestion state.
+References of the form \code{file.cpp:123} point to a line of the source at commit \code{9706e21}. Features new
+in protocol version~8 are marked \vviii.

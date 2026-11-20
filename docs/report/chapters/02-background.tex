@@ -1,0 +1,106 @@
+\chapter{Background and Related Work}\label{ch:background}
+
+\section{TCP}
+
+TCP~\cite{rfc9293} offers a reliable, ordered byte stream between two endpoints. Reliability is built from four
+mechanisms:
+\begin{itemize}
+  \item cumulative acknowledgements, optionally extended with selective acknowledgements (SACK)~\cite{rfc2018};
+  \item a retransmission timer computed from a smoothed round-trip time and its variance~\cite{rfc6298};
+  \item fast retransmit on duplicate acknowledgements;
+  \item window scaling for large bandwidth-delay products~\cite{rfc7323}.
+\end{itemize}
+Congestion control follows the additive-increase, multiplicative-decrease principle~\cite{jacobson,chiu-jain}:
+slow start doubles the window every round trip until the first loss, after which the window grows by about one
+segment per round trip and halves on loss~\cite{rfc5681}. The steady-state throughput of such a flow is roughly
+proportional to $\mathit{MSS}/(\mathit{RTT}\sqrt{p})$ for loss rate $p$~\cite{mathis}, which is why loss and
+latency together dominate bulk performance on long paths.
+
+Two properties make TCP a poor fit for mixed traffic. First, the byte stream is totally ordered: when a segment
+is lost, the bytes after it cannot be delivered to the application until the retransmission arrives, even if
+they belong to an unrelated message. Second, the whole connection shares one congestion window, so the
+behaviour of the bulk data determines the latency of everything else.
+
+\section{QUIC}
+
+QUIC~\cite{rfc9000,quic-design} runs over UDP and multiplexes many independent streams inside one encrypted
+connection. A lost packet only blocks the streams whose data it carried. QUIC has two further features worth
+noting:
+\begin{itemize}
+  \item \emph{packet numbers that are never reused}, so retransmitted data travels in a new packet and RTT
+    samples are unambiguous;
+  \item \emph{address validation}: a Retry token proves that a client can receive at its claimed address before
+    the server commits resources or sends large responses.
+\end{itemize}
+Loss detection and congestion control are specified in RFC~9002~\cite{rfc9002}, and packet protection with
+TLS~1.3 in RFC~9001~\cite{rfc9001,rfc8446}. RFC~9001 also bounds how many packets a single AEAD key may protect.
+
+For the problem in this report, QUIC still has three drawbacks:
+\begin{itemize}
+  \item Congestion control is per connection, so a bulk stream's losses throttle the latency-sensitive stream
+    that shares the connection.
+  \item Encryption is mandatory, so a trusted link always pays for TLS.
+  \item Reliability is a property of the connection's streams. Unreliable delivery requires the separate
+    datagram extension and is not a per-stream setting.
+\end{itemize}
+Several of Fuse's version~8 mechanisms deliberately borrow QUIC's well-studied answers: Retry-style address
+tokens, path validation, AEAD key limits and the separation of RTT estimation from retransmission.
+
+\section{Other transports}
+
+\begin{itemize}
+  \item \textbf{SCTP}~\cite{sctp} provides multiple streams within an association, with per-stream ordering and
+    an optional unordered delivery mode. It is message-oriented, like Fuse's SDK. Its congestion control,
+    however, is per association, and in practice it is often blocked by middleboxes.
+  \item \textbf{UDT}~\cite{udt} is a UDP-based protocol for high-speed bulk transfer over wide-area networks,
+    with its own rate-based congestion control. It addresses a single bulk flow rather than mixed traffic.
+  \item \textbf{DTLS}~\cite{rfc6347,rfc9147} adapts TLS to datagrams. Its record layer keeps per-session
+    sequence numbers, an epoch and a replay window. As Section~\ref{sec:crypto} explains, that state is why
+    Fuse does not use one DTLS session per lane for its high-throughput path.
+  \item \textbf{TFTP}~\cite{rfc1350} has the server answer each request from a fresh port, so that one
+    well-known port can serve many transfers without connection identifiers. Fuse's SDK reuses this idea.
+\end{itemize}
+
+\section{Systems techniques relied upon}
+
+\begin{itemize}
+  \item \textbf{Batched UDP I/O.} One system call per datagram limits a modern host to a few hundred thousand
+    datagrams per second, however fast the network. Linux provides \code{recvmmsg}/\code{sendmmsg} to move many
+    datagrams per call~\cite{recvmmsg}, and generic segmentation offload (\code{UDP\_SEGMENT}, Linux 4.18): the
+    application hands the kernel one large buffer and the kernel or network card splits it into ordinary
+    MTU-sized datagrams~\cite{gso}.
+  \item \textbf{Path MTU.} Datagrams larger than the path MTU are fragmented at the IP layer, and the loss of any
+    fragment destroys the whole datagram. Packetization-layer path MTU discovery~\cite{rfc8899} probes larger
+    sizes carefully and backs off after failure. Fuse's adaptive block size follows its spirit.
+  \item \textbf{Authenticated encryption.} AES-GCM~\cite{nist-gcm} provides confidentiality and integrity in one
+    pass. Its security collapses if a (key, nonce) pair is ever reused with different inputs: two such
+    ciphertexts allow the authentication key to be recovered and arbitrary messages to be
+    forged~\cite{joux}. Every encryption design in Fuse is shaped by this constraint.
+  \item \textbf{Key derivation and keyed hashing.} HKDF~\cite{rfc5869} derives keys from a pre-shared secret and
+    a salt. SipHash~\cite{siphash} is a fast keyed pseudorandom function for short inputs, suitable for
+    unforgeable tokens.
+  \item \textbf{Lock-free hand-off.} A ring buffer with one producer and one consumer needs no locks, only
+    correctly ordered reads and writes of its two indices~\cite{lamport-spsc}.
+\end{itemize}
+
+\section{Summary of the gap}
+
+Table~\ref{tab:compare} summarises the comparison that motivates Fuse.
+
+\begin{table}[H]
+\centering\small
+\caption{Transport properties relevant to mixed loss-tolerant and loss-intolerant traffic.}\label{tab:compare}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{3.6cm}XXX}
+\toprule
+ & \textbf{TCP} & \textbf{QUIC} & \textbf{Fuse} \\
+\midrule
+Head-of-line blocking & across all data & per stream & per stream \\
+Congestion control & per connection & per connection & per stream \\
+Reliability & always & always (datagrams via extension) & per stream (\code{LOSSLESS}) \\
+Ordering & always & per stream & per stream (\code{ORDERED}) \\
+Encryption & optional (TLS) & mandatory (TLS~1.3) & optional, local (PSK) \\
+Forward secrecy & with TLS & yes & DTLS path only (not on the PSK path) \\
+Batched I/O & kernel & implementation-dependent & GSO + \code{recvmmsg} \\
+\bottomrule
+\end{tabularx}
+\end{table}

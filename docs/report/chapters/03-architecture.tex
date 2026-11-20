@@ -1,0 +1,265 @@
+\chapter{Architecture and Design Principles}\label{ch:arch}
+
+\section{Goals and non-goals}
+
+The design goals, as recorded in the repository's roadmap~\cite{repo}:
+\begin{enumerate}
+  \item Per-stream reliability, ordering and congestion control.
+  \item High throughput on commodity hosts, through batching and the absence of per-packet allocation.
+  \item Optional, fail-closed encryption: a peer that is configured to encrypt never silently falls back to
+    plaintext.
+  \item Robustness against hostile input: every field received from the network is treated as an attacker's
+    claim.
+  \item No workload-specific assumptions in the protocol core.
+\end{enumerate}
+
+\noindent Things the protocol deliberately does not do:
+\begin{itemize}
+  \item renegotiate block or window sizes in the middle of a session;
+  \item make encryption mandatory;
+  \item authenticate peers with certificates or a PKI (pre-shared keys are the design);
+  \item expose a byte-stream socket compatible with TCP.
+\end{itemize}
+
+\section{Layered structure}
+
+Figure~\ref{fig:layers} shows the structure of the repository:
+\begin{itemize}
+  \item \textbf{Protocol core} (\code{include/fuse/proto/}, \code{src/proto/}): small building blocks, each
+    independently testable and none of them aware of sockets, threads or clocks.
+  \item \textbf{Transports}: built from those blocks, and the only place where the blocks meet real I/O,
+    real time and real concurrency.
+  \item \textbf{UDP wrapper}: the lowest layer, which hides the platform differences.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\fitwidth{\begin{tikzpicture}[node distance=4mm and 3mm, every node/.style={font=\small}]
+  \node[api,minimum width=3.3cm] (t) {\textbf{transfer.hpp}\\buffers \& files};
+  \node[api,minimum width=3.3cm,right=of t] (s) {\textbf{sdk.h}\\connect / send / recv};
+  \node[api,minimum width=3.3cm,right=of s] (m) {\textbf{mux\_transfer.hpp}\\N streams, 1 socket};
+  \node[api,minimum width=3.0cm,right=of m] (h) {\textbf{http.h}\\1 request, 1 response};
+  \node[core,below=10mm of t,minimum width=2.6cm] (w) {wire / block / control\\encode \& decode};
+  \node[core,right=of w,minimum width=2.4cm] (r) {registry\\retransmit store};
+  \node[core,right=of r,minimum width=2.4cm] (rx) {receiver\\window, NACK};
+  \node[core,right=of rx,minimum width=2.6cm] (cc) {congestion\\AIMD, RTO, pacing};
+  \node[core,right=of cc,minimum width=2.2cm] (cr) {session\_crypto\\AEAD, GMAC};
+  \node[core,below=4mm of w,minimum width=2.6cm] (su) {setup\\3-way handshake};
+  \node[core,right=of su,minimum width=2.4cm] (q) {send\_queue,\\reassembly};
+  \node[core,right=of q,minimum width=2.4cm] (ring) {spsc\_ring\\lock-free};
+  \node[core,right=of ring,minimum width=2.6cm] (o) {orchestrator\\autoscaling};
+  \node[core,right=of o,minimum width=2.2cm] (d) {digest, hash,\\dtls};
+  \node[io,below=10mm of ring,minimum width=9cm] (u) {\textbf{udp.hpp}: GSO + \code{recvmmsg} (Linux), plain sockets (macOS)};
+  \node[io,below=4mm of u,minimum width=9cm] (k) {Kernel UDP / IP};
+  \begin{scope}[on background layer]
+    \node[draw=black!30,dashed,rounded corners,fit=(w)(cr)(su)(d),inner sep=6pt] {};
+  \end{scope}
+  \draw[arr] (h) -- (s);
+  \draw[arr] ($(t.south)+(0,0)$) -- ++(0,-5mm);
+  \draw[arr] ($(s.south)+(0,0)$) -- ++(0,-5mm);
+  \draw[arr] ($(m.south)+(0,0)$) -- ++(0,-5mm);
+  \draw[arr] (u) -- (k);
+  \draw[arr] ($(q.south)!0.5!(ring.south)+(0,-2mm)$) -- (u.north);
+\end{tikzpicture}}
+\caption{Layered structure of the repository: public APIs (green), protocol core (blue), platform I/O (orange).}\label{fig:layers}
+\end{figure}
+
+The public APIs are:
+\begin{itemize}
+  \item \code{transfer.hpp}: \code{send_buffer}, \code{receive_buffer}, \code{send_file} and \code{receive_file};
+  \item \code{sdk.h}: a C API with \code{fuse_listen}, \code{fuse_accept}, \code{fuse_connect},
+    \code{fuse_send}, \code{fuse_recv} and \code{fuse_close};
+  \item \code{mux_transfer.hpp}: \code{send_multiplexed} and \code{receive_multiplexed};
+  \item \code{http.h}: one HTTP/1.1 request and one response over an SDK connection.
+\end{itemize}
+
+They build into the libraries listed in Table~\ref{tab:targets}.
+
+\begin{table}[H]
+\centering\small
+\caption{CMake library targets.}\label{tab:targets}
+\begin{tabularx}{\linewidth}{lXl}
+\toprule
+\textbf{Target} & \textbf{Contents} & \textbf{Installed} \\
+\midrule
+\code{fuse::proto} & Protocol core: block, control, registry, receiver, UDP, SETUP, reassembly, DTLS, orchestrator, session crypto, digest & yes \\
+\code{fuse::sdk} & The three transports (\code{transfer.cpp}, \code{mux_transfer.cpp}, \code{sdk.cpp}), linking \code{fuse::proto} & no$^{*}$ \\
+\code{fuse::http} & HTTP mapping (\code{http.cpp}) & no$^{*}$ \\
+\code{fuse::fuse} & Legacy C scaffold (QUIC-like long header, variable-length integers); unused by the protocol & yes \\
+\bottomrule
+\multicolumn{3}{l}{\footnotesize $^{*}$Released from the separate \code{fuse-sdk} repository.}
+\end{tabularx}
+\end{table}
+
+Two build options matter most:
+\begin{itemize}
+  \item \code{FUSE_WITH_CRYPTO} (on by default) links wolfSSL~\cite{wolfssl}. The build can fetch wolfSSL and
+    compiles it with AES-NI assembly: wolfSSL's own CMake build had silently used software AES, at 151~MB/s
+    against 4,852~MB/s with the assembly enabled.
+  \item Without crypto, every cryptographic entry point fails closed, and a request for encryption returns
+    \code{Unsupported}.
+\end{itemize}
+
+\section{The three transports at a glance}
+
+\begin{table}[H]
+\centering\small
+\caption{The three transports.}\label{tab:transports}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{2.4cm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X}
+\toprule
+ & \textbf{Bulk transfer} & \textbf{SDK} & \textbf{Multiplexed} \\
+\midrule
+Unit & one buffer or file, split into \emph{lanes} & messages on a connection & one buffer over $N$ streams \\
+Ports & one per lane (\code{base_port}$+i$) & one listen port, then a fresh port per connection & one \\
+Threads & sender: one per lane; receiver: one reader per lane, $K$ writers, one retransmission consumer & one pump thread per connection & autoscaling pool \\
+Session setup & per-lane StreamStart with Retry token\vviii & HELLO / HELLO-ACK & SETUP, then per-stream StreamStart \\
+Encryption & AES-256-GCM per block; GMAC on control\vviii; key epochs\vviii & AES-256-GCM on DATA only & none \\
+v8 hardening & complete & deferred & SACK, RTO, slow start, validation \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Evolution of the wire protocol}
+
+The first byte of every datagram is the protocol version. Each increment was an on-wire change, and the
+comment above the constant in \code{wire.hpp} records why (Table~\ref{tab:versions}).
+
+\begin{table}[H]
+\centering\small
+\caption{Protocol versions and the reason for each change.}\label{tab:versions}
+\begin{tabularx}{\linewidth}{c>{\raggedright\arraybackslash}p{5cm}X}
+\toprule
+\textbf{v} & \textbf{Change} & \textbf{Reason} \\
+\midrule
+1 & Block header, registry, bitmask, ACK/NACK & Stage 1 reliability core \\
+2 & Explicit byte offset in DATA & Block size adapts mid-stream, so $\mathit{seq}\times\mathit{size}$ misplaces data \\
+3 & Multi-word bitmask; handshake nonce & Windows over 64 blocks; a stale ACK must not confirm a new session \\
+4 & Server salt in HELLO-ACK & Retried HELLOs could derive identical keys with both sequence numbers at 0, an AES-GCM nonce collision \\
+5 & Two-byte window size & Raise the window from 255 to 1,024 blocks; the old field capped throughput on any real bandwidth-delay product \\
+6 & Base offset and total size in StreamStart & Write each block directly to its final file position \\
+7 & File id, ResumeRanges, FileDigest & Resumable file reception with whole-file verification \\
+8 & Control-plane authentication, AAD fix, key epochs, Retry, path validation, SETUP nonce, receive window, extensions, version-mismatch reply & The security and correctness review (Chapter~\ref{ch:security}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Design principles of the implementation}\label{sec:principles}
+
+The code base is small, but it follows a consistent set of principles. They explain many choices that look
+unusual in isolation.
+
+\paragraph{Staged construction with acceptance tests.} The protocol was built in stages, each with its own
+acceptance test:
+
+\smallskip
+\begin{center}\small
+\begin{tabular}{@{}ll@{\qquad}ll@{}}
+\toprule
+\textbf{Stage} & \textbf{Scope} & \textbf{Stage} & \textbf{Scope} \\
+\midrule
+0 & framing & 4 & per-stream flags \\
+1 & blocks and the received bitmask & 5 & congestion control \\
+1.5 & control messages & 6 & CPU pinning \\
+2 & SETUP & 7 & encryption \\
+3 & worker threads & 8 & benchmarks \\
+\bottomrule
+\end{tabular}
+\end{center}
+\smallskip
+
+\noindent When a measurement contradicted a stage, the stage was removed rather than kept because it had been
+planned. CPU pinning made transfers about 6\% slower, so Stage~6 was deleted, and the reason is recorded in
+\code{orchestrator.hpp}.
+
+\paragraph{Pure state machines; the caller owns I/O and time.} The SETUP handshake, the receiver window, the
+sender registry and the congestion controller never touch a socket or read a clock. They receive the current
+time as an argument and write any datagram they want to send into a buffer supplied by the caller. As a result:
+\begin{itemize}
+  \item tests can drive them with a virtual clock and injected loss, so ``retransmits after 50~ms'' is a
+    deterministic unit test rather than a sleep;
+  \item the same logic serves three transports with different threading models.
+\end{itemize}
+Loops that depend on time are bounded: the congestion controller processes at most 4,096 epochs per call, so a
+clock jump cannot make it spin.
+
+\paragraph{A single place for byte order.} Only the \code{put_u8}\ldots\code{put_u64} and
+\code{get_u8}\ldots\code{get_u64} helpers in \code{wire.hpp} touch raw wire bytes. They are all big-endian, and
+each returns the number of bytes it consumed, so cursor arithmetic looks the same everywhere. Every message has
+an encoder that returns the encoded length (zero if it does not fit) and a decoder that returns false on a
+version mismatch, the wrong type or truncation. A malformed datagram is therefore dropped at one obvious place.
+
+\paragraph{Fixed-size storage and no allocation on the hot path.}
+\begin{itemize}
+  \item A registry slot embeds its whole payload array rather than a pointer.
+  \item The receiver's bitmask and gap timers are fixed arrays sized by the maximum window.
+  \item Messages are plain structures with fixed arrays.
+\end{itemize}
+A test that replaces the global \code{operator new} proves that the Stage~1 send and receive loop allocates
+nothing after setup. This avoids allocator latency and jitter, and a hostile length field cannot grow a fixed
+array. The cost is memory sized for the worst case, which is visible in the SDK (Section~\ref{sec:sdk}).
+
+\paragraph{Every wire field is hostile.} Lengths, offsets and counts from the network are bounded before any
+arithmetic is done with them, and in an order that cannot overflow. For example, a block's placement is checked
+as $\mathit{offset}\le\mathit{total} \wedge \mathit{len}\le\mathit{total}-\mathit{offset}$, never as
+$\mathit{offset}+\mathit{len}\le\mathit{total}$, because an offset close to $2^{64}$ would wrap the sum. A claimed
+transfer size that cannot be allocated fails the transfer with \code{ResourceLimit} instead of throwing out of a
+thread.
+
+\paragraph{Fail closed.}
+\begin{itemize}
+  \item With no cryptographic backend, encryption requests are refused rather than downgraded.
+  \item With no secure random source, the process aborts rather than use a predictable nonce.
+  \item If sealing a block fails, the batch stops rather than emit plaintext.
+  \item A cipher object refuses to be keyed twice, because re-keying is how a (key, nonce) pair could repeat.
+  \item Since version~8, under a pre-shared key, nothing unsigned is acted upon.
+\end{itemize}
+
+\paragraph{Ownership through RAII.}
+\begin{itemize}
+  \item Sockets are move-only objects, and ciphers are uniquely owned.
+  \item The digest thread of a sending lane is joined on every exit path by a small guard object.
+  \item The SDK counts the application threads inside \code{fuse_send} and \code{fuse_recv} with an RAII guard,
+    so that closing a connection can wait for them.
+  \item Key material is wiped after use.
+\end{itemize}
+Lane functions have a dozen early exits (cancellation, timeout, abort, authentication failure), and RAII is what
+keeps the cleanup correct on all of them.
+
+\paragraph{A concurrency model chosen per component.} Three patterns are used, each where it fits:
+\begin{enumerate}
+  \item \emph{Thread confinement}. A bulk-transfer lane owns its socket, registry, receiver state and ciphers
+    outright, so nothing on its per-packet path is locked.
+  \item \emph{Lock-free single-producer, single-consumer rings} between a lane's socket reader and the writer
+    threads.
+  \item \emph{One mutex per stream or connection} in the multiplexed transfer and the SDK, where several
+    threads touch the same stream.
+\end{enumerate}
+Shared counters use the weakest correct memory ordering: relaxed for progress statistics, release and acquire
+for the flags that publish state.
+
+\paragraph{Hiding dependencies.}
+\begin{itemize}
+  \item wolfSSL types appear in no public header; a cipher holds its context as an opaque pointer.
+  \item Platform differences are confined to three files: \code{udp_linux.cpp} (segmentation offload,
+    \code{recvmmsg}, MTU query), \code{udp_darwin.cpp} (one system call per datagram) and
+    \code{udp_common.cpp}.
+\end{itemize}
+
+\paragraph{Time, not counts.}
+\begin{itemize}
+  \item All timing uses a monotonic nanosecond clock, and differences are taken modulo $2^{64}$.
+  \item Retries are bounded by elapsed time. The original StreamStart handshake gave up after
+    $200\times200~\mu$s $=40$~ms, so it failed on any path with a longer round trip. It now retries with
+    exponential backoff until a connect timeout.
+  \item The sender keeps two progress clocks. One paces retransmission. The other, which only moves when an
+    acknowledgement confirms new data, enforces the user's timeout. A local send to a dead peer keeps
+    ``succeeding'', so using the first clock for the timeout made the loop unbounded.
+\end{itemize}
+
+\paragraph{A C ABI where stability matters.} The SDK is plain C. It uses opaque handles, a status enumeration,
+and a configuration structure initialised by a function, so that fields can be added without breaking callers.
+It is the stable interface for bindings to other languages.
+
+\paragraph{Comments state the invariant and its history.} Comments explain \emph{why}, often naming the bug
+that motivated a line and the roadmap number of its fix. Protocol code is mostly invariants, and a future change
+that breaks one should run into the comment that states it.
